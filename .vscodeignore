@@ -16,3 +16,4 @@ environment.yml
 media/preview.html
 media/preview.png
 **/*.log
+docs/**

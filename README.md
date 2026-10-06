@@ -1,19 +1,65 @@
 # Chatroom
 
-A VS Code extension that brings Codex, Claude Code, GitHub Copilot, and Ollama into one shared conversation. Its speech-bubble icon and **Chatroom: Open Room** open the right Secondary Side Bar. The chat uses your current VS Code theme, font, input, button, and panel colors. Requires VS Code 1.106 or newer.
+A VS Code extension where Codex, Claude Code, GitHub Copilot and local Ollama models work on one conversation with you. A lead agent splits your request into steps. The other agents work on those steps in parallel or build on each other's results, and the lead writes one final answer. Attach PDFs, Word files or images, and every agent can read and search them using local OCR and embeddings.
+
+![A lead agent's plan: two steps run in parallel, and a third builds on both](docs/images/lead-team.png)
+
+## Features
+
+- **Lead + team.** The lead plans a small graph of steps. Independent steps run at the same time; a step that depends on others starts when they finish and receives their output. The lead then combines everything into one answer and resolves disagreements.
+- **Other ways to talk.** **Relay** (agents reply in turn and build on each other), **Parallel** (independent answers), and **1:1 chat** with a single agent.
+- **Agents know the room.** Each agent is told who else is present, which client and model they use, their roles, their tools, and which documents are attached.
+- **Documents.** PDFs (text layer, plus OCR for scanned pages), images, Word and text files are read automatically, split into passages, and embedded locally. The relevant passages go to every agent with each message.
+- **Your accounts, your machine.** Chatroom uses the clients you are already signed in to. It has no API-key form, no backend and no telemetry. OCR and embeddings run on your machine through Ollama.
+- **In control.** Live plan status, pause, resume, stop (per agent or for everyone), usage per agent, and an optional token limit per message.
+- **Native look.** It opens in the right Secondary Side Bar and uses your VS Code theme.
+
+<table>
+  <tr>
+    <td><img src="docs/images/sidebar.png" width="260" alt="Chatroom in the Secondary Side Bar showing a plan in progress"></td>
+    <td><img src="docs/images/documents.png" width="260" alt="Tools tab with the room's documents"></td>
+    <td><img src="docs/images/usage.png" width="260" alt="Usage tab with tokens by agent"></td>
+  </tr>
+  <tr>
+    <td align="center">In the side bar</td>
+    <td align="center">Tools and documents</td>
+    <td align="center">Usage</td>
+  </tr>
+</table>
+
+## Requirements
+
+- VS Code 1.106 or newer.
+- At least one signed-in client:
+  - **Codex**: the Codex extension or CLI.
+  - **Claude Code**: the Claude Code extension or CLI.
+  - **GitHub Copilot**: signed in to Copilot in VS Code.
+  - **Ollama**: local models.
+- For documents (optional): [Ollama](https://ollama.com) with a vision/OCR model and an embedding model, for example `ollama pull glm-ocr` and `ollama pull embeddinggemma`.
+- To build: Node.js 20 or newer.
 
 ## Install
 
-Build the extension with `npm run package` (see [Development environment](#development-environment)). It writes `artifacts/chatroom-0.3.2.vsix`.
+```powershell
+git clone https://github.com/GhoshSrinjoy/ChatRoom.git
+cd ChatRoom
+npm ci
+npm run package
+code --install-extension artifacts/chatroom-0.3.2.vsix
+```
 
-1. In VS Code, run **Extensions: Install from VSIX…** from the Command Palette and select that file.
-2. Open a local folder you trust and run **Chatroom: Open Room**. It opens in the right Secondary Side Bar. After upgrading, run **Developer: Reload Window** to load the new extension.
-3. Click **Refresh connections**. Copilot may ask for consent to share its models with Chatroom.
-4. Each agent has a model dropdown populated from its client. Click its name to change role, tools, and Codex reasoning effort. Use **Add agent** for more agents, including multiple models from the same provider.
-5. Send your objective to everyone, or pick **Only *name* · 1:1 chat** to talk to a single agent. The **Usage** tab controls rounds, concurrency, and an optional token limit per message (off by default). **Pause** finishes active turns and preserves queued work; **Stop** cancels all active requests. Toggle an agent off to stop only that agent.
-6. Use the paperclip to attach PDFs, Word files, images or text. They are read and indexed automatically, and every agent can use them.
+Then run **Developer: Reload Window** in VS Code. You can also install the file with **Extensions: Install from VSIX…** from the Command Palette.
 
-The grid button beside the room title opens Usage, Tools, and Activity. The diagonal arrow or **Chatroom: Open in Editor** opens an optional editor beside your current one.
+## Getting started
+
+1. Open a local folder you trust and run **Chatroom: Open Room**. It opens in the right Secondary Side Bar.
+2. Click **Refresh connections**. Copilot may ask for consent to share its models with Chatroom.
+3. Each agent has a model dropdown populated from its client. Click an agent's name to change its role, tools, and Codex reasoning effort. Use **Add agent** for more agents, including several models from the same client.
+4. Pick how the agents collaborate in the composer (**Lead + team** is the default) and who leads. Then send your request to everyone, or pick **Only *name* · 1:1 chat** to talk to a single agent.
+5. Use the paperclip to attach PDFs, Word files, images or text. They are read and indexed automatically, and every agent can use them.
+6. **Pause** finishes active turns and keeps queued work; **Stop** cancels all active requests. Turn an agent's toggle off to stop only that agent.
+
+The grid button beside the room title opens **Usage**, **Tools** and **Activity**, where you set rounds, the parallel limit and the optional token limit. The diagonal arrow or **Chatroom: Open in Editor** opens the room in an editor tab beside your current one.
 
 ## How agents collaborate
 
@@ -25,6 +71,8 @@ Choose the mode in the composer. New rooms use **Lead + team**.
 - **1:1 chat.** Picking a single agent sends exactly one turn to it with a one-on-one prompt, whatever the mode and rounds. It still sees the room's transcript.
 
 Every agent's instructions list everyone in the room with their client, model, role and tools, plus the documents attached to the room. Agents therefore know who can do what, and the lead assigns work accordingly.
+
+![Each step shows its assignment and what it builds on; the lead's final answer combines them](docs/images/final-answer.png)
 
 ## Models, task defaults, and execution
 
@@ -71,7 +119,7 @@ Click the paperclip in the composer, or **Attach documents** in the **Tools** ta
 3. **Embed.** Passages are embedded with the local embedding model. Retrieval-tuned models such as EmbeddingGemma and nomic-embed get their query/document prompts. Without an embedding model, search falls back to keyword scoring.
 4. **Use.** For every new message, Chatroom retrieves the most relevant passages once and gives them to all agents; small document sets are shared in full. Agents with `search_documents` can look up more. Agents can also read a workspace PDF or image with `read_file`, which runs the same pipeline and attaches it to the room.
 
-Chatroom selects installed local models automatically, preferring a vision model whose name contains `ocr` and an embedding model. Change them in **Tools**; after a manual choice, Chatroom stops auto-selecting. It does not download models. This machine has `glm-ocr:latest` and `embeddinggemma:latest`.
+Chatroom selects installed local models automatically, preferring a vision model whose name contains `ocr` and an embedding model. Change them in **Tools**; after a manual choice, Chatroom stops auto-selecting. It does not download models: `ollama pull glm-ocr` and `ollama pull embeddinggemma` are a good pair.
 
 Attached documents are processed because you chose them, so a token limit does not block them, but their local usage is still counted under **Local specialists**. OCR from agent tool calls respects the limit. Documents up to 40 MB are accepted, and up to 40 scanned pages are read per PDF; skipped scans are noted in the text. A PDF page drawn as vector shapes, with neither text nor an image, cannot be read.
 
@@ -95,7 +143,16 @@ This release supports discussion and read-only research. Claude's native tools a
 
 ## Development environment
 
-Development dependencies are stored in the **chatroom** Conda prefix at `.conda/chatroom`, with npm packages under `.conda/chatroom/tooling/node_modules`. The workspace `node_modules` is a junction to that location. Nothing is installed into the base Conda environment.
+With Node.js 20 or newer, the quickest route is:
+
+```powershell
+npm ci
+npm run check
+npm test
+npm run package
+```
+
+Alternatively, keep everything inside the project folder with Conda. Development dependencies are then stored in the **chatroom** Conda prefix at `.conda/chatroom`, with npm packages under `.conda/chatroom/tooling/node_modules`. The workspace `node_modules` is a junction to that location. Nothing is installed into the base Conda environment.
 
 ```powershell
 # Initial setup or dependency changes; uses the manifest's devDependencies.
@@ -108,7 +165,7 @@ npm run build
 npm run package
 ```
 
-Use `scripts/bootstrap.ps1` to install/update packages instead of running `npm install` at the project root: npm may replace a junction with a regular directory. The generated lockfile is committed at the project root for reproducibility. The environment is a project-local Conda prefix named `chatroom`; activate it using its full path.
+In the Conda setup, use `scripts/bootstrap.ps1` to install or update packages instead of running `npm install` at the project root: npm may replace the junction with a regular directory. The generated lockfile is committed at the project root for reproducibility. The environment is a project-local Conda prefix named `chatroom`; activate it using its full path.
 
 Press **F5** with the project open to launch the **Run Chatroom** development configuration. The installed extension needs no Conda, Python, or Node installation for its own bundled JavaScript; external provider CLIs have their own runtime requirements.
 
@@ -117,6 +174,9 @@ Additional validation:
 ```powershell
 # Uses an existing Google Chrome installation; saves UI previews and the logo.
 node scripts/test-ui.mjs
+
+# Regenerates the README screenshots in docs/images from sample data.
+node scripts/screenshots.mjs
 
 # Real VS Code iframe checks, in an isolated user-data directory.
 node scripts/test-sidebar.mjs
@@ -158,3 +218,7 @@ Run `node scripts/build-smoke.mjs`, then supply `scripts/extension-smoke.cjs` to
 - [VS Code Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model)
 - [Ollama chat API](https://docs.ollama.com/api/chat) and [embeddings API](https://docs.ollama.com/api/embed)
 - [GLM-OCR task-specific prompts](https://ollama.com/library/glm-ocr)
+
+## License
+
+[Apache License 2.0](LICENSE)

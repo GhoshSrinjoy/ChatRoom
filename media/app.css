@@ -137,7 +137,7 @@ pre code { background: transparent; padding: 0; }
 .budget-progress { height: 4px; width: 100%; border: 0; accent-color: var(--accent); margin: 12px 0 6px; }
 .budget-progress::-webkit-progress-bar { background: var(--input); }.budget-progress::-webkit-progress-value { background: var(--accent); }
 .stat-caption, .usage-breakdown { display: flex; justify-content: space-between; gap: 6px; color: var(--muted); font-size: 11px; margin: 6px 0; }
-.usage-agent { padding: 12px 0; border-bottom: 1px solid var(--border); }.usage-agent:last-child { border: 0; }
+.usage-agent { padding: 12px 0; border-bottom: 1px solid var(--border); }.usage-agent:last-child { border: 0; }.usage-agent .cost { font-size: 11px; margin: 6px 0; }
 .usage-agent-name { display: flex; align-items: center; gap: 8px; }.usage-agent-name strong { margin-left: auto; }
 .usage-breakdown b { font-weight: 500; color: var(--foreground); }
 .cache-card { display: flex; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border); }.cache-card p { color: var(--muted); font-size: 11px; margin: 6px 0 0; }.cache-symbol { font-size: 22px; }
