@@ -19,13 +19,23 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 
 <table>
   <tr>
-    <td><img src="docs/images/sidebar.png" width="260" alt="Chatroom in the Secondary Side Bar showing a plan in progress"></td>
-    <td><img src="docs/images/documents.png" width="260" alt="Tools tab with the room's documents"></td>
-    <td><img src="docs/images/usage.png" width="260" alt="Usage tab with tokens by agent"></td>
+    <td><img src="docs/images/sidebar.png" width="260" alt="Chatroom in the Secondary Side Bar: the team strip with the lead's star, a plan in progress and the composer chips"></td>
+    <td><img src="docs/images/approvals.png" width="260" alt="Approval cards for a command and a file edit, with Allow, Allow for session and Deny"></td>
+    <td><img src="docs/images/commands.png" width="260" alt="The slash command menu above the composer, with the open file as a context chip"></td>
   </tr>
   <tr>
     <td align="center">In the side bar</td>
-    <td align="center">Tools and documents</td>
+    <td align="center">Approvals in the room</td>
+    <td align="center">Commands and the open file</td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/tools.png" width="260" alt="Tools tab listing each agent's own tools, skills, MCP servers and commands"></td>
+    <td><img src="docs/images/documents.png" width="260" alt="Tools tab with shared skills, room tools and the room's documents"></td>
+    <td><img src="docs/images/usage.png" width="260" alt="Usage tab with tokens by agent"></td>
+  </tr>
+  <tr>
+    <td align="center">Each agent's own tools</td>
+    <td align="center">Shared skills and documents</td>
     <td align="center">Usage</td>
   </tr>
 </table>
@@ -36,7 +46,7 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 - At least one signed-in client:
   - **Claude Code**: the Claude Code extension or CLI.
   - **Codex**: the Codex extension or CLI.
-  - **GitHub Copilot CLI** (recommended for Copilot): `npm i -g @github/copilot`, then `copilot login`. Without it, Copilot runs through VS Code's chat models as a chat-only agent.
+  - **GitHub Copilot CLI** (recommended for Copilot): `npm i -g @github/copilot`, then `copilot login` (or run **Chatroom: Sign in to Copilot CLI**). Without it, Copilot runs through VS Code's chat models as a chat-only agent.
   - **Ollama**: local models.
 - For documents (optional): [Ollama](https://ollama.com) with a vision/OCR model and an embedding model, for example `ollama pull glm-ocr` and `ollama pull embeddinggemma`.
 - To build: Node.js 20 or newer.
@@ -71,6 +81,8 @@ The grid button beside the room title opens **Usage**, **Tools** and **Activity*
 - **Parallel.** Agents answer the same snapshot at the same time; the next round sees every reply.
 - **@mentions.** A message that starts with `@Agent` goes only to the mentioned agents, in order, whatever the mode. When an agent starts a line with `@Name`, that agent gets the next turn with the request. Hand-offs per message are capped (`chatroom.maxHandoffs`, default 6). In Team mode only the lead hands out work.
 - **Loops** (`/loop` or the loop chip): `/loop 3` (three rounds), `/loop consensus` (until every agent ends with `[AGREE]`), `/loop done` (until the lead ends with `[DONE]`), `/loop every 10m <prompt>` (repeat on a timer while the room is idle) and `/loop off`. Every loop stops at its iteration cap and, if set, its time and new-token caps. `/loop every …` drops the default time cap when that cap would end the loop before its iteration cap. Stop ends any loop. Interval loops do not survive a reload.
+
+![The lead's final answer combines the team's steps](docs/images/final-answer.png)
 
 Each agent gets a short room framing appended to its CLI's own system prompt: who is in the room, how messages arrive, how to hand off, and who leads. Agents have no default persona; an optional focus can be set per agent.
 
@@ -186,7 +198,7 @@ Additional validation:
 # Uses an existing Google Chrome installation; saves UI previews.
 node scripts/test-ui.mjs
 
-# Regenerates the README screenshots in docs/images from sample data.
+# Regenerates the README screenshots in docs/images from sample data (no CLI needed).
 node scripts/screenshots.mjs
 
 # Real VS Code iframe checks, in an isolated user-data directory.
