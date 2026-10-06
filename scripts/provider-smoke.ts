@@ -25,7 +25,8 @@ export async function run(): Promise<void> {
     }
   } as unknown as vscode.LanguageModelChat;
   const provider = new CopilotProvider(undefined, async selector => { assert.equal(selector?.id, 'fixture-model'); return [model]; });
-  const engine = new RoomEngine(room, { providers: { copilot: provider, codex: provider, claude: provider, ollama: provider }, tools: async () => { executions++; return 'Real tool output'; }, contextTokens: () => 12000, timeoutMs: () => 5000, changed: () => {} });
+  const engine = new RoomEngine(room, { providers: { copilot: provider, codex: provider, claude: provider, ollama: provider }, native: () => undefined, tools: async () => { executions++; return 'Real tool output'; },
+    framing: () => 'You are an agent in Chatroom.', contextTokens: () => 12000, timeoutMs: () => 5000, approvalTimeoutMs: () => 60000, maxHandoffs: () => 6, changed: () => {} });
   await engine.start('Read the documentation.');
   assert.equal(requests, 2); assert.equal(executions, 1); assert.equal(room.messages.at(-1)?.text, 'Verified response');
   assert.equal(room.completedTurns, 1);

@@ -8,10 +8,11 @@ import { resolve } from 'node:path';
 const out = 'docs/images';
 await mkdir(out, { recursive: true });
 const now = new Date('2026-10-06T09:41:00').getTime();
+const options = { effort: '', thinking: 'on', summary: 'auto', permission: 'ask', useMcp: true, useSkills: true, useProjectSettings: true, extraDirs: [], ultra: false };
 const agents = [
-  { id: 'a1', name: 'Codex', provider: 'codex', model: '', role: 'Engineer. Propose a concrete implementation and identify technical tradeoffs.', enabled: true, tools: ['list_files', 'read_file', 'search_files', 'search_documents'] },
-  { id: 'a2', name: 'Claude', provider: 'claude', model: 'sonnet', role: 'Reviewer. Challenge assumptions, catch edge cases, and improve the proposed solution.', enabled: true, tools: ['list_files', 'read_file', 'search_files', 'search_documents'] },
-  { id: 'a3', name: 'Copilot', provider: 'copilot', model: '', role: 'Integrator. Reconcile the discussion into practical next steps and a clear answer.', enabled: true, tools: ['list_files', 'read_file', 'search_files', 'search_documents'] }
+  { id: 'a1', name: 'Codex', provider: 'codex', model: '', role: '', enabled: true, tools: ['list_files', 'read_file', 'search_files', 'search_documents'], options },
+  { id: 'a2', name: 'Claude', provider: 'claude', model: 'sonnet', role: '', enabled: true, tools: ['list_files', 'read_file', 'search_files', 'search_documents'], options },
+  { id: 'a3', name: 'Copilot', provider: 'copilot', model: '', role: '', enabled: true, tools: ['list_files', 'read_file', 'search_files', 'search_documents'], options: { ...options, copilotRuntime: 'auto' } }
 ];
 const tasks = {
   s1: 'Read src/process.ts and list every way a stopped or timed-out CLI could keep a turn waiting.',
@@ -47,9 +48,10 @@ const connections = [
   { id: 'copilot', status: 'ready', detail: 'Models available through VS Code', models: [] },
   { id: 'ollama', status: 'ready', detail: 'Installed models · loopback endpoint', models: [{ id: 'glm-ocr:latest', name: 'glm-ocr:latest', capabilities: ['vision'] }, { id: 'embeddinggemma:latest', name: 'embeddinggemma:latest', capabilities: ['embedding'] }] }];
 const room = overrides => ({ id: 'demo', title: 'Review the subprocess handling for reliability issues', createdAt: now, status: 'idle', mode: 'orchestrated', leadId: 'a2', concurrency: 3,
-  activeAgents: [], queuedTurns: 0, rounds: 1, tokenBudget: 0, runStartTokens: 0, completedTurns: 5, activity: [], usage, agents, ...overrides });
+  activeAgents: [], queuedTurns: 0, loop: { kind: 'once', rounds: 2, everyMinutes: 10, maxIterations: 5, maxMinutes: 60, maxTokens: 0 }, attachEditor: true, shareSkills: true, tokenBudget: 0, runStartTokens: 0, completedTurns: 5, activity: [], usage, agents, ...overrides });
 const state = room => ({ type: 'state', workspace: 'chatroom', trusted: true, discovering: false, modelDefaults: { planning: {}, drafting: {}, review: {} }, defaultPreset: 'planning', executionMode: 'orchestrated', maxParallelAgents: 3,
-  rooms: [{ id: 'demo', title: room.title }], connections, localModels: { vision: 'glm-ocr:latest', embedding: 'embeddinggemma:latest' }, room });
+  rooms: [{ id: 'demo', title: room.title }], connections, capabilities: {}, editor: null, sharedSkills: [], roomCommands: [],
+  settings: { allowFullAccess: false, attachOpenFile: true, approvalTimeoutSeconds: 300 }, localModels: { vision: 'glm-ocr:latest', embedding: 'embeddinggemma:latest' }, room });
 const running = room({ status: 'running', activeAgents: ['a3'], currentAgent: 'a3', queuedTurns: 1, completedTurns: 2, documents: documents(true),
   agentStates: { a1: { status: 'complete' }, a2: { status: 'queued' }, a3: { status: 'thinking' } },
   messages: [user, plan(['complete', 'running', 'pending']), tool, s1, { ...s2, status: 'streaming', text: 'The only cancellation test uses a child that exits on the first signal. Missing:' }] });
@@ -72,7 +74,7 @@ try {
     await page.evaluate(() => { document.body.className = 'vscode-dark'; document.documentElement.style.setProperty('--vscode-sideBar-background', '#181818'); });
     await page.evaluate(data => window.postMessage(data, '*'), data);
     await page.locator('.message.user').waitFor();
-    if (collapseAgents) await page.evaluate(() => { document.querySelector('.roster').open = false; });
+    if (collapseAgents) await page.evaluate(() => { const roster = document.querySelector('.roster'); if (roster) roster.open = false; });
     if (tab) { await page.locator('.inspector-toggle').click(); await page.locator(`[data-tab="${tab}"]`).click(); }
     await page.evaluate(selector => {
       const list = document.getElementById('messages'), target = selector && list.querySelector(selector);

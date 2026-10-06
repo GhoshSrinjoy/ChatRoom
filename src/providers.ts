@@ -1,17 +1,46 @@
 import * as vscode from 'vscode';
-import { Provider, ProviderId, ProviderRequest, ProviderResult, Connection, ToolCall, emptyUsage } from './types';
+import { Agent, AgentCapabilities, Connection, DriverHost, NativeDriver, NativeProviderId, Provider, ProviderRequest, ProviderResult, Runtime, ToolCall, emptyUsage } from './types';
 import { OllamaClient } from './ollama';
-import { CliProvider } from './cli-provider';
-import { Runtime, findRuntime, codexModels, claudeModels } from './catalog';
+import { findRuntime, codexModels, claudeModels } from './catalog';
 import { toolSpecs } from './tool-specs';
+import { ClaudeDriver } from './claude-native';
+import { CodexDriver } from './codex-native';
+import { CopilotDriver } from './copilot-native';
 
+const EXTENSIONS: Record<NativeProviderId, string | undefined> = { codex: 'openai.chatgpt', claude: 'anthropic.claude-code', copilot: undefined };
 const runtimes = new Map<string, { expires: number; promise: Promise<Runtime | undefined> }>();
-export function providerRuntime(id: 'codex' | 'claude'): Promise<Runtime | undefined> {
+/** Settings `chatroom.{codex,claude,copilot}Path`, cached for 3 minutes. */
+export function providerRuntime(id: NativeProviderId): Promise<Runtime | undefined> {
   const configured = vscode.workspace.getConfiguration('chatroom').get<string>(`${id}Path`, id);
-  const extensionPath = vscode.extensions.getExtension(id === 'codex' ? 'openai.chatgpt' : 'anthropic.claude-code')?.extensionPath;
+  const extension = EXTENSIONS[id], extensionPath = extension ? vscode.extensions.getExtension(extension)?.extensionPath : undefined;
   const key = JSON.stringify([id, configured, extensionPath]), existing = runtimes.get(key);
   if (existing && existing.expires > Date.now()) return existing.promise;
   const promise = findRuntime(id, configured, extensionPath); runtimes.set(key, { promise, expires: Date.now() + 180000 }); return promise;
+}
+export interface Drivers { claude: ClaudeDriver; codex: CodexDriver; copilot: CopilotDriver }
+export function createDrivers(host: DriverHost): Drivers {
+  return { claude: new ClaudeDriver(host), codex: new CodexDriver(host), copilot: new CopilotDriver(host) };
+}
+export function createLegacyProviders(ollama: OllamaClient, connected?: (models: vscode.LanguageModelChat[]) => void): { copilot: Provider; ollama: Provider } {
+  return { copilot: new CopilotProvider(connected), ollama };
+}
+/** Driver to use for an agent, or undefined for the legacy path. Copilot uses the CLI when it was detected (or explicitly chosen) and the agent did not pick VS Code models. */
+export function nativeDriverFor(agent: Agent, drivers: Drivers, connections: Connection[]): NativeDriver | undefined {
+  if (agent.provider === 'claude') return drivers.claude;
+  if (agent.provider === 'codex') return drivers.codex;
+  if (agent.provider !== 'copilot') return undefined;
+  const choice = agent.options?.copilotRuntime ?? 'auto';
+  if (choice === 'vscode-lm') return undefined;
+  return choice === 'cli' || connections.find(c => c.id === 'copilot')?.runtime === 'cli' ? drivers.copilot : undefined;
+}
+const NO_SUPPORT = { thinking: false, summary: false, sandbox: false, webSearch: false, useMcp: false, useSkills: false, useProjectSettings: false, extraDirs: false,
+  ultraSession: false, ultraTurn: false, thinkHard: false, fullAccess: false, customAgent: false };
+/** Capabilities of chat-model agents (Ollama, Copilot through vscode.lm): Chatroom's read-only tools only. */
+export function legacyCapabilities(agent: Agent, connection: Connection | undefined): AgentCapabilities {
+  const status = connection?.status === 'ready' || connection?.status === 'missing' || connection?.status === 'error' ? connection.status : 'unchecked';
+  return { provider: agent.provider, runtime: agent.provider === 'ollama' ? 'ollama' : 'vscode-lm', status, ...(connection?.detail ? { detail: connection.detail } : {}),
+    ...(connection?.version ? { version: connection.version } : {}), models: connection?.models ?? [], efforts: [], tools: [...agent.tools], skills: [], commands: [], mcpServers: [],
+    supports: { ...NO_SUPPORT }, ...(connection?.hint?.action ? { action: connection.hint.action } : {}), updatedAt: Date.now() };
 }
 export class CopilotProvider implements Provider {
   constructor(private readonly connected?: (models: vscode.LanguageModelChat[]) => void,
@@ -49,25 +78,33 @@ export class CopilotProvider implements Provider {
     } finally { request.signal.removeEventListener('abort', cancel); tokenSource.dispose(); }
   }
 }
-export function createProviders(cwd: () => string, ollama: OllamaClient, connected?: (models: vscode.LanguageModelChat[]) => void): Record<ProviderId, Provider> {
-  return { codex: new CliProvider('codex', cwd, () => providerRuntime('codex')), claude: new CliProvider('claude', cwd, () => providerRuntime('claude')), copilot: new CopilotProvider(connected), ollama };
+const INSTALL_HINT = { text: 'Install the GitHub Copilot CLI to give Copilot its own tools, skills and sessions: npm i -g @github/copilot', action: 'installCopilot' as const };
+async function copilotConnection(includeCopilot: boolean, previous: Connection[]): Promise<Connection> {
+  const runtime = await providerRuntime('copilot');
+  if (runtime) return { id: 'copilot', status: 'ready', runtime: 'cli', detail: `Copilot CLI ${runtime.version} · sign-in is checked when an agent connects`, models: [],
+    modelSource: 'Copilot CLI (models load when the agent connects)', executable: runtime.executable.prefix[0] ?? runtime.executable.command, version: runtime.version };
+  if (!includeCopilot) {
+    const known = previous.find(c => c.id === 'copilot' && c.runtime !== 'cli');
+    return known ? { ...known, runtime: 'vscode-lm', hint: INSTALL_HINT } : { id: 'copilot', status: 'unchecked', runtime: 'vscode-lm', detail: 'Connect to discover your Copilot models', models: [], hint: INSTALL_HINT };
+  }
+  const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+  return { id: 'copilot', status: models.length ? 'ready' : 'missing', runtime: 'vscode-lm', detail: models.length ? `${models.length} models available through VS Code` : 'Sign in to GitHub Copilot in VS Code',
+    models: models.map(m => ({ id: m.id, name: m.name })), modelSource: 'VS Code Copilot catalog', hint: INSTALL_HINT };
 }
 export async function detectConnections(ollama: OllamaClient, includeCopilot: boolean, previous: Connection[]): Promise<Connection[]> {
   return Promise.all((['codex', 'claude', 'copilot', 'ollama'] as const).map(async id => {
     try {
       if (id === 'codex' || id === 'claude') {
         const runtime = await providerRuntime(id);
-        if (!runtime) return { id, status: 'missing', detail: 'No runtime found · install the client extension or configure its executable', models: [] } as Connection;
+        if (!runtime) return { id, status: 'missing', runtime: 'cli', detail: 'No runtime found · install the client extension or configure its executable', models: [] } as Connection;
         const catalog = await (id === 'codex' ? codexModels(runtime) : claudeModels(runtime));
-        return { id, status: 'ready', detail: `${runtime.version} · ${runtime.source} · ${catalog.models.length} models`, models: catalog.models, modelSource: catalog.source, executable: runtime.executable.prefix[0] ?? runtime.executable.command, version: runtime.version } as Connection;
+        return { id, status: 'ready', runtime: 'cli', detail: `${runtime.version} · ${runtime.source} · ${catalog.models.length} models`, models: catalog.models, modelSource: catalog.source, executable: runtime.executable.prefix[0] ?? runtime.executable.command, version: runtime.version } as Connection;
       }
       if (id === 'ollama') {
         const models = await ollama.models();
-        return { id, status: 'ready', detail: `${models.length} installed models · loopback endpoint`, models, modelSource: 'Ollama installed models' } as Connection;
+        return { id, status: 'ready', runtime: 'http', detail: `${models.length} installed models · loopback endpoint`, models, modelSource: 'Ollama installed models' } as Connection;
       }
-      if (!includeCopilot) return previous.find(c => c.id === id) ?? { id, status: 'unchecked', detail: 'Connect to discover your Copilot models', models: [] };
-      const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-      return { id, status: models.length ? 'ready' : 'missing', detail: models.length ? `${models.length} models available through VS Code` : 'Sign in to GitHub Copilot in VS Code', models: models.map(m => ({ id: m.id, name: m.name })), modelSource: 'VS Code Copilot catalog' } as Connection;
+      return await copilotConnection(includeCopilot, previous);
     } catch (error) { return { id, status: 'error', detail: error instanceof Error ? error.message : String(error), models: [] } as Connection; }
   }));
 }

@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { readFile, stat } from 'node:fs/promises';
 import { relative, isAbsolute, extname } from 'node:path';
-import { ToolCall, Agent, Room } from './types';
+import { ToolCall, Agent, Room, RoomToolName } from './types';
 import { safePath, DENIED } from './paths';
 import { DocumentService } from './documents';
 import { IMAGE_EXTENSIONS, MAX_DOCUMENT_BYTES, documentKind } from './extract';
@@ -9,6 +9,8 @@ import { cosine } from './knowledge';
 
 export { cosine };
 const EXCLUDES = '**/{node_modules,.git,.conda,.env,.aws,.ssh,.codex,.agents,dist,build}/**';
+const DOCUMENT_KINDS = ['pdf', 'docx', 'image'];
+const reader = (args: Record<string, unknown>) => (key: string, fallback = '') => typeof args[key] === 'string' ? String(args[key]).slice(0, 2000) : fallback;
 export class ToolService {
   constructor(private readonly root: () => string, private readonly documents: DocumentService, private readonly room: () => Room, private readonly log: (text: string) => void) {}
   private async files(glob = '**/*'): Promise<string[]> {
@@ -27,17 +29,12 @@ export class ToolService {
     signal.throwIfAborted();
     if (!vscode.workspace.isTrusted) throw new Error('Tools require a trusted workspace.');
     if (!agent.tools.includes(call.name)) throw new Error(`${call.name} is disabled for ${agent.name}.`);
-    const arg = (key: string, fallback = '') => typeof call.arguments[key] === 'string' ? String(call.arguments[key]).slice(0, 2000) : fallback;
+    const arg = reader(call.arguments);
     if (call.name === 'list_files') return (await this.files(arg('glob', '**/*'))).join('\n') || 'No matching files.';
     if (call.name === 'read_file') {
       const path = arg('path');
-      if (['pdf', 'docx', 'image'].includes(documentKind(path) ?? '')) {
-        // Documents are extracted (with OCR for images and scans) and attached to the room.
-        const full = await safePath(this.root(), path);
-        if ((await stat(full)).size > MAX_DOCUMENT_BYTES) throw new Error('Documents must be smaller than 40 MB.');
-        return this.documents.read(this.room(), path.replace(/\\/g, '/'), await readFile(full), signal);
-      }
-      return this.text(path);
+      // Documents are extracted (with OCR for images and scans) and attached to the room.
+      return DOCUMENT_KINDS.includes(documentKind(path) ?? '') ? this.readDocument(path, signal) : this.text(path);
     }
     if (call.name === 'search_files') {
       const query = arg('query'); if (!query) throw new Error('Search query cannot be empty.');
@@ -49,23 +46,48 @@ export class ToolService {
       }
       return found.slice(0, 60).join('\n') || 'No matches in the first 160 candidate files.';
     }
-    if (call.name === 'search_documents') {
-      const query = arg('query'); if (!query) throw new Error('Search query cannot be empty.');
-      const room = this.room(), ready = (room.documents ?? []).filter(d => d.status === 'ready');
-      if (!ready.length) return 'No documents are attached to this room. Ask the user to attach files, or read a workspace PDF, Word file or image with read_file to attach it.';
-      const { hits, method } = await this.documents.search(room, query, 6, signal);
-      this.log(`Document search · ${hits.length} passages · ${method}`);
-      return hits.length ? `Searched ${ready.length} document(s) using ${method}.\n\n${this.documents.format(hits)}` : `No passages in ${ready.map(d => d.name).join(', ')} matched. Try different words.`;
+    if (call.name === 'search_documents') return this.searchDocuments(arg('query'), 'read_file', signal);
+    if (call.name === 'ollama_ocr') return this.ocr(arg('path'), 'read_file', signal);
+    return this.semantic(arg('query'), arg('glob', '**/*'), signal);
+  }
+  /** Room tools for native CLIs. There is no per-agent gate: every native agent gets all four. */
+  async executeRoomTool(name: RoomToolName, args: Record<string, unknown>, signal: AbortSignal): Promise<string> {
+    signal.throwIfAborted();
+    if (!vscode.workspace.isTrusted) throw new Error('Tools require a trusted workspace.');
+    const arg = reader(args);
+    if (name === 'read_document') {
+      const path = arg('path');
+      if (!DOCUMENT_KINDS.includes(documentKind(path) ?? '')) throw new Error('Use your own file tools for text files.');
+      return this.readDocument(path, signal);
     }
-    if (call.name === 'ollama_ocr') {
-      const path = await safePath(this.root(), arg('path'));
-      if (!IMAGE_EXTENSIONS.includes(extname(path).toLowerCase())) throw new Error('OCR accepts PNG, JPEG and WebP images. Use read_file for PDFs.');
-      if ((await stat(path)).size > 8_000_000) throw new Error('OCR image must be smaller than 8 MB.');
-      return (await this.documents.ocr(await readFile(path), signal)).slice(0, 24000);
-    }
-    const query = arg('query'); if (!query) throw new Error('Semantic query cannot be empty.');
+    if (name === 'search_documents') return this.searchDocuments(arg('query'), 'read_document', signal);
+    if (name === 'ollama_ocr') return this.ocr(arg('path'), 'read_document', signal);
+    if (name === 'semantic_search') return this.semantic(arg('query'), arg('glob', '**/*'), signal);
+    throw new Error(`Unknown room tool ${String(name)}.`);
+  }
+  private async readDocument(path: string, signal: AbortSignal): Promise<string> {
+    const full = await safePath(this.root(), path);
+    if ((await stat(full)).size > MAX_DOCUMENT_BYTES) throw new Error('Documents must be smaller than 40 MB.');
+    return this.documents.read(this.room(), path.replace(/\\/g, '/'), await readFile(full), signal);
+  }
+  private async searchDocuments(query: string, readTool: string, signal: AbortSignal): Promise<string> {
+    if (!query) throw new Error('Search query cannot be empty.');
+    const room = this.room(), ready = (room.documents ?? []).filter(d => d.status === 'ready');
+    if (!ready.length) return `No documents are attached to this room. Ask the user to attach files, or read a workspace PDF, Word file or image with ${readTool} to attach it.`;
+    const { hits, method } = await this.documents.search(room, query, 6, signal);
+    this.log(`Document search · ${hits.length} passages · ${method}`);
+    return hits.length ? `Searched ${ready.length} document(s) using ${method}.\n\n${this.documents.format(hits)}` : `No passages in ${ready.map(d => d.name).join(', ')} matched. Try different words.`;
+  }
+  private async ocr(value: string, readTool: string, signal: AbortSignal): Promise<string> {
+    const path = await safePath(this.root(), value);
+    if (!IMAGE_EXTENSIONS.includes(extname(path).toLowerCase())) throw new Error(`OCR accepts PNG, JPEG and WebP images. Use ${readTool} for PDFs.`);
+    if ((await stat(path)).size > 8_000_000) throw new Error('OCR image must be smaller than 8 MB.');
+    return (await this.documents.ocr(await readFile(path), signal)).slice(0, 24000);
+  }
+  private async semantic(query: string, glob: string, signal: AbortSignal): Promise<string> {
+    if (!query) throw new Error('Semantic query cannot be empty.');
     const snippets: { path: string; text: string }[] = [];
-    for (const path of (await this.files(arg('glob', '**/*'))).slice(0, 40)) {
+    for (const path of (await this.files(glob)).slice(0, 40)) {
       signal.throwIfAborted();
       try {
         const content = (await this.text(path)).slice(0, 6000);

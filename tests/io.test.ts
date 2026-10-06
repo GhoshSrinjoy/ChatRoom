@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { safePath } from '../src/paths';
 import { jsonLines, localEndpoint, OllamaClient } from '../src/ollama';
 import { createServer } from 'node:http';
+import { defaultOptions } from '../src/core';
 
 test('workspace path guard rejects traversal, credentials, absolute paths and escaping junctions', async () => {
   const root = await mkdtemp(join(tmpdir(), 'chatroom-test-'));
@@ -42,7 +43,7 @@ test('Ollama HTTP adapter streams text and maps actual terminal usage', async ()
     const address = server.address() as { port: number };
     const client = new OllamaClient(() => `http://127.0.0.1:${address.port}`, () => '5m');
     const chunks: string[] = [];
-    const result = await client.run({ agent: { id: '1', provider: 'ollama', model: 'mock', name: 'Local', role: 'Helper', enabled: true, tools: [] }, system: 'System', prompt: 'Hi', signal: new AbortController().signal, onText: text => chunks.push(text), onActivity: () => {} });
+    const result = await client.run({ agent: { id: '1', provider: 'ollama', model: 'mock', name: 'Local', role: 'Helper', enabled: true, tools: [], options: defaultOptions('ollama') }, system: 'System', prompt: 'Hi', signal: new AbortController().signal, onText: text => chunks.push(text), onActivity: () => {} });
     assert.equal(result.text, 'Hello room'); assert.equal(result.usage.input, 22); assert.equal(result.usage.output, 3);
     assert.deepEqual(chunks, ['Hello ', 'Hello room']);
   } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
