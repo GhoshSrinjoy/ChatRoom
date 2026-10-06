@@ -1,160 +1,314 @@
 import { randomUUID } from 'node:crypto';
-import { Agent, Flow, Message, Provider, ProviderId, Room, ToolCall, addUsage, emptyUsage } from './types';
-import { TurnSpec, buildContext, message, parsePlan, parseToolCall, planStages, overLimit, roomFresh, estimatedUsage } from './core';
+import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, ToolCall, TurnFlags, TurnSink, addUsage, emptyUsage } from './types';
+import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, planStages, renderContext, renderEntry, roomFresh, roomUpdate, turnAsk, unseenEntries } from './core';
+import { extractHandoffs, markerOf } from './commands';
+import { plainEditorText } from './editor-context';
 
 export interface EngineOptions {
-  providers: Record<ProviderId, Provider>;
+  /** Legacy providers (Ollama, Copilot through vscode.lm). */
+  providers: Partial<Record<ProviderId, Provider>>;
+  /** The native CLI driver for an agent, or undefined for the legacy path. */
+  native: (agent: Agent) => NativeDriver | undefined;
+  /** Legacy <chatroom-tool> calls. */
   tools: (call: ToolCall, agent: Agent, signal: AbortSignal) => Promise<string>;
   /** Optional document retrieval for the latest user message, shared by every turn in a run. */
   briefing?: (room: Room, query: string, signal: AbortSignal) => Promise<string>;
-  contextTokens: () => number; timeoutMs: () => number; changed: () => void;
+  framing: (agent: Agent, room: Room, legacy: boolean) => string;
+  capabilities?: (agent: Agent, caps: AgentCapabilities) => void;
+  contextTokens: () => number;
+  /** Per-turn inactivity timeout: no sink event and no pending approval. */
+  timeoutMs: () => number;
+  approvalTimeoutMs: () => number;
+  maxHandoffs: () => number;
+  changed: () => void;
+  clock?: Clock;
 }
-interface QueueItem { id: string; round: number; direct?: boolean }
+export interface Clock { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(handle: unknown): void }
+export interface StartOptions { text?: string; targets?: string[]; all?: boolean; editor?: EditorSnapshot; flags?: TurnFlags; author?: string }
+interface QueueItem { id: string; kind: 'discussion' | 'direct' | 'handoff'; handoff?: { fromId: string; from: string; line: string } }
+interface Pass {
+  trigger: Message; direct: boolean; parallel: boolean; snapshot?: Room;
+  hops: number; keys: Set<string>; limitLogged: boolean;
+  /** Last completed answer per agent in this pass, for loop conditions. */
+  turns: Map<string, Message>;
+  /** Parallel hand-offs wait until the round's turns finish. */
+  deferred: QueueItem[];
+  failed?: string;
+  /** Team mode: agents that already failed to lead this pass. */
+  leadTried?: Set<string>;
+}
+interface Watchdog { readonly done: boolean; arm(): void; suspend(): void; resume(): void; end(): void }
+interface PendingApproval { agentId: string; finish: (status: ApprovalInfo['status'], decision: ApprovalDecision) => void }
+const realClock: Clock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => { const handle = setTimeout(fn, ms); handle.unref?.(); return handle; },
+  clearTimeout: handle => { if (handle !== undefined) clearTimeout(handle as NodeJS.Timeout); }
+};
+/** How long a driver may take to settle after an abort before the engine stops waiting for it. */
+const ABORT_GRACE_MS = 10_000;
+const MAX_ACTIVITY = 80;
+/** A native delta is delivered whole (the CLI compacts on its own), up to this many characters. */
+const MAX_DELTA_CHARS = 400_000;
+const rank = (level: PermissionLevel) => PERMISSIONS.indexOf(level);
+const display = (text: string) => text.split('<chatroom-tool>')[0]!.split('<chatroom-plan>')[0]!.slice(0, 100000);
+const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+
 export class RoomEngine {
   private queue: QueueItem[] = [];
+  private pass?: Pass;
   private controllers = new Map<string, AbortController>();
+  private approvals = new Map<string, PendingApproval>();
   private pauseRequested = false;
   private stopping = false;
   private running?: Promise<void>;
-  private roundContext?: { round: number; room: Room };
-  private consensus = new Set<string>();
   private briefing?: { key: string; text: string };
   private briefingController?: AbortController;
-  constructor(public room: Room, private readonly options: EngineOptions) {}
+  private writer: Promise<void> = Promise.resolve();
+  private writers = 0;
+  private loopTimer?: unknown;
+  private readonly clock: Clock;
+  constructor(public room: Room, private readonly options: EngineOptions) { this.clock = options.clock ?? realClock; }
   get busy(): boolean { return !!this.running; }
+  /** Resolves when the current run (if any) has settled. */
+  whenIdle(): Promise<void> { return this.running ?? Promise.resolve(); }
   private changed(): void {
     this.room.activeAgents = [...this.controllers.keys()];
     this.room.currentAgent = this.room.activeAgents[0];
-    this.room.queuedTurns = this.queue.length + (this.room.flow?.steps.filter(s => s.status === 'pending').length ?? 0);
+    this.room.queuedTurns = this.queue.length + (this.pass?.deferred.length ?? 0) + (this.room.flow?.steps.filter(s => s.status === 'pending').length ?? 0);
     this.options.changed();
   }
   log(text: string, kind: 'info' | 'tool' | 'error' = 'info'): void {
-    this.room.activity.push({ id: randomUUID(), text: text.slice(0, 1500), time: Date.now(), kind });
+    this.room.activity.push({ id: randomUUID(), text: text.slice(0, 1500), time: this.clock.now(), kind });
     this.room.activity = this.room.activity.slice(-150); this.changed();
   }
-  /** The agent that plans and answers in lead-and-team mode. */
-  lead(): Agent | undefined { return this.room.agents.find(a => a.id === this.room.leadId && a.enabled) ?? this.room.agents.find(a => a.enabled); }
-  start(text?: string, target?: string): Promise<void> {
+  private notice(text: string): void { this.room.messages.push(message('notice', text, 'Chatroom')); this.changed(); }
+  private state(id: string, status: NonNullable<Room['agentStates']>[string]['status'], detail?: string): void {
+    (this.room.agentStates ??= {})[id] = detail ? { status, detail } : { status };
+  }
+  lead(): Agent | undefined { return leadAgent(this.room); }
+
+  // ── Runs and passes ───────────────────────────────────────────────────────
+  start(input?: string | StartOptions, target?: string): Promise<void> {
+    const opts: StartOptions = input && typeof input === 'object' ? input : { text: input, targets: target ? [target] : undefined };
     if (this.running) return Promise.reject(new Error('Pause or stop the current run before sending another message.'));
-    const agents = this.room.agents.filter(a => a.enabled && (!target || a.id === target));
-    if (!agents.length) return Promise.reject(new Error(target ? 'That agent is disabled.' : 'Enable at least one agent.'));
-    if (text?.trim()) {
-      this.room.messages.push(message('user', text.trim().slice(0, 24000)));
-      if (this.room.title === 'New conversation') this.room.title = text.trim().slice(0, 56);
-      this.queue = []; this.roundContext = undefined; this.consensus.clear(); this.room.flow = undefined;
+    const enabled = this.room.agents.filter(a => a.enabled);
+    const targets = [...new Set(opts.targets ?? [])].filter(id => this.room.agents.some(a => a.id === id));
+    if ((opts.targets?.length ?? 0) > 0 && !targets.some(id => enabled.some(a => a.id === id))) return Promise.reject(new Error(targets.length > 1 ? 'Those agents are disabled.' : 'That agent is disabled.'));
+    if (!enabled.length) return Promise.reject(new Error('Enable at least one agent.'));
+    const text = opts.text?.trim();
+    if (text) {
+      const user = message('user', text.slice(0, 24000), opts.author ?? 'You');
+      user.createdAt = this.clock.now();
+      if (targets.length && !opts.all) user.targets = targets;
+      if (opts.editor) user.editor = opts.editor;
+      if (opts.flags?.think || opts.flags?.ultra) user.flags = { ...(opts.flags.think ? { think: true } : {}), ...(opts.flags.ultra ? { ultra: true } : {}) };
+      this.room.messages.push(user);
+      if (this.room.title === 'New conversation') this.room.title = text.slice(0, 56);
+      this.beginLoop(!opts.all && targets.length > 0);
+      this.newPass(user, opts.all ? [] : targets);
+    } else if (!this.pass) {
+      const trigger = this.latestUser();
+      if (!trigger) return Promise.reject(new Error('Write a message to start the room.'));
+      const again = targets.length ? targets : trigger.targets ?? [];
+      this.beginLoop(again.length > 0);
+      this.newPass(trigger, again);
     }
-    if (!this.room.messages.some(m => m.kind === 'user')) return Promise.reject(new Error('Write a message to start the room.'));
-    if (!this.queue.length && !this.room.flow) {
-      this.roundContext = undefined; this.consensus.clear(); this.room.agentStates = {};
-      if (target) this.queue = [{ id: target, round: 0, direct: true }];
-      else if (this.room.mode === 'orchestrated') this.room.flow = { wave: 0, leadId: this.lead()!.id, phase: 'plan', steps: [] };
-      else this.queue = Array.from({ length: this.room.rounds }, (_, round) => agents.map(a => ({ id: a.id, round }))).flat();
-    }
-    for (const { id } of this.queue) (this.room.agentStates ??= {})[id] = { status: 'queued' };
-    const flow = this.room.flow;
-    if (flow) for (const id of flow.phase === 'steps' ? flow.steps.filter(s => s.status === 'pending').map(s => s.agentId) : [flow.leadId]) (this.room.agentStates ??= {})[id] = { status: 'queued' };
+    return this.launch();
+  }
+  private latestUser(): Message | undefined { return [...this.room.messages].reverse().find(m => m.kind === 'user' && m.turn !== 'command'); }
+  private beginLoop(direct: boolean): void {
+    this.clearLoopTimer();
+    this.room.loopState = !direct && this.room.loop.kind !== 'once' ? { iteration: 1, startedAt: this.clock.now(), startTokens: roomFresh(this.room) } : undefined;
+  }
+  private newPass(trigger: Message, targets: string[]): void {
+    const enabled = this.room.agents.filter(a => a.enabled), direct = targets.length > 0, lead = this.lead();
+    // A paused plan that a new message replaces ends here, so its pending steps do not stay pending.
+    if (this.room.flow) this.endFlow(this.room.flow, 'Replaced by a new message.');
+    this.queue = []; this.room.agentStates = {};
+    this.pass = { trigger, direct, parallel: !direct && this.room.mode === 'parallel', hops: 0, keys: new Set(), limitLogged: false, turns: new Map(), deferred: [] };
+    if (direct) this.queue = targets.filter(id => enabled.some(a => a.id === id)).map(id => ({ id, kind: 'direct' }));
+    else if (this.room.mode === 'orchestrated') { if (lead) this.room.flow = { wave: 0, leadId: lead.id, phase: 'plan', steps: [] }; }
+    else this.queue = enabled.map(a => ({ id: a.id, kind: 'discussion' }));
+  }
+  private launch(): Promise<void> {
     this.pauseRequested = false; this.stopping = false; this.room.status = 'running'; this.room.runStartTokens = roomFresh(this.room);
-    this.running = Promise.resolve().then(() => this.loop()).finally(() => { this.running = undefined; this.controllers.clear(); this.changed(); });
+    for (const { id } of this.queue) this.state(id, 'queued');
+    const flow = this.room.flow;
+    if (flow) for (const id of flow.phase === 'steps' ? flow.steps.filter(s => s.status === 'pending').map(s => s.agentId) : [flow.leadId]) this.state(id, 'queued');
+    this.running = Promise.resolve().then(() => this.run()).finally(() => { this.running = undefined; this.controllers.clear(); this.changed(); });
     this.changed(); return this.running;
   }
   pause(): void { if (this.running) { this.pauseRequested = true; this.log('Pause requested · finishing active turns'); } }
   stop(): void {
     this.stopping = true;
-    for (const { id } of this.queue) if (!this.controllers.has(id)) (this.room.agentStates ??= {})[id] = { status: 'stopped' };
+    for (const { id } of this.queue) if (!this.controllers.has(id)) this.state(id, 'stopped');
     for (const step of this.room.flow?.steps ?? []) if (step.status === 'pending') { step.status = 'skipped'; step.detail = 'Stopped by you.'; }
-    this.queue = []; this.roundContext = undefined; this.room.flow = undefined;
+    this.queue = []; this.pass = undefined; this.room.flow = undefined;
+    this.room.loopState = undefined; this.clearLoopTimer();
     this.briefingController?.abort(new Error('Stopped by you.'));
     for (const controller of this.controllers.values()) controller.abort(new Error('Stopped by you.'));
-    if (!this.running) this.room.status = 'idle'; this.changed();
+    for (const pending of [...this.approvals.values()]) pending.finish('cancelled', { decision: 'deny', message: 'Stopped by you.' });
+    if (!this.running) this.room.status = 'idle';
+    this.changed();
   }
   stopAgent(id: string): void {
     const agent = this.room.agents.find(a => a.id === id); if (agent) agent.enabled = false;
     this.queue = this.queue.filter(item => item.id !== id);
+    if (this.pass) this.pass.deferred = this.pass.deferred.filter(item => item.id !== id);
     this.controllers.get(id)?.abort(new Error('Agent stopped by you.'));
-    (this.room.agentStates ??= {})[id] = { status: 'stopped' }; this.changed();
+    for (const pending of [...this.approvals.values()]) if (pending.agentId === id) pending.finish('cancelled', { decision: 'deny', message: 'Stopped by you.' });
+    this.state(id, 'stopped'); this.changed();
   }
+  dispose(): void { this.stop(); this.clearLoopTimer(); }
   private halted(): boolean {
     if (!this.pauseRequested && !overLimit(this.room)) return false;
     if (!this.pauseRequested) this.log(`Paused at your limit of ${this.room.tokenBudget.toLocaleString('en')} new tokens for this message · Resume to continue, or change the limit in Usage`);
     this.room.status = 'paused'; return true;
   }
-  private async loop(): Promise<void> {
+  private async run(): Promise<void> {
     try {
       await this.refreshBriefing();
-      if (this.room.flow) await this.orchestrate(); else await this.discuss();
+      while (this.pass && !this.stopping) {
+        if (this.halted()) return;
+        const pass = this.pass;
+        const done = this.room.flow ? await this.orchestrate(pass) : await this.discuss(pass);
+        if (!done || this.stopping || this.pass !== pass) break;
+        this.pass = undefined; this.queue = [];
+        if (!this.nextIteration(pass)) break;
+      }
       if (this.room.status === 'running') this.room.status = 'idle';
-    } catch (error) { this.room.status = 'idle'; this.log(error instanceof Error ? error.message : String(error), 'error'); }
+    } catch (error) { this.room.status = 'idle'; this.log(errorText(error), 'error'); }
     finally { this.changed(); }
   }
   private async refreshBriefing(): Promise<void> {
-    const latest = [...this.room.messages].reverse().find(m => m.kind === 'user'), ready = (this.room.documents ?? []).filter(d => d.status === 'ready');
+    const latest = this.latestUser(), ready = (this.room.documents ?? []).filter(d => d.status === 'ready');
     if (!this.options.briefing || !latest || !ready.length) { this.briefing = undefined; return; }
     const key = latest.id + ready.map(d => d.hash).join();
     if (this.briefing?.key === key) return;
     const controller = this.briefingController = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error('Document retrieval timed out.')), 60000);
+    const timeout = this.clock.setTimeout(() => controller.abort(new Error('Document retrieval timed out.')), 60000);
     try {
       const text = await this.options.briefing(this.room, latest.text, controller.signal);
       this.briefing = { key, text };
       if (text) this.log(`Retrieved passages from ${ready.length} room document${ready.length === 1 ? '' : 's'} for every agent`, 'tool');
     } catch (error) {
       if (this.stopping) return;
-      this.briefing = { key, text: '' }; this.log(`Document retrieval skipped · ${error instanceof Error ? error.message : String(error)}`, 'error');
-    } finally { clearTimeout(timeout); this.briefingController = undefined; }
+      this.briefing = { key, text: '' }; this.log(`Document retrieval skipped · ${errorText(error)}`, 'error');
+    } finally { this.clock.clearTimeout(timeout); this.briefingController = undefined; }
   }
-  private async discuss(): Promise<void> {
-    while (this.queue.length && !this.stopping) {
-      if (this.halted()) return;
-      const round = this.queue[0]!.round;
-      const parallel = this.room.mode === 'parallel';
-      if (this.roundContext?.round !== round) { this.roundContext = { round, room: structuredClone(this.room) }; this.consensus.clear(); }
-      const workers = parallel ? Math.max(1, Math.min(4, this.room.concurrency ?? 3)) : 1;
-      // Workers share a round snapshot. The next round sees all completed replies.
+  /** Relay, parallel and direct passes. Returns false when the run paused. */
+  private async discuss(pass: Pass): Promise<boolean> {
+    while (!this.stopping && this.pass === pass) {
+      if (!this.queue.length && pass.deferred.length) { this.queue = pass.deferred; pass.deferred = []; pass.parallel = false; pass.snapshot = undefined; }
+      if (!this.queue.length) return true;
+      if (this.halted()) return false;
+      if (this.capHit()) { this.queue = []; pass.deferred = []; return true; }
+      if (!pass.parallel) { await this.runItem(this.queue.shift()!, pass, this.room); continue; }
+      // Workers share a snapshot of the room taken when the round began; the next round sees every reply.
+      const snapshot = pass.snapshot ??= { ...this.room, messages: this.room.messages.slice() };
+      const workers = Math.max(1, Math.min(4, this.room.concurrency ?? 3));
       await Promise.all(Array.from({ length: workers }, async () => {
-        while (this.queue[0]?.round === round && !this.stopping && !this.pauseRequested && !overLimit(this.room)) {
-          const { id, direct } = this.queue.shift()!, agent = this.room.agents.find(a => a.id === id);
-          if (!agent?.enabled) { this.changed(); continue; }
-          await this.turn(agent, parallel && !direct ? this.roundContext!.room : this.room, { kind: direct ? 'direct' : 'discussion', parallel });
-        }
+        while (this.queue.length && !this.stopping && !this.pauseRequested && !overLimit(this.room) && !this.capHit()) await this.runItem(this.queue.shift()!, pass, snapshot);
       }));
-      const participants = this.room.agents.filter(a => a.enabled && this.room.agentStates?.[a.id]);
-      if (!this.queue.some(item => item.round === round) && participants.length && participants.every(a => this.consensus.has(a.id))) {
-        this.queue = []; this.log('All active agents reached consensus');
-      }
+      if (this.loopStopped()) { this.queue = []; pass.deferred = []; }
     }
+    return !this.stopping;
   }
-  private async orchestrate(): Promise<void> {
-    while (!this.stopping) {
+  private loopSpec(pass: Pass): Partial<TurnSpec> {
+    const state = pass.direct ? undefined : this.room.loopState, loop = this.room.loop, iteration = state?.iteration ?? 1;
+    return { trigger: pass.trigger, ...(state ? { loop, iteration, round: iteration, rounds: loop.kind === 'rounds' ? loop.rounds : 1 } : {}) };
+  }
+  private async runItem(item: QueueItem, pass: Pass, contextRoom: Room): Promise<void> {
+    const agent = this.room.agents.find(a => a.id === item.id);
+    if (!agent?.enabled) { this.changed(); return; }
+    const spec: TurnSpec = { kind: item.kind, parallel: pass.parallel && item.kind === 'discussion', ...this.loopSpec(pass),
+      ...(item.handoff ? { handoff: { from: item.handoff.from, line: item.handoff.line } } : {}) };
+    const answer = await this.turn(agent, contextRoom, spec, item.handoff?.fromId);
+    if (answer.status === 'complete') { pass.turns.set(agent.id, answer); this.handoffs(answer, agent, pass); }
+    else if (answer.status === 'error') pass.failed ??= agent.name;
+  }
+  private handoffs(answer: Message, author: Agent, pass: Pass): void {
+    const enabled = this.room.agents.filter(a => a.enabled);
+    const found = extractHandoffs(answer.text, author, enabled, this.lead()?.id);
+    const items: QueueItem[] = [];
+    for (const { agentId, line } of found) {
+      const target = enabled.find(a => a.id === agentId), key = `${author.id}>${agentId}>${line}`;
+      if (!target || agentId === author.id || pass.keys.has(key)) continue;
+      if (pass.hops >= Math.max(0, this.options.maxHandoffs())) {
+        if (!pass.limitLogged) { pass.limitLogged = true; this.log('Hand-off limit reached'); }
+        continue;
+      }
+      pass.keys.add(key); pass.hops++;
+      items.push({ id: agentId, kind: 'handoff', handoff: { fromId: author.id, from: author.name, line } });
+    }
+    if (!items.length) return;
+    const to = [...new Set(items.map(i => i.id))];
+    answer.handoff = { from: author.id, to };
+    this.log(`${author.name} handed off to ${to.map(id => this.room.agents.find(a => a.id === id)!.name).join(', ')}`);
+    if (pass.parallel) pass.deferred.push(...items);
+    else {
+      const targets = new Set(to);
+      this.queue = [...items, ...this.queue.filter(q => q.kind === 'handoff' || !targets.has(q.id))];
+    }
+    for (const id of to) if (!this.controllers.has(id)) this.state(id, 'queued');
+    this.changed();
+  }
+  /** Lead plan → steps → synthesis, with extra waves while the loop allows. Returns false when the run paused. */
+  private async orchestrate(pass: Pass): Promise<boolean> {
+    while (!this.stopping && this.pass === pass) {
       const flow = this.room.flow;
-      if (!flow || this.halted()) return;
+      if (!flow) return true;
+      if (this.halted()) return false;
+      if (this.capHit()) { this.endFlow(flow, 'The loop stopped.'); return true; }
       const lead = this.room.agents.find(a => a.id === flow.leadId);
-      if (!lead?.enabled) { this.log('The lead agent is disabled · choose another lead and send again', 'error'); this.room.flow = undefined; return; }
+      if (!lead?.enabled) { this.log('The lead agent is disabled · choose another lead and send again', 'error'); this.room.flow = undefined; return true; }
       if (flow.phase === 'steps') {
-        await this.runSteps(flow);
-        if (this.stopping || this.room.flow !== flow) return;
+        await this.runSteps(flow, pass);
+        if (this.stopping || this.room.flow !== flow) return !this.stopping;
         if (flow.steps.some(s => s.status === 'pending')) {
-          if (this.halted()) return;
+          if (this.halted()) return false;
+          if (this.loopStopped()) { this.endFlow(flow, 'The loop stopped.'); return true; }
           for (const step of flow.steps) if (step.status === 'pending') { step.status = 'skipped'; step.detail = 'It could not be scheduled.'; }
         }
-        flow.phase = 'synthesis'; (this.room.agentStates ??= {})[lead.id] = { status: 'queued' }; continue;
+        flow.phase = 'synthesis'; this.state(lead.id, 'queued'); continue;
       }
-      const roundsLeft = Math.max(0, this.room.rounds - flow.wave - 1);
-      const answer = await this.turn(lead, this.room, { kind: flow.phase, flow, roundsLeft });
-      if (this.stopping || this.room.flow !== flow) return;
-      if (answer.status !== 'complete') { this.room.flow = undefined; return; }
-      if (answer.plan?.length && (flow.phase === 'plan' || roundsLeft > 0)) {
+      const wavesLeft = Math.max(0, (this.room.loop.kind === 'rounds' ? this.room.loop.rounds : 1) - flow.wave - 1);
+      const answer = await this.turn(lead, this.room, { kind: flow.phase, flow, wavesLeft, ...this.loopSpec(pass) });
+      if (this.stopping || this.room.flow !== flow) return !this.stopping;
+      if (answer.status !== 'complete') {
+        // A lead that cannot run (missing CLI, usage limit) hands this message to the next enabled agent instead of failing it.
+        if (answer.status === 'error' && flow.phase === 'plan' && flow.wave === 0) {
+          (pass.leadTried ??= new Set()).add(lead.id);
+          const next = this.room.agents.find(a => a.enabled && !pass.leadTried!.has(a.id));
+          if (next) { this.log(`${lead.name} could not lead this message · ${next.name} takes over`); flow.leadId = next.id; this.state(next.id, 'queued'); continue; }
+        }
+        if (answer.status === 'error') pass.failed ??= lead.name;
+        this.room.flow = undefined; return true;
+      }
+      pass.turns.set(lead.id, answer);
+      const delegate = flow.phase === 'plan' || wavesLeft > 0;
+      if (delegate && !answer.plan?.length) {
+        const found = extractHandoffs(answer.text, lead, this.room.agents.filter(a => a.enabled), lead.id).slice(0, MAX_PLAN_STEPS);
+        if (found.length) answer.plan = found.map((h, i): PlanStep => ({ id: `s${i + 1}`, agentId: h.agentId, task: h.line || 'Help with the request above.', after: [], status: 'pending' }));
+      }
+      if (delegate && answer.plan?.length) {
         if (flow.phase === 'synthesis') flow.wave++;
         answer.turn = 'plan'; flow.steps = answer.plan; flow.planId = answer.id; flow.phase = 'steps';
-        for (const step of flow.steps) (this.room.agentStates ??= {})[step.agentId] = { status: 'queued' };
+        for (const step of flow.steps) this.state(step.agentId, 'queued');
         const stages = planStages(flow.steps);
         this.log(`${lead.name} planned ${flow.steps.length} step${flow.steps.length === 1 ? '' : 's'} in ${stages.length} stage${stages.length === 1 ? '' : 's'}${stages.some(s => s.length > 1) ? ' · independent steps run in parallel' : ''}`);
         continue;
       }
-      if (answer.plan) { delete answer.plan; this.log(`${lead.name} proposed more steps, but the run has no rounds left · raise Rounds to allow another wave`); }
-      answer.turn = 'synthesis'; this.room.flow = undefined; return;
+      if (answer.plan) { delete answer.plan; this.log(`${lead.name} proposed more steps, but no waves are left · use /loop N to allow more`); }
+      answer.turn = 'synthesis'; this.room.flow = undefined; return true;
     }
+    return !this.stopping;
   }
-  private async runSteps(flow: Flow): Promise<void> {
+  private endFlow(flow: Flow, detail: string): void {
+    for (const step of flow.steps) if (step.status === 'pending') { step.status = 'skipped'; step.detail = detail; }
+    this.room.flow = undefined;
+  }
+  private async runSteps(flow: Flow, pass: Pass): Promise<void> {
     const running = new Map<string, Promise<void>>();
     const status = (id: string) => flow.steps.find(s => s.id === id)?.status;
     const limit = Math.max(1, Math.min(4, this.room.concurrency ?? 3));
@@ -167,14 +321,20 @@ export class RoomEngine {
       // One turn per agent at a time; dependencies gate the rest.
       const busy = new Set(flow.steps.filter(s => s.status === 'running').map(s => s.agentId));
       for (const step of flow.steps) {
-        if (running.size >= limit || this.pauseRequested || overLimit(this.room)) break;
+        if (running.size >= limit || this.pauseRequested || overLimit(this.room) || this.capHit()) break;
         if (step.status !== 'pending' || busy.has(step.agentId) || !step.after.every(id => status(id) === 'complete')) continue;
         const agent = this.room.agents.find(a => a.id === step.agentId)!;
         step.status = 'running'; busy.add(agent.id);
-        running.set(step.id, this.turn(agent, this.room, { kind: 'step', flow, step }).then(answer => {
+        running.set(step.id, this.turn(agent, this.room, { kind: 'step', flow, step, ...this.loopSpec(pass) }).then(answer => {
           step.messageId = answer.id;
           step.status = answer.status === 'complete' ? 'complete' : answer.status === 'cancelled' ? 'skipped' : 'error';
           if (answer.status !== 'complete') step.detail = answer.status === 'cancelled' ? 'Stopped.' : 'The agent failed.';
+          if (answer.status === 'error') pass.failed ??= agent.name;
+          if (answer.status === 'complete') {
+            pass.turns.set(agent.id, answer);
+            const mentioned = extractHandoffs(answer.text, agent, this.room.agents.filter(a => a.enabled), flow.leadId);
+            if (mentioned.length) this.log(`${agent.name} mentioned ${[...new Set(mentioned.map(h => this.room.agents.find(a => a.id === h.agentId)?.name ?? h.agentId))].join(', ')}; in Team mode the lead coordinates.`);
+          }
         }).finally(() => running.delete(step.id)));
       }
       this.changed();
@@ -183,20 +343,324 @@ export class RoomEngine {
     }
     await Promise.allSettled(running.values());
   }
-  private async turn(agent: Agent, contextRoom: Room, spec: TurnSpec): Promise<Message> {
-    const id = agent.id, controller = new AbortController(), signal = controller.signal;
-    this.controllers.set(id, controller); (this.room.agentStates ??= {})[id] = { status: 'thinking' };
-    const timeout = setTimeout(() => controller.abort(new Error('Turn timed out. Increase the turn timeout in Settings if needed.')), this.options.timeoutMs());
-    const purpose = spec.kind === 'step' ? ` · step ${spec.step!.id}` : spec.kind === 'plan' ? ' · planning' : spec.kind === 'synthesis' ? ' · final answer' : spec.kind === 'direct' ? ' · 1:1' : '';
-    this.log(`${agent.name} started${purpose} · ${agent.model || 'client default'}`);
-    const context = buildContext(contextRoom, agent, this.options.contextTokens(), { ...spec, briefing: this.briefing?.text });
-    const answer = message('agent', '', agent.name, id); answer.status = 'streaming'; answer.turn = spec.kind;
-    if (spec.kind === 'step') answer.step = { id: spec.step!.id, plan: spec.flow?.planId, task: spec.step!.task, after: spec.step!.after };
-    this.room.messages.push(answer);
+
+  // ── Loops (§6.7) ──────────────────────────────────────────────────────────
+  private loopStopped(): boolean { return !!this.room.loopState?.stoppedReason; }
+  private capReason(iterations: boolean): string | undefined {
+    const state = this.room.loopState, loop = this.room.loop;
+    if (!state) return;
+    if (iterations && ['consensus', 'lead-done', 'interval'].includes(loop.kind) && state.iteration >= loop.maxIterations) return `reached ${loop.maxIterations} run${loop.maxIterations === 1 ? '' : 's'}`;
+    if (loop.maxMinutes > 0 && this.clock.now() - state.startedAt > loop.maxMinutes * 60000) return `reached the ${loop.maxMinutes}-minute limit`;
+    if (loop.maxTokens > 0 && roomFresh(this.room) - state.startTokens >= loop.maxTokens) return `reached the ${loop.maxTokens.toLocaleString('en')}-token limit`;
+  }
+  /** Checks the time and token caps before a pass or a queued turn; stops the loop when one is hit. */
+  private capHit(): boolean {
+    const state = this.room.loopState;
+    if (!state) return false;
+    if (state.stoppedReason) return true;
+    const reason = this.capReason(false);
+    if (reason) this.stopLoop(reason);
+    return !!reason;
+  }
+  private stopLoop(reason: string): void {
+    if (this.room.loopState) { this.room.loopState.stoppedReason = reason; delete this.room.loopState.nextAt; }
+    this.clearLoopTimer(); this.log(`Loop stopped: ${reason}`);
+  }
+  private finishLoop(note: string): false { this.room.loopState = undefined; if (note) this.log(note); return false; }
+  /** After a completed pass: decides whether the loop runs another pass now (true), later (interval) or ends. */
+  private nextIteration(pass: Pass): boolean {
+    const state = this.room.loopState, loop = this.room.loop;
+    if (!state || pass.direct || state.stoppedReason) return false;
+    if (pass.failed) { this.stopLoop(`${pass.failed} failed`); return false; }
+    if (loop.kind === 'once') return this.finishLoop('');
+    if (!this.room.agents.some(a => a.enabled)) { this.stopLoop('no agent is turned on'); return false; }
+    if (loop.kind === 'rounds' && (this.room.mode === 'orchestrated' || state.iteration >= loop.rounds)) return this.finishLoop(this.room.mode === 'orchestrated' ? '' : `Loop finished · ${state.iteration} rounds`);
+    if (loop.kind === 'consensus') {
+      const turns = [...pass.turns.values()];
+      if (turns.length && turns.every(m => m.marker === 'agree')) return this.finishLoop('Loop finished · every agent agrees');
+    }
+    if (loop.kind === 'lead-done') {
+      const lead = this.lead(), last = lead && pass.turns.get(lead.id);
+      if (last?.marker === 'done') return this.finishLoop(`Loop finished · ${lead!.name} marked the task done`);
+    }
+    const cap = this.capReason(true);
+    if (cap) { this.stopLoop(cap); return false; }
+    if (loop.kind === 'interval') {
+      state.nextAt = this.clock.now() + loop.everyMinutes * 60000;
+      this.log(`Next loop run in ${loop.everyMinutes} minute${loop.everyMinutes === 1 ? '' : 's'}`);
+      this.scheduleLoop(); return false;
+    }
+    state.iteration++;
+    this.newPass(pass.trigger, []);
+    for (const { id } of this.queue) this.state(id, 'queued');
+    if (this.room.flow) this.state(this.room.flow.leadId, 'queued');
+    return true;
+  }
+  private clearLoopTimer(): void { if (this.loopTimer !== undefined) { this.clock.clearTimeout(this.loopTimer); this.loopTimer = undefined; } }
+  scheduleLoop(): void {
+    this.clearLoopTimer();
+    const state = this.room.loopState;
+    if (this.room.loop.kind !== 'interval' || !state || state.stoppedReason || state.nextAt === undefined) return;
+    this.loopTimer = this.clock.setTimeout(() => this.tick(), Math.max(0, state.nextAt - this.clock.now()));
+  }
+  private tick(): void {
+    this.loopTimer = undefined;
+    const state = this.room.loopState, loop = this.room.loop;
+    if (!state || loop.kind !== 'interval' || state.stoppedReason) return;
+    if (this.running || this.room.status !== 'idle') {
+      this.log('Loop run skipped · the room is busy');
+      state.nextAt = this.clock.now() + loop.everyMinutes * 60000; this.scheduleLoop(); return;
+    }
+    const cap = this.capReason(true);
+    if (cap) { this.stopLoop(cap); return; }
+    if (!this.room.agents.some(a => a.enabled)) { this.stopLoop('no agent is turned on'); return; }
+    const text = loop.prompt?.trim() || this.latestUser()?.text;
+    if (!text) { this.stopLoop('there is no message to repeat'); return; }
+    state.iteration++; delete state.nextAt;
+    const trigger = message('user', text.slice(0, 24000), 'Loop');
+    trigger.createdAt = this.clock.now();
+    this.room.messages.push(trigger);
+    this.newPass(trigger, []);
+    void this.launch().catch(() => {});
+  }
+
+  // ── Turns ─────────────────────────────────────────────────────────────────
+  private turn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string): Promise<Message> {
+    const driver = this.options.native(agent);
+    return driver ? this.nativeTurn(agent, driver, contextRoom, spec, handoffFrom) : this.legacyTurn(agent, contextRoom, spec, handoffFrom);
+  }
+  private purpose(spec: TurnSpec, command?: { name: string }): string {
+    switch (spec.kind) {
+      case 'step': return ` · step ${spec.step!.id}`;
+      case 'plan': return ' · planning';
+      case 'synthesis': return ' · final answer';
+      case 'direct': return ' · 1:1';
+      case 'handoff': return ` · asked by ${spec.handoff?.from ?? 'a teammate'}`;
+      case 'command': return ` · /${command?.name ?? 'command'}`;
+      default: return '';
+    }
+  }
+  private answerFor(agent: Agent, spec: TurnSpec, handoffFrom?: string): Message {
+    const answer = message('agent', '', agent.name, agent.id);
+    answer.createdAt = this.clock.now(); answer.status = 'streaming'; answer.turn = spec.kind;
+    if (spec.kind === 'step' && spec.step) answer.step = { id: spec.step.id, plan: spec.flow?.planId, task: spec.step.task, after: spec.step.after };
+    if (handoffFrom) answer.handoff = { from: handoffFrom, to: [agent.id] };
+    return answer;
+  }
+  /** Inactivity timer: re-armed by every sink event, suspended while an approval is pending. */
+  private watchdog(agent: Agent, controller: AbortController): Watchdog {
+    let handle: unknown, suspended = 0, done = false;
+    const seconds = () => Math.round(this.options.timeoutMs() / 1000);
+    const arm = () => {
+      this.clock.clearTimeout(handle); handle = undefined;
+      if (!done && !suspended) handle = this.clock.setTimeout(() => controller.abort(new Error(`No activity from ${agent.name} for ${seconds()} s. Increase chatroom.turnTimeoutSeconds if needed.`)), this.options.timeoutMs());
+    };
+    return {
+      arm, get done() { return done; },
+      suspend: () => { suspended++; arm(); },
+      resume: () => { suspended = Math.max(0, suspended - 1); arm(); },
+      end: () => { done = true; this.clock.clearTimeout(handle); handle = undefined; }
+    };
+  }
+  /** One writer at a time: agents that edit without asking (auto-edit, full access, a writable Codex sandbox) wait for each other. */
+  private async writerLock(agent: Agent, signal: AbortSignal): Promise<(() => void) | undefined> {
+    const permission = agent.options?.permission, sandbox = agent.provider === 'codex' && permission !== 'plan' ? agent.options?.sandbox : undefined;
+    if (permission !== 'auto-edit' && permission !== 'full' && sandbox !== 'workspace-write' && sandbox !== 'danger-full-access') return;
+    const previous = this.writer;
+    let release!: () => void;
+    this.writer = new Promise<void>(resolve => release = resolve);
+    if (this.writers++ > 0) { this.state(agent.id, 'queued', 'Waiting for another agent to finish editing'); this.changed(); }
+    const done = () => { this.writers--; release(); };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => reject(signal.reason ?? new Error('Stopped.'));
+        if (signal.aborted) return onAbort();
+        signal.addEventListener('abort', onAbort, { once: true });
+        void previous.then(() => { signal.removeEventListener('abort', onAbort); resolve(); });
+      });
+    } catch (error) { void previous.then(done); throw error; }
+    return done;
+  }
+  /** Waits for a driver, but never longer than a grace period after an abort. */
+  private bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let grace: unknown;
+      const onAbort = () => { grace = this.clock.setTimeout(() => reject(signal.reason ?? new Error('Stopped.')), ABORT_GRACE_MS); };
+      if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(resolve, reject).finally(() => { this.clock.clearTimeout(grace); signal.removeEventListener('abort', onAbort); });
+    });
+  }
+  private approval(agent: Agent, request: ApprovalRequest, signals: AbortSignal[], timer: Watchdog): Promise<ApprovalDecision> {
+    const now = this.clock.now(), timeoutMs = Math.max(1000, this.options.approvalTimeoutMs());
+    const info: ApprovalInfo = { kind: request.kind, tool: String(request.tool ?? 'tool'), title: String(request.title ?? 'Permission request').slice(0, 500),
+      ...(request.detail ? { detail: String(request.detail).slice(0, 8000) } : {}), ...(request.diff ? { diff: String(request.diff).slice(0, 8000) } : {}),
+      canAllowSession: !!request.canAllowSession, id: randomUUID(), agentId: agent.id, provider: agent.provider, status: 'pending', createdAt: now, expiresAt: now + timeoutMs };
+    const card = message('approval', info.title, agent.name, agent.id);
+    card.createdAt = now; card.approval = info;
+    this.room.messages.push(card);
+    this.state(agent.id, 'approval', info.title); timer.suspend(); this.changed();
+    return new Promise<ApprovalDecision>(resolve => {
+      let settled = false, expiry: unknown;
+      const finish = (status: ApprovalInfo['status'], decision: ApprovalDecision) => {
+        if (settled) return;
+        settled = true; info.status = status; info.decidedAt = this.clock.now();
+        this.clock.clearTimeout(expiry); this.approvals.delete(info.id);
+        for (const signal of signals) signal.removeEventListener('abort', onAbort);
+        timer.resume();
+        if (!timer.done && ![...this.approvals.values()].some(p => p.agentId === agent.id)) this.state(agent.id, 'thinking');
+        this.log(`${agent.name}: ${info.title} → ${decision.decision === 'deny' ? 'Denied' : 'Allowed'}`);
+        resolve(decision);
+      };
+      const onAbort = () => finish('cancelled', { decision: 'deny', message: 'The request was cancelled.' });
+      this.approvals.set(info.id, { agentId: agent.id, finish });
+      expiry = this.clock.setTimeout(() => finish('expired', { decision: 'deny', message: 'No response from the user in time.' }), timeoutMs);
+      for (const signal of signals) {
+        if (signal.aborted) { onAbort(); return; }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+  decide(approvalId: string, decision: ApprovalDecision): boolean {
+    const pending = this.approvals.get(approvalId), kind = decision?.decision;
+    if (!pending || (kind !== 'allow' && kind !== 'allow-session' && kind !== 'deny')) return false;
+    const message = typeof decision.message === 'string' && decision.message.trim() ? decision.message.trim().slice(0, 2000) : undefined;
+    pending.finish(kind === 'allow' ? 'allowed' : kind === 'allow-session' ? 'allowed-session' : 'denied', { decision: kind, ...(message ? { message } : {}) });
+    return true;
+  }
+  private upsertActivity(answer: Message, item: ActivityItem): void {
+    const list = answer.activity ??= [];
+    const entry = { ...item, at: item.at ?? this.clock.now() }, index = list.findIndex(a => a.id === item.id);
+    if (index >= 0) list[index] = { ...list[index]!, ...entry }; else list.push(entry);
+    while (list.length > MAX_ACTIVITY) {
+      const old = list.findIndex(a => a.status !== 'running');
+      list.splice(old >= 0 ? old : 0, 1);
+    }
+  }
+  private async nativeTurn(agent: Agent, driver: NativeDriver, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, command?: { name: string; args: string }): Promise<Message> {
+    const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
+    this.controllers.set(id, controller); this.state(id, 'thinking');
+    const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec, command);
+    let release: (() => void) | undefined;
+    try {
+      release = await this.writerLock(agent, signal);
+      this.state(id, 'thinking');
+      const framing = this.options.framing(agent, this.room, false), maxChars = this.options.contextTokens() * 3;
+      let context = '', ask = '', fullContext = () => '', editor: EditorSnapshot | undefined, flags: TurnFlags = {}, seen: string | undefined;
+      if (!command) {
+        const session = agent.session, trigger = spec.trigger;
+        const entries = session ? unseenEntries(contextRoom, agent, spec) : boundedHistory(contextRoom, agent, this.options.contextTokens(), spec);
+        seen = contextRoom.messages.at(-1)?.id;
+        const unseen = !!trigger && entries.some(m => m.id === trigger.id);
+        const rest = unseen ? entries.filter(m => m.id !== trigger!.id) : entries;
+        const update = session?.id && framingHash(framing) !== session.framingHash ? roomUpdate(framing) : '';
+        // The delta goes whole: seen moves past it, so anything cut here would never reach the session.
+        const deltaChars = rest.reduce((n, m) => n + renderEntry(m, this.room).length + 2, 0);
+        context = [update, rest.length ? renderContext(rest, this.room, Math.min(MAX_DELTA_CHARS, Math.max(maxChars, deltaChars))) : ''].filter(Boolean).join('\n\n');
+        fullContext = () => renderContext(boundedHistory(contextRoom, agent, this.options.contextTokens(), spec).filter(m => !(unseen && m.id === trigger!.id)), this.room, maxChars);
+        const briefing = unseen && trigger!.kind === 'user' ? this.briefing?.text ?? '' : '';
+        ask = [unseen ? renderEntry(trigger!, this.room) : '', turnAsk(agent, this.room, spec), briefing].filter(Boolean).join('\n\n');
+        if (unseen) { editor = trigger!.editor; if (spec.kind !== 'handoff' && trigger!.flags) flags = { ...trigger!.flags }; }
+      }
+      this.room.messages.push(answer); timer.arm();
+      this.log(`${agent.name} started${purpose} · ${agent.model || 'default model'}`);
+      const touch = () => timer.arm();
+      const sink: TurnSink = {
+        text: full => { if (timer.done) return; answer.text = display(String(full ?? '')); touch(); this.changed(); },
+        thinking: full => { if (timer.done) return; answer.thinking = String(full ?? '').slice(-20000); touch(); this.changed(); },
+        activity: item => {
+          if (timer.done || !item || typeof item.id !== 'string') return;
+          this.upsertActivity(answer, item);
+          if (this.room.agentStates?.[id]?.status !== 'approval') this.state(id, item.status === 'running' ? 'tool' : 'thinking', item.status === 'running' ? item.title : undefined);
+          touch(); this.changed();
+        },
+        approval: (request, driverSignal) => { touch(); return this.approval(agent, request, driverSignal && driverSignal !== signal ? [signal, driverSignal] : [signal], timer); },
+        session: patch => { agent.session = { ...agent.session, ...patch, provider: agent.provider, lastUsedAt: this.clock.now() }; touch(); this.changed(); },
+        capabilities: caps => { this.options.capabilities?.(agent, caps); touch(); },
+        options: patch => {
+          // A CLI may lower its own permission, or leave plan mode after an approved plan; it never raises itself.
+          const { permission, exitPlan, ...rest } = patch ?? {};
+          Object.assign(agent.options, rest);
+          const allowed = !!permission && !!PERMISSION_LABELS[permission] && (rank(permission) < rank(agent.options.permission) || (!!exitPlan && agent.options.permission === 'plan' && permission === 'ask'));
+          if (permission && allowed) {
+            agent.options.permission = permission; this.log(`${agent.name} switched to ${PERMISSION_LABELS[permission]}`);
+          }
+          touch(); this.changed();
+        }
+      };
+      const result = await this.bounded(driver.turn({ room: this.room, agent, kind: spec.kind, framing, context, fullContext, ask, editor, flags, ...(command ? { command } : {}), signal, sink }), signal);
+      timer.end();
+      answer.text = String(result?.text || answer.text || '').slice(0, 100000);
+      const usage = result?.usage ?? emptyUsage();
+      answer.usage = usage; this.room.usage[id] = addUsage(this.room.usage[id] ?? emptyUsage(), usage);
+      const delivered = () => {
+        const seenId = spec.kind === 'step' && spec.flow?.planId ? spec.flow.planId : seen;
+        agent.session = { ...agent.session, ...(seenId ? { seen: seenId } : {}), framingHash: framingHash(framing), provider: agent.provider, lastUsedAt: this.clock.now() };
+      };
+      if (result?.status === 'interrupted') {
+        // Stopped after the CLI received the input (it says so, or the model already answered): its session holds it, so later turns must not send it again.
+        if (!command && (result.delivered || answer.text.trim() || answer.thinking)) delivered();
+        return this.cancelled(agent, answer, signal);
+      }
+      if (command && !answer.text.trim()) answer.text = `/${command.name} finished.`;
+      this.complete(agent, answer, spec, purpose);
+      if (!command) delivered();
+    } catch (error) {
+      this.failed(agent, answer, signal, error);
+    } finally {
+      timer.end(); release?.();
+      if (this.controllers.get(id) === controller) this.controllers.delete(id);
+      this.changed();
+    }
+    return answer;
+  }
+  private complete(agent: Agent, answer: Message, spec: TurnSpec, purpose: string): void {
+    if (spec.kind === 'plan' || spec.kind === 'synthesis') {
+      const parsed = parsePlan(answer.text, this.room.agents.filter(a => a.enabled));
+      if (parsed) { answer.text = parsed.text; if (parsed.steps.length) answer.plan = parsed.steps; parsed.notes.forEach(note => this.log(note)); }
+    }
+    if (!answer.text.trim() && !answer.plan && !answer.activity?.length) throw new Error('The agent returned an empty answer.');
+    answer.status = 'complete'; this.room.completedTurns++; this.state(agent.id, 'complete');
+    const marker = spec.kind === 'command' ? undefined : markerOf(answer.text);
+    if (marker) answer.marker = marker;
+    const usage = answer.usage ?? emptyUsage();
+    this.log(`${agent.name} finished${purpose} · ${usage.input + usage.output} ${usage.estimated ? 'estimated ' : ''}tokens`);
+  }
+  private cancelled(agent: Agent, answer: Message, signal: AbortSignal): Message {
+    const reason = signal.aborted ? errorText(signal.reason ?? 'Stopped.') : 'Interrupted.';
+    answer.status = 'cancelled'; answer.text = answer.text ? `${answer.text}\n\n${reason}` : reason;
+    this.state(agent.id, 'stopped', reason);
+    this.queue = this.queue.filter(item => item.id !== agent.id);
+    this.log(`${agent.name}: ${reason}`, /No activity/.test(reason) ? 'error' : 'info');
+    return answer;
+  }
+  private failed(agent: Agent, answer: Message, signal: AbortSignal, error: unknown): void {
+    if (!this.room.messages.includes(answer)) {
+      if (signal.aborted) { answer.status = 'cancelled'; this.state(agent.id, 'stopped'); return; }
+      this.room.messages.push(answer);
+    }
+    if (signal.aborted) { this.cancelled(agent, answer, signal); return; }
+    const detail = errorText(error);
+    answer.status = 'error'; answer.text = answer.text ? `${answer.text}\n\n${detail}` : detail;
+    this.state(agent.id, 'error', detail);
+    this.queue = this.queue.filter(item => item.id !== agent.id);
+    this.log(`${agent.name}: ${detail}`, 'error');
+    if (error instanceof ProviderError && error.extra?.action) this.notice(error.message);
+  }
+  private async legacyTurn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string): Promise<Message> {
+    const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
+    this.controllers.set(id, controller); this.state(id, 'thinking');
+    const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec);
     let aggregate = emptyUsage(), pendingInput: string | undefined;
     try {
+      const provider = this.options.providers[agent.provider];
+      if (!provider) throw new Error(`${PROVIDER_LABELS[agent.provider]} is not available. Refresh connections and try again.`);
+      const system = legacySystem(this.options.framing(agent, this.room, true), agent, this.room);
+      const context = legacyContext(contextRoom, agent, this.options.contextTokens(), { ...spec, briefing: this.briefing?.text }, system);
+      this.room.messages.push(answer); timer.arm();
+      this.log(`${agent.name} started${purpose} · ${agent.model || 'client default'}`);
       if (context.omitted) this.log(`Context bounded · ${context.omitted} earlier messages omitted for ${agent.name}`);
-      let prompt = context.prompt, continuation: unknown, toolResults: { call: ToolCall; output: string }[] | undefined, toolCount = 0, wrapUp = false;
+      const editor = spec.trigger?.editor ? `\n\n${plainEditorText(spec.trigger.editor)}` : '';
+      let prompt = context.prompt + editor, continuation: unknown, toolResults: { call: ToolCall; output: string }[] | undefined, toolCount = 0, wrapUp = false;
       for (let step = 0; step <= 8; step++) {
         signal.throwIfAborted();
         // Over the limit mid-turn: let the agent answer from what it already has instead of discarding the turn.
@@ -204,10 +668,10 @@ export class RoomEngine {
           wrapUp = true; this.log(`${agent.name} is finishing its answer · this message reached its token limit`);
           prompt += '\n\n[This message has reached the user\'s token limit. Do not request any more tools. Give your answer now, using only the results above.]';
         }
-        pendingInput = context.system + prompt;
-        this.room.agentStates![id] = { status: 'thinking' };
-        const result = await this.options.providers[agent.provider].run({ agent, system: context.system, prompt, signal, continuation, toolResults, allowTools: toolCount < 8 && !wrapUp,
-          onText: text => { answer.text = text.split('<chatroom-tool>')[0]!.split('<chatroom-plan>')[0]!.slice(0, 100000); this.changed(); }, onActivity: text => this.log(text, 'tool') });
+        pendingInput = system + prompt;
+        this.state(id, 'thinking'); timer.arm();
+        const result = await this.bounded(provider.run({ agent, system, prompt, signal, continuation, toolResults, allowTools: toolCount < 8 && !wrapUp,
+          onText: text => { if (timer.done) return; answer.text = display(text); timer.arm(); this.changed(); }, onActivity: text => { timer.arm(); this.log(text, 'tool'); } }), signal);
         aggregate = addUsage(aggregate, result.usage); pendingInput = undefined; answer.usage = aggregate;
         this.room.usage[id] = addUsage(this.room.usage[id] ?? emptyUsage(), result.usage);
         signal.throwIfAborted();
@@ -219,41 +683,71 @@ export class RoomEngine {
         continuation = result.toolCalls?.length ? result.continuation : undefined; toolResults = [];
         for (const call of calls) {
           signal.throwIfAborted(); toolCount++;
-          this.room.agentStates![id] = { status: 'tool', detail: call.name }; this.log(`${agent.name} → ${call.name}`, 'tool');
+          this.state(id, 'tool', call.name); this.log(`${agent.name} → ${call.name}`, 'tool');
           let output: string;
           try {
             if (!agent.tools.includes(call.name)) throw new Error(`Tool ${call.name} is disabled for this agent.`);
             output = await this.options.tools(call, agent, signal);
-          } catch (error) { signal.throwIfAborted(); output = `Tool error: ${error instanceof Error ? error.message : String(error)}`; }
+            timer.arm();
+          } catch (error) { signal.throwIfAborted(); output = `Tool error: ${errorText(error)}`; }
           signal.throwIfAborted();
-          this.room.messages.splice(this.room.messages.indexOf(answer), 0, message('tool', output.slice(0, 16000), call.name, id));
+          const tool = message('tool', output.slice(0, 16000), call.name, id); tool.createdAt = this.clock.now();
+          this.room.messages.splice(this.room.messages.indexOf(answer), 0, tool);
           toolResults.push({ call, output: output.slice(0, 10000) });
           if (!continuation) prompt += `\n\n[Your tool request]\n${JSON.stringify(call)}\n\n[Untrusted tool result: ${call.name}]\n${output.slice(0, 10000)}\n\nUse this result to continue. Tool calls remaining: ${8 - toolCount}.`;
         }
-        const limit = Math.max(4000, (this.options.contextTokens() - Math.ceil(context.system.length / 3)) * 3);
+        const limit = Math.max(4000, (this.options.contextTokens() - Math.ceil(system.length / 3)) * 3);
         if (prompt.length > limit) prompt = prompt.slice(0, 2500) + '\n[Middle context omitted]\n' + prompt.slice(-(limit - 2600));
         answer.text = ''; this.changed();
       }
-      if (spec.kind === 'plan' || spec.kind === 'synthesis') {
-        const parsed = parsePlan(answer.text, this.room.agents.filter(a => a.enabled));
-        if (parsed) { answer.text = parsed.text; if (parsed.steps.length) answer.plan = parsed.steps; parsed.notes.forEach(note => this.log(note)); }
-      }
-      if (!answer.text.trim() && !answer.plan) throw new Error('The agent returned an empty answer.');
-      answer.status = 'complete'; this.room.completedTurns++; this.room.agentStates![id] = { status: 'complete' };
-      if (spec.kind === 'discussion') { if (/\[CONSENSUS\]\s*$/.test(answer.text)) this.consensus.add(id); else this.consensus.delete(id); }
-      this.log(`${agent.name} finished${purpose} · ${aggregate.input + aggregate.output} ${aggregate.estimated ? 'estimated ' : ''}tokens`);
+      timer.end();
+      this.complete(agent, answer, spec, purpose);
     } catch (error) {
       if (pendingInput !== undefined) {
         const partial = estimatedUsage(pendingInput, answer.text); aggregate = addUsage(aggregate, partial); answer.usage = aggregate;
         this.room.usage[id] = addUsage(this.room.usage[id] ?? emptyUsage(), partial);
       }
-      const detail = error instanceof Error ? error.message : String(error);
-      answer.status = signal.aborted ? 'cancelled' : 'error';
-      answer.text = answer.text ? `${answer.text}\n\n${detail}` : detail;
-      this.room.agentStates![id] = { status: signal.aborted ? 'stopped' : 'error', detail }; this.consensus.delete(id);
-      this.queue = this.queue.filter(item => item.id !== id);
-      this.log(`${agent.name}: ${detail}`, signal.aborted ? 'info' : 'error');
-    } finally { clearTimeout(timeout); this.controllers.delete(id); this.changed(); }
+      this.failed(agent, answer, signal, error);
+    } finally {
+      timer.end();
+      if (this.controllers.get(id) === controller) this.controllers.delete(id);
+      this.changed();
+    }
     return answer;
+  }
+
+  // ── Sessions and native commands ──────────────────────────────────────────
+  async resetSession(agentIds: string[], mode: 'forget' | 'fresh'): Promise<void> {
+    if (this.running) throw new Error('Wait for the agents to finish or press Stop.');
+    const last = this.room.messages.at(-1)?.id;
+    for (const id of agentIds) {
+      const agent = this.room.agents.find(a => a.id === id);
+      if (!agent) continue;
+      // forget (/clear): a new native session that receives nothing from before this point.
+      agent.session = mode === 'fresh' ? undefined : { provider: agent.provider, ...(last ? { seen: last } : agent.session?.seen ? { seen: agent.session.seen } : {}) };
+      await this.options.native(agent)?.release(this.room.id, agent.id).catch(error => this.log(`${agent.name}: ${errorText(error)}`, 'error'));
+    }
+    this.changed();
+  }
+  runAgentCommand(agentIds: string[], name: string, args: string, text?: string): Promise<void> {
+    if (this.running) return Promise.reject(new Error('Wait for the agents to finish or press Stop.'));
+    const agents = [...new Set(agentIds)].map(id => this.room.agents.find(a => a.id === id)).filter((a): a is Agent => !!a);
+    if (!agents.length) return Promise.reject(new Error(`No agent to run /${name}.`));
+    if (text?.trim()) {
+      const line = message('user', text.trim().slice(0, 24000)); line.createdAt = this.clock.now(); line.turn = 'command'; line.targets = agents.map(a => a.id);
+      this.room.messages.push(line);
+    }
+    this.pauseRequested = false; this.stopping = false; this.room.status = 'running'; this.room.agentStates = {};
+    for (const agent of agents) this.state(agent.id, 'queued');
+    const pending = [...agents], workers = Math.max(1, Math.min(4, this.room.concurrency ?? 3));
+    this.running = Promise.all(Array.from({ length: workers }, async () => {
+      while (pending.length && !this.stopping) {
+        const agent = pending.shift()!, driver = this.options.native(agent);
+        if (!driver) { this.notice(`${agent.name} uses a chat model without native commands.`); this.state(agent.id, 'complete'); continue; }
+        await this.nativeTurn(agent, driver, this.room, { kind: 'command' }, undefined, { name, args: args ?? '' });
+      }
+    })).then(() => { if (this.room.status === 'running') this.room.status = 'idle'; }, error => { this.room.status = 'idle'; this.log(errorText(error), 'error'); })
+      .finally(() => { this.running = undefined; this.controllers.clear(); this.changed(); });
+    this.changed(); return this.running;
   }
 }

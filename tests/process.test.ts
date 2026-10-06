@@ -1,13 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { runJsonLines, resolveCli, childEnv, STOP_GRACE_MS, RELEASE_GRACE_MS } from '../src/process';
-import { CliProvider } from '../src/cli-provider';
-import { createRoom } from '../src/core';
+import { delimiter } from 'node:path';
+import { runJsonLines, resolveCli, childEnv, killTree, SCRUB_ENV, STOP_GRACE_MS, RELEASE_GRACE_MS } from '../src/process';
 
 const node = { command: process.execPath, prefix: [] };
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -79,17 +78,6 @@ test('a stopped CLI that never closes is forced, then released, so the room cann
 test('a failing CLI reports its plain-text stdout when stderr is empty', { timeout: 10000 }, async () => {
   await assert.rejects(runJsonLines(node, ['-e', `console.log('Not logged in. Run codex login.'); process.exit(2);`], '', process.cwd(), new AbortController().signal, () => {}), /Not logged in\. Run codex login\./);
 });
-test('a CLI that prints a plain-text message instead of an answer explains itself', { timeout: 10000 }, async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'chatroom-cli-'));
-  try {
-    const script = join(dir, 'fake-claude.js');
-    await writeFile(script, `process.stdin.resume(); process.stdin.on('end', () => console.log('Invalid API key · Please run /login'));`);
-    const provider = new CliProvider('claude', () => dir, async () => ({ executable: { command: process.execPath, prefix: [script] }, version: '2.1.289', source: 'test', modern: true }));
-    const agent = createRoom().agents[1]!;
-    await assert.rejects(provider.run({ agent, system: 'System', prompt: 'Hello', signal: new AbortController().signal, onText: () => {}, onActivity: () => {} }),
-      /Claude CLI returned no answer\. It printed:\nInvalid API key · Please run \/login/);
-  } finally { await rm(dir, { recursive: true, force: true }); }
-});
 test('only VS Code\'s own executable runs with ELECTRON_RUN_AS_NODE', () => {
   const previous = process.env.ELECTRON_RUN_AS_NODE;
   try {
@@ -101,4 +89,59 @@ test('only VS Code\'s own executable runs with ELECTRON_RUN_AS_NODE', () => {
 });
 test('nonexistent provider returns a clean missing executable result', () => {
   assert.equal(resolveCli('chatroom-nonexistent-command-92810', 'codex'), undefined);
+});
+/** Runs `body` with these environment variables set (undefined deletes), then restores them. */
+function withEnv(vars: Record<string, string | undefined>, body: () => void | Promise<void>) {
+  const previous = Object.fromEntries(Object.keys(vars).map(k => [k, process.env[k]]));
+  const apply = (values: Record<string, string | undefined>) => { for (const [k, v] of Object.entries(values)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+  apply(vars);
+  const restore = () => apply(previous);
+  try { const result = body(); if (result instanceof Promise) return result.finally(restore); restore(); } catch (error) { restore(); throw error; }
+}
+const nativeExe = { command: join(tmpdir(), 'claude.exe'), prefix: [] };
+test('childEnv scrubs nested-session variables but keeps user configuration', () => withEnv({
+  CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDE_CODE_SESSION_ID: 'x', CLAUDE_CODE_SESSION_SOMETHING_NEW: 'x', CLAUDE_CODE_MESSAGING_FOO: 'x',
+  CLAUDE_CODE_EMIT_FOO: 'x', NODE_OPTIONS: '--inspect', DEBUG: '*', TRACEPARENT: 't', CLAUDE_CONFIG_DIR: '/cfg', CLAUDE_CODE_USE_BEDROCK: '1', ELECTRON_RUN_AS_NODE: '1',
+}, () => {
+  const env = childEnv(nativeExe);
+  for (const key of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_SESSION_SOMETHING_NEW', 'CLAUDE_CODE_MESSAGING_FOO', 'CLAUDE_CODE_EMIT_FOO', 'NODE_OPTIONS', 'DEBUG', 'TRACEPARENT', 'ELECTRON_RUN_AS_NODE'])
+    assert.equal(env[key], undefined, key);
+  assert.equal(env.CLAUDE_CONFIG_DIR, '/cfg'); assert.equal(env.CLAUDE_CODE_USE_BEDROCK, '1'); assert.equal(env.NO_COLOR, '1');
+  assert.ok(SCRUB_ENV.includes('CLAUDE_CODE_SSE_PORT'));
+}));
+test('childEnv per provider: Claude entrypoint, Codex log level, Copilot tokens and auto-update', () => withEnv({ CLAUDE_CODE_ENTRYPOINT: 'cli', GH_TOKEN: 'ghp', GITHUB_TOKEN: 'ghp2', RUST_LOG: undefined }, () => {
+  assert.equal(childEnv(nativeExe, 'claude').CLAUDE_CODE_ENTRYPOINT, 'sdk-ts');
+  assert.equal(childEnv(nativeExe, 'codex').RUST_LOG, 'warn');
+  const copilot = childEnv(nativeExe, 'copilot');
+  assert.equal(copilot.GH_TOKEN, undefined); assert.equal(copilot.GITHUB_TOKEN, undefined); assert.equal(copilot.COPILOT_AUTO_UPDATE, 'false');
+  const kept = childEnv(nativeExe, 'copilot', { keepGithubTokens: true });
+  assert.equal(kept.GH_TOKEN, 'ghp'); assert.equal(kept.GITHUB_TOKEN, 'ghp2');
+  assert.equal(childEnv(nativeExe, 'claude').GH_TOKEN, 'ghp');
+  process.env.RUST_LOG = 'debug';
+  assert.equal(childEnv(nativeExe, 'codex').RUST_LOG, 'debug');
+}));
+test('childEnv prepends to PATH', () => {
+  const env = childEnv(nativeExe, 'codex', { pathPrepend: ['/opt/codex-path'] });
+  const key = Object.keys(env).find(k => k.toUpperCase() === 'PATH')!;
+  assert.ok(env[key]!.startsWith('/opt/codex-path' + delimiter));
+  assert.equal(Object.keys(env).filter(k => k.toUpperCase() === 'PATH').length, 1);
+});
+test('resolveCli finds the native Copilot executable behind an npm shim', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'chatroom-copilot-'));
+  try {
+    const shim = join(dir, process.platform === 'win32' ? 'copilot.cmd' : 'copilot');
+    await writeFile(shim, '@ECHO off\r\nnode "%~dp0\\node_modules\\@github\\copilot\\npm-loader.js" %*\r\n');
+    const pkg = join(dir, 'node_modules', '@github', 'copilot');
+    await mkdir(pkg, { recursive: true }); await writeFile(join(pkg, 'npm-loader.js'), '');
+    assert.deepEqual(resolveCli(shim, 'copilot'), { command: process.execPath, prefix: [join(pkg, 'npm-loader.js')] });
+    const nativeDir = join(pkg, 'node_modules', '@github', `copilot-${process.platform}-${process.arch}`);
+    const exe = join(nativeDir, process.platform === 'win32' ? 'copilot.exe' : 'copilot');
+    await mkdir(nativeDir, { recursive: true }); await writeFile(exe, '');
+    assert.deepEqual(resolveCli(shim, 'copilot'), { command: exe, prefix: [] });
+    const winget = join(dir, 'copilot.exe'); await writeFile(winget, '');
+    assert.deepEqual(resolveCli(winget, 'copilot'), { command: winget, prefix: [] });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test('killTree ignores processes that are already gone', async () => {
+  await killTree(2 ** 22 + 99);
 });

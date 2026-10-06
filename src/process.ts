@@ -1,18 +1,33 @@
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { delimiter, dirname, isAbsolute, join, extname } from 'node:path';
+import { Executable, NativeProviderId } from './types';
 
-export interface Executable { command: string; prefix: string[] }
-export function resolveCli(configured: string, provider: 'codex' | 'claude'): Executable | undefined {
+export type { Executable } from './types';
+/** For an npm shim or global install, the JavaScript entry or (Copilot) the native executable it launches. */
+function npmTarget(dir: string, provider: NativeProviderId): Executable | undefined {
+  if (provider !== 'copilot') {
+    const script = join(dir, 'node_modules', provider === 'codex' ? '@openai/codex/bin/codex.js' : '@anthropic-ai/claude-code/cli.js');
+    return existsSync(script) ? { command: process.execPath, prefix: [script] } : undefined;
+  }
+  const exe = process.platform === 'win32' ? 'copilot.exe' : 'copilot', pkg = `copilot-${process.platform}-${process.arch}`;
+  for (const root of [join(dir, 'node_modules'), join(dir, '..', 'lib', 'node_modules')]) {
+    for (const native of [join(root, '@github', 'copilot', 'node_modules', '@github', pkg, exe), join(root, '@github', pkg, exe)]) if (existsSync(native)) return { command: native, prefix: [] };
+    const loader = join(root, '@github', 'copilot', 'npm-loader.js');
+    if (existsSync(loader)) return { command: process.execPath, prefix: [loader] };
+  }
+}
+export function resolveCli(configured: string, provider: NativeProviderId): Executable | undefined {
   const entries = isAbsolute(configured) ? [configured] : (process.env.PATH ?? '').split(delimiter).flatMap(p => [join(p, configured), join(p, configured + '.exe'), join(p, configured + '.cmd')]);
   for (const candidate of entries) {
     if (!existsSync(candidate)) continue;
     const ext = extname(candidate).toLowerCase();
-    if (ext === '.exe' || (process.platform !== 'win32' && !ext)) return { command: candidate, prefix: [] };
+    if (ext === '.exe') return { command: candidate, prefix: [] };
     if (ext === '.js' || ext === '.mjs') return { command: process.execPath, prefix: [candidate] };
-    // Resolve npm shims to JavaScript, avoiding cmd.exe and shell interpolation.
-    const script = join(dirname(candidate), 'node_modules', provider === 'codex' ? '@openai/codex/bin/codex.js' : '@anthropic-ai/claude-code/cli.js');
-    if (existsSync(script)) return { command: process.execPath, prefix: [script] };
+    // Resolve npm shims to the native executable or JavaScript, avoiding cmd.exe and shell interpolation.
+    const target = npmTarget(dirname(candidate), provider);
+    if (target) return target;
+    if (process.platform !== 'win32' && !ext) return { command: candidate, prefix: [] };
     if (ext === '.cmd' || ext === '.ps1') {
       const shim = readFileSync(candidate, 'utf8');
       const relative = /node_modules[\\/][^\r\n"']+?\.(?:m?js)/.exec(shim)?.[0];
@@ -20,14 +35,46 @@ export function resolveCli(configured: string, provider: 'codex' | 'claude'): Ex
     }
   }
 }
+/** Variables a parent Claude Code, IDE or debugger session sets; a nested CLI must not inherit them. */
+export const SCRUB_ENV = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_PID',
+  'CLAUDE_EFFORT', 'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_AGENT_SDK_VERSION', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_EMIT_STARTUP_TIMING', 'CLAUDE_CODE_QUESTION_PREVIEW_FORMAT',
+  'CLAUDE_CODE_ENABLE_TASKS', 'CLAUDE_CODE_SSE_PORT', 'ENABLE_IDE_INTEGRATION', 'MCP_CONNECTION_NONBLOCKING', 'AI_AGENT', 'TRACEPARENT', 'NODE_OPTIONS', 'DEBUG',
+  'COPILOT_OTEL_FILE_EXPORTER_PATH'];
+const SCRUB_PATTERN = /^CLAUDE_CODE_(SESSION|MESSAGING|CHILD|ENTRYPOINT|EXECPATH|SSE_PORT|EMIT_|QUESTION_)/;
 /**
  * VS Code's own executable runs JavaScript CLIs only with ELECTRON_RUN_AS_NODE. Native executables
  * must not get it, or their own child processes (including Electron apps) would inherit it.
  */
-export function childEnv(executable: Executable): NodeJS.ProcessEnv {
+export function childEnv(executable: Executable, provider?: NativeProviderId, extra: { keepGithubTokens?: boolean; pathPrepend?: string[] } = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: '1' };
   if (executable.command === process.execPath) env.ELECTRON_RUN_AS_NODE = '1'; else delete env.ELECTRON_RUN_AS_NODE;
+  const scrub = new Set(SCRUB_ENV);
+  if (provider === 'copilot' && !extra.keepGithubTokens) scrub.add('GH_TOKEN').add('GITHUB_TOKEN');
+  for (const key of Object.keys(env)) if (scrub.has(key.toUpperCase()) || SCRUB_PATTERN.test(key.toUpperCase())) delete env[key];
+  if (provider === 'claude') env.CLAUDE_CODE_ENTRYPOINT = 'sdk-ts';
+  if (provider === 'codex' && !env.RUST_LOG) env.RUST_LOG = 'warn';
+  if (provider === 'copilot') env.COPILOT_AUTO_UPDATE = 'false';
+  if (extra.pathPrepend?.length) {
+    const key = Object.keys(env).find(k => process.platform === 'win32' ? k.toUpperCase() === 'PATH' : k === 'PATH') ?? 'PATH';
+    env[key] = [...extra.pathPrepend, env[key]].filter(Boolean).join(delimiter);
+  }
   return env;
+}
+/** Ends a process and its descendants. Errors are ignored. */
+export function killTree(pid: number): Promise<void> {
+  return new Promise(resolve => {
+    if (process.platform !== 'win32') {
+      try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* Already gone. */ } }
+      resolve(); return;
+    }
+    const timer = setTimeout(resolve, 5000);
+    const done = () => { clearTimeout(timer); resolve(); };
+    try {
+      const killer = spawn(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.on('error', done); killer.on('exit', done);
+    } catch { done(); }
+  });
 }
 /** Grace before a stop becomes a forced kill, and before pipes held by leftover descendants are released. */
 export const STOP_GRACE_MS = 2000, RELEASE_GRACE_MS = 2000;
