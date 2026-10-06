@@ -1,0 +1,21 @@
+const vscode = require('vscode');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+exports.run = async () => {
+  const extension = vscode.extensions.getExtension('chatroom-local.chatroom');
+  assert.ok(extension, 'Development extension is discoverable');
+  fs.writeFileSync(path.join(extension.extensionPath, 'artifacts', 'extension-smoke.json'), JSON.stringify({ passed: false, extension: extension.packageJSON.version, started: new Date().toISOString() }));
+  await extension.activate();
+  assert.ok(extension.isActive, 'Extension activates');
+  const commands = await vscode.commands.getCommands(true);
+  for (const name of ['chatroom.open', 'chatroom.new', 'chatroom.refresh', 'chatroom.export']) assert.ok(commands.includes(name), `${name} is registered`);
+  assert.equal(extension.packageJSON.contributes.viewsContainers.secondarySidebar[0].id, 'chatroom-secondary');
+  assert.equal(extension.packageJSON.contributes.viewsContainers.activitybar, undefined);
+  await vscode.commands.executeCommand('workbench.view.extension.chatroom-secondary');
+  await vscode.commands.executeCommand('chatroom.open');
+  await vscode.commands.executeCommand('chatroom.openEditor');
+  await vscode.commands.executeCommand('chatroom.new');
+  await require(path.join(extension.extensionPath, 'artifacts', 'provider-smoke.cjs')).run();
+  fs.writeFileSync(path.join(extension.extensionPath, 'artifacts', 'extension-smoke.json'), JSON.stringify({ passed: true, vscode: vscode.version, extension: extension.packageJSON.version, checks: ['activation', 'commands', 'secondary sidebar contribution', 'open room focus', 'editor panel', 'new room', 'Copilot native tool protocol with VS Code classes (fixture model)'] }, null, 2));
+};

@@ -1,0 +1,9 @@
+import { ToolName } from './types';
+export const toolSpecs: Record<ToolName, { name: ToolName; description: string; inputSchema: object }> = {
+  list_files: { name: 'list_files', description: 'List real workspace files. Always use before making claims about repository contents.', inputSchema: { type: 'object', properties: { glob: { type: 'string', description: 'Glob relative to workspace, for example **/*' } }, additionalProperties: false } },
+  read_file: { name: 'read_file', description: 'Read an existing workspace file to ground an answer in actual source code. PDF, Word (.docx) and image files are converted to text automatically, using local OCR for scans and images.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false } },
+  search_files: { name: 'search_files', description: 'Search workspace files for literal text.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, glob: { type: 'string' } }, required: ['query'], additionalProperties: false } },
+  search_documents: { name: 'search_documents', description: 'Search the documents attached to this Chatroom (PDFs, Word files, images, text) by meaning and return the most relevant passages with page numbers.', inputSchema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'], additionalProperties: false } },
+  ollama_ocr: { name: 'ollama_ocr', description: 'Extract text from a workspace image using the selected local OCR model.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false } },
+  semantic_search: { name: 'semantic_search', description: 'Find relevant code snippets using the selected local embedding model.', inputSchema: { type: 'object', properties: { query: { type: 'string' }, glob: { type: 'string' } }, required: ['query'], additionalProperties: false } }
+};

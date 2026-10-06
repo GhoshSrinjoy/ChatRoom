@@ -1,0 +1,66 @@
+{
+  "name": "chatroom",
+  "displayName": "Chatroom",
+  "description": "One room for Codex, Claude Code, GitHub Copilot and Ollama. A lead agent plans steps for the team, agents build on each other's work, and attached documents are read with local OCR and embeddings.",
+  "version": "0.3.2",
+  "publisher": "chatroom-local",
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.106.0" },
+  "categories": ["AI", "Other"],
+  "keywords": ["agents", "codex", "claude", "copilot", "ollama"],
+  "main": "./dist/extension.js",
+  "icon": "media/icon.png",
+  "activationEvents": ["onStartupFinished", "onView:chatroom.chat", "onView:chatroom.sidebar"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false }, "virtualWorkspaces": false },
+  "contributes": {
+    "commands": [
+      { "command": "chatroom.open", "title": "Chatroom: Open Room", "icon": "$(comment-discussion)" },
+      { "command": "chatroom.openEditor", "title": "Chatroom: Open in Editor", "icon": "$(open-preview)" },
+      { "command": "chatroom.new", "title": "Chatroom: New Room", "icon": "$(add)" },
+      { "command": "chatroom.refresh", "title": "Chatroom: Refresh Connections", "icon": "$(refresh)" },
+      { "command": "chatroom.export", "title": "Chatroom: Export Conversation" }
+    ],
+    "viewsContainers": { "secondarySidebar": [{ "id": "chatroom-secondary", "title": "Chatroom", "icon": "media/chatroom.svg" }] },
+    "views": { "chatroom-secondary": [{ "type": "webview", "id": "chatroom.chat", "name": "Chatroom" }] },
+    "menus": { "view/title": [
+      { "command": "chatroom.new", "when": "view == chatroom.chat", "group": "navigation" },
+      { "command": "chatroom.openEditor", "when": "view == chatroom.chat", "group": "navigation" }
+    ] },
+    "configuration": {
+      "title": "Chatroom",
+      "properties": {
+        "chatroom.codexPath": { "type": "string", "default": "codex", "scope": "machine", "description": "Codex executable or CLI JavaScript file. Default prefers the installed Codex extension runtime, then PATH. Uses your existing login." },
+        "chatroom.claudePath": { "type": "string", "default": "claude", "scope": "machine", "description": "Claude executable or CLI JavaScript file. Default prefers the installed Claude Code extension runtime, then PATH. Uses your existing login." },
+        "chatroom.modelDefaults": { "type": "object", "default": { "planning": {}, "drafting": {}, "review": {} }, "description": "Model IDs by task preset and provider (codex, claude, copilot, ollama). Configure with Chatroom's Settings button. Empty values choose from the discovered client catalog; drafting prefers a small model when available.", "additionalProperties": false, "properties": {
+          "planning": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } },
+          "drafting": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } },
+          "review": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } }
+        } },
+        "chatroom.defaultPreset": { "type": "string", "enum": ["planning", "drafting", "review"], "default": "planning", "description": "Task preset for new rooms. Planning also covers orchestration. Switching a room's preset applies its models to all agents." },
+        "chatroom.executionMode": { "type": "string", "enum": ["orchestrated", "sequential", "parallel"], "enumDescriptions": ["Lead + team: the lead plans a step graph; independent steps run in parallel, dependent steps build on earlier outputs, and the lead writes the final answer.", "Relay: agents reply one after another, each building on the replies before it.", "Parallel: agents answer independently with the same context; the next round sees all replies."], "default": "orchestrated", "description": "How agents collaborate in new rooms. Choosing a single agent in the composer always starts a 1:1 chat." },
+        "chatroom.maxParallelAgents": { "type": "integer", "minimum": 1, "maximum": 4, "default": 3, "description": "Maximum agents (or Lead + team steps) running at once. Room budgets are checked before starting each request; in-flight requests can exceed them." },
+        "chatroom.ollamaUrl": { "type": "string", "default": "http://127.0.0.1:11434", "scope": "machine", "description": "Ollama endpoint. Only loopback endpoints are supported." },
+        "chatroom.contextTokens": { "type": "number", "default": 12000, "minimum": 2000, "maximum": 64000, "description": "Approximate input context budget per turn." },
+        "chatroom.turnTimeoutSeconds": { "type": "number", "default": 180, "minimum": 15, "maximum": 1800, "description": "Maximum time for each agent turn including tools." },
+        "chatroom.ollamaKeepAlive": { "type": "string", "default": "5m", "description": "How long Ollama keeps a model loaded after a request." }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.3.2.vsix",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.96.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "unpdf": "^1.8.1",
+    "@playwright/test": "^1.55.0"
+  }
+}

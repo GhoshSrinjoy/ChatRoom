@@ -1,0 +1,18 @@
+# Dependencies and local environment (node_modules is a junction into .conda)
+node_modules
+.conda
+
+# Build output and test artifacts
+dist/
+artifacts/
+test-results/
+*.vsix
+*.log
+
+# Local agent state and secrets
+.membrain/
+.agents/
+.codex/
+.claude/
+.env
+.env.*

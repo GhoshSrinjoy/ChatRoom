@@ -1,0 +1,5 @@
+name: chatroom
+channels:
+  - conda-forge
+dependencies:
+  - nodejs=22
