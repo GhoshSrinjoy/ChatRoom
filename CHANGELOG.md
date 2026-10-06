@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0
+
+The agents are now the real CLIs, working together in one room.
+
+- **Native CLIs.** Claude Code runs as a long-lived `claude` process in stream-json mode, Codex as one `codex app-server` per window, and Copilot as `copilot --acp` when the Copilot CLI is installed (otherwise it stays a VS Code chat model). Each keeps its own tools, skills, slash commands, MCP servers, `CLAUDE.md`/`AGENTS.md`, hooks and native session, which resumes after a reload.
+- **Delta delivery.** Each agent receives only the room messages it has not seen; its own replies are already in its session. New or lost sessions get a bounded copy of the room history once. The long protocol prompt and the default personas are gone: a short room framing is appended to each CLI's own system prompt.
+- **Permissions and approvals.** Per agent: Plan, Ask (default), Auto-edit or Full access, mapped to each CLI's own modes. Approval requests appear as cards in the room and are denied after a timeout. Full access needs `chatroom.allowFullAccess` and a confirmation. Agents that edit run one at a time.
+- **Teamwork.** A line starting with `@Name` hands the next turn to that agent, within a hop cap. Team mode accepts mention lines as well as step plans. Messages that start with `@Agent` go to just those agents.
+- **Loops.** Rounds, until consensus (`[AGREE]`), until the lead says done (`[DONE]`), or every few minutes, with iteration, time and token caps. `/loop` sets them.
+- **Composer.** `@` mentions, `/` room and native commands, chips for team mode, loops, permissions and effort, think-harder and Ultra toggles, a context ring, and the open file and selection as context.
+- **Shared skills and room tools.** Skills are shared between the CLIs; four room tools reach native agents through MCP or Codex dynamic tools. `chatroom.sharedMcpServers` gives every native agent extra MCP servers.
+- **Room commands:** `/help`, `/clear`, `/compact`, `/new`, `/export`, `/loop`, `/mode`, `/lead`, `/model`, `/effort`, `/permissions`, `/status`, `/stop`.
+- **Timeouts.** The turn timeout now measures inactivity (default 300 s) and does not count time spent waiting for approval. Stop sends each CLI's own interrupt first.
+- **New settings:** `copilotPath`, `attachOpenFile`, `defaultPermission`, `allowFullAccess`, `approvalTimeoutSeconds`, `idleSessionMinutes`, `shareSkills`, `sharedMcpServers`, `maxHandoffs`, `copilotUseEnvToken`. New command: **Chatroom: Sign in to Copilot CLI**.
+- **Review fixes.**
+  - Team mode: when the lead cannot run (for example, Codex at its usage limit), the next enabled agent leads that message. A lead whose CLI is missing hands the lead to an agent that is ready.
+  - Every unseen message reaches a native session in full. A Stop after the CLI received a message no longer sends that message again, and step outputs a dependent step received are not sent to that agent again.
+  - Codex: turning MCP off no longer breaks every turn (the built-in apps server is turned off with `features.apps`). Option changes reach a running thread. "Default" model and effort follow your Codex config. Sub-agent approvals and room-tool calls reach their parent turn. Approval cards always show the exact command.
+  - Claude: "Allow for session" no longer raises an agent to Auto-edit or writes settings files. Only the four room tools are auto-allowed. `/compact` on a session that cannot be resumed no longer starts an empty one, and its tokens are counted. The first turn reuses the process that loaded capabilities.
+  - Copilot: room-tool trust comes only from the CLI's own metadata. Auto-edit allows reads and edits only inside the workspace and extra folders, and network requests always ask. Ultra puts `/fleet` at the start of the message.
+  - Full-access, default-permission, shared-MCP and Copilot token settings are read from user settings only.
+  - `/loop every …` is no longer cut short by the default 60-minute cap. A loop with no agent turned on stops instead of failing. A new message ends a paused plan. A Codex sandbox override can only tighten what the permission level allows, so it can no longer turn Ask into Auto-edit.
+  - Large rooms broadcast less often while streaming and are saved at least every 5 seconds.
+- **Migration.** Saved rooms move to schema 5: default personas are cleared, Rounds become a rounds loop, Codex reasoning becomes the agent's effort, and pending approvals are marked expired. Agents start fresh native sessions with the room's recent history.
+
 ## 0.3.2
 
 Fixes from the agents' own reliability review of this workspace:
