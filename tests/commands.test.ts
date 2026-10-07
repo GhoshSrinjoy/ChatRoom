@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, resolveMention, stripCode } from '../src/commands';
+import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseTeam, resolveMention, stripCode } from '../src/commands';
 import { Agent, AgentCapabilities, NativeCommand, ProviderId } from '../src/types';
 
 const agent = (id: string, name: string, provider: ProviderId, enabled = true): Agent => ({ id, name, provider, model: '', role: '', enabled, tools: [],
@@ -20,11 +20,12 @@ const capsMap: Record<string, AgentCapabilities> = {
 };
 
 test('room commands table is exact and agent-scoped names are derived from it', () => {
-  assert.deepEqual(ROOM_COMMANDS.map(c => c.name), ['help', 'clear', 'compact', 'new', 'export', 'loop', 'mode', 'lead', 'model', 'effort', 'permissions', 'status', 'stop']);
+  assert.deepEqual(ROOM_COMMANDS.map(c => c.name), ['help', 'clear', 'compact', 'new', 'export', 'loop', 'mode', 'lead', 'team', 'model', 'effort', 'permissions', 'status', 'stop']);
   assert.deepEqual(AGENT_SCOPED, ['clear', 'compact', 'model', 'effort', 'permissions', 'status']);
   assert.equal(ROOM_COMMANDS.find(c => c.name === 'loop')?.args, '[N | consensus | done | every 10m <prompt> | off]');
   assert.equal(ROOM_COMMANDS.find(c => c.name === 'compact')?.description, "Summarize each agent's native session to free context");
   assert.equal(NATIVE_COMMAND_DENYLIST.codex.length, 0);
+  assert.deepEqual(ROOM_COMMANDS.find(c => c.name === 'team'), { name: 'team', args: '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', description: 'Set up your own team: stages such as lead, drafting, review, testing', agentScoped: false });
 });
 
 test('stripCode blanks fences and inline code but keeps offsets and lines', () => {
@@ -86,6 +87,7 @@ test('parseComposer: room commands with and without targets', () => {
   assert.deepEqual(parseComposer('@Codex /model gpt-6', agents, capsMap).command, { name: 'model', args: 'gpt-6', scope: 'room', agentIds: ['a2'] });
   // A non-scoped room command with a target applies room-wide.
   assert.deepEqual(parseComposer('@Codex /mode team', agents, capsMap).command, { name: 'mode', args: 'team', scope: 'room', agentIds: ['a2'] });
+  assert.deepEqual(parseComposer('/team Lead: Claude > Review: Codex', agents, capsMap).command, { name: 'team', args: 'Lead: Claude > Review: Codex', scope: 'room', agentIds: [] });
   assert.deepEqual(parseComposer('@all /compact', agents, capsMap).command, { name: 'compact', args: '', scope: 'room', agentIds: [] });
   // Native commands that share a room command name are filtered out of the agent's list (the room command wins).
   assert.deepEqual(parseComposer('@Claude /compact', agents, capsMap).command?.scope, 'room');
@@ -183,4 +185,28 @@ test('markerOf', () => {
   assert.equal(markerOf('Shipped **[DONE]**'), 'done');
   assert.equal(markerOf('[AGREE] but one more thing'), undefined);
   assert.equal(markerOf('plain'), undefined);
+});
+
+test('parseTeam: show, off, edit, save, delete, a saved name and inline teams', () => {
+  const usage = 'Usage: /team · /team <saved name> · /team Lead: Claude > Draft: Codex > Review: Claude, Copilot · /team save <name> · /team edit · /team off';
+  assert.deepEqual(parseTeam(''), { show: true });
+  assert.deepEqual(parseTeam(' OFF '), { off: true });
+  assert.deepEqual(parseTeam('edit'), { edit: true });
+  assert.deepEqual(parseTeam('save My crew'), { save: 'My crew' });
+  assert.deepEqual(parseTeam('save'), { save: '' });
+  assert.deepEqual(parseTeam('delete Old team'), { remove: 'Old team' });
+  assert.deepEqual(parseTeam('Remove x'), { remove: 'x' });
+  assert.deepEqual(parseTeam('delete'), { error: usage });
+  assert.deepEqual(parseTeam('Build and test'), { use: 'Build and test' });
+  assert.deepEqual(parseTeam('saved team'), { use: 'saved team' });
+  assert.deepEqual(parseTeam('Lead: Claude > Draft: Codex (a first pass) > Review: Claude, Copilot'), { team: { name: 'Custom team', wrapUp: true, stages: [
+    { name: 'Lead', agents: ['Claude'], run: 'parallel', lead: true },
+    { name: 'Draft', agents: ['Codex'], run: 'parallel', lead: false, task: 'a first pass' },
+    { name: 'Review', agents: ['Claude', 'Copilot'], run: 'parallel', lead: false }] } });
+  for (const sep of ['->', '→', '|', ';', '\n', ' > '])
+    assert.deepEqual(parseTeam(`Draft: Codex ${sep} Test: Copilot + Claude (write and run the tests)`).team!.stages.map(s => [s.name, s.agents, s.task]), [['Draft', ['Codex'], undefined], ['Test', ['Copilot', 'Claude'], 'write and run the tests']], sep);
+  assert.deepEqual(parseTeam('Review: Claude and Copilot & Codex, claude').team!.stages[0]!.agents, ['Claude', 'Copilot', 'Codex']);
+  assert.deepEqual(parseTeam('Draft: Codex > Codex').team!.stages.map(s => s.name), ['Draft', 'Stage 2']);
+  assert.equal(parseTeam('Draft: Codex > Review: Claude').team!.wrapUp, false);
+  assert.deepEqual(parseTeam('Lead: > Review: (just look)'), { error: `That team has no stage with an agent. ${usage}` });
 });

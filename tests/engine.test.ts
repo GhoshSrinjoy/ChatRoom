@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RoomEngine, EngineOptions, Clock } from '../src/engine';
-import { createRoom, roomFraming, DEFAULT_LOOP, patchLoop } from '../src/core';
+import { createRoom, roomFraming, DEFAULT_LOOP, patchLoop, defaultOptions, normalizeTeam, unavailableText } from '../src/core';
 import { parseLoop } from '../src/commands';
-import { Agent, AgentCapabilities, ApprovalDecision, LoopConfig, NativeDriver, NativeTurnRequest, NativeTurnResult, Provider, ProviderError, ProviderRequest, Room, emptyUsage } from '../src/types';
+import { Agent, AgentCapabilities, ApprovalDecision, LoopConfig, NativeDriver, NativeTurnRequest, NativeTurnResult, Provider, ProviderError, ProviderRequest, Room, Unavailable, emptyUsage } from '../src/types';
 import { waitFor } from './helpers';
 
 const usage = { ...emptyUsage(), input: 30, output: 10, requests: 1 };
@@ -608,6 +608,240 @@ test('a new message ends a paused plan; a loop with no agent turned on stops ins
     assert.equal(looped.engine.room.messages.filter(m => m.author === 'Loop').length, 0, mode);
     assert.equal(looped.engine.room.loopState!.stoppedReason, 'no agent is turned on', mode);
   }
+});
+
+// ── Availability: show it, skip the agent, continue with the rest ────────────
+const usageMark = (until: number): Unavailable => ({ reason: 'usage-limit', detail: 'Codex usage limit reached.', at: 0, until });
+const notices = (room: Room) => room.messages.filter(m => m.kind === 'notice').map(m => m.text);
+const turns = (driver: FakeDriver) => driver.calls.map(c => `${c.agent.name}:${c.kind}`);
+
+test('availability: relay skips a marked agent with one notice, a rounds loop keeps going, and the same notice is not posted again', async () => {
+  const clock = fakeClock();
+  const { engine, driver, agents } = nativeEngine(req => `${req.agent.name} ok`, { clock });
+  agents[0].unavailable = usageMark(clock.now() + 3_600_000);
+  engine.room.loop = loop({ kind: 'rounds', rounds: 2 });
+  await engine.start('Plan it');
+  assert.deepEqual(driver.calls.map(c => c.agent.name), ['Claude', 'Copilot', 'Claude', 'Copilot']);
+  assert.equal(notices(engine.room).length, 1);
+  assert.match(notices(engine.room)[0]!, /^Skipping Codex \(out of usage until \w{3} \d\d:\d\d\) · continuing with Claude and Copilot\.$/);
+  assert.equal(engine.room.agentStates![agents[0].id]!.status, 'unavailable');
+  assert.equal(engine.room.loopState, undefined, 'the loop finished its rounds');
+  await engine.start('Again');
+  assert.equal(notices(engine.room).length, 1, 'an identical skip notice is not posted again');
+  assert.equal(engine.room.activity.filter(a => a.text.startsWith('Skipping Codex (out of usage')).length, 4, 'every skip is logged');
+});
+test('availability: a usage limit mid-turn marks the agent until it resets without failing the loop, then it runs again', async () => {
+  const clock = fakeClock(), resetsAt = clock.now() + 3_600_000;
+  let limited = true;
+  const { engine, driver, agents } = nativeEngine(req => {
+    if (req.agent.name === 'Codex' && limited) throw new ProviderError('Codex usage limit reached. Other agents can continue.', 'usage-limit', { resetsAt });
+    return `${req.agent.name} ok`;
+  }, { clock });
+  engine.room.loop = loop({ kind: 'rounds', rounds: 2 });
+  await engine.start('Work');
+  assert.deepEqual(driver.calls.map(c => c.agent.name), ['Codex', 'Claude', 'Copilot', 'Claude', 'Copilot']);
+  assert.deepEqual(agents[0].unavailable, { reason: 'usage-limit', detail: 'Codex usage limit reached. Other agents can continue.', at: clock.now(), until: resetsAt });
+  const answer = engine.room.messages.find(m => m.author === 'Codex')!;
+  assert.equal(answer.status, 'error'); assert.match(answer.text, /usage limit/);
+  assert.deepEqual(notices(engine.room), [`Codex can't run right now (${unavailableText(agents[0].unavailable!, clock.now())}) · continuing without it.`], 'the next round does not repeat it');
+  assert.equal(engine.room.loopState, undefined); assert.ok(!engine.room.activity.some(a => a.text.startsWith('Loop stopped')), 'an agent that can\'t run does not fail the loop');
+  engine.room.loop = loop({ kind: 'once' }); limited = false;
+  await engine.start('Still limited');
+  assert.equal(driver.of('Codex').length, 1);
+  clock.advance(3_600_000);
+  await engine.start('After the reset');
+  assert.equal(driver.of('Codex').length, 2); assert.equal(agents[0].unavailable, undefined);
+  assert.equal(engine.room.messages.filter(m => m.author === 'Codex').at(-1)!.status, 'complete');
+});
+test('availability: a model-not-found error marks the model; Ollama refusing connections marks it not running', async () => {
+  const { engine, agents } = nativeEngine(req => { if (req.agent.name === 'Claude') throw new Error('The model claude-x was not found for your account.'); return 'ok'; });
+  agents[1].model = 'claude-x';
+  await engine.start('Hi');
+  assert.deepEqual([agents[1].unavailable?.reason, agents[1].unavailable?.model, agents[1].unavailable?.until], ['model', 'claude-x', undefined]);
+  assert.deepEqual(notices(engine.room), ['Claude can\'t run right now (model claude-x is not available) · continuing without it.']);
+  assert.equal(engine.room.completedTurns, 2); assert.equal(engine.room.agentStates![agents[1].id]!.detail, 'model claude-x is not available');
+
+  const clock = fakeClock();
+  const legacy = legacyEngine({ run: async req => { if (req.agent.provider === 'ollama') throw new TypeError('fetch failed: connect ECONNREFUSED 127.0.0.1:11434'); return { text: 'ok', usage }; } }, undefined, { clock });
+  legacy.room.agents.slice(1).forEach(a => a.enabled = false);
+  legacy.room.agents.push({ id: 'ollama-1', name: 'Ollama', provider: 'ollama', model: 'llama3', role: '', enabled: true, tools: [], options: defaultOptions('ollama') });
+  await legacy.start('Hi');
+  const ollama = legacy.room.agents.at(-1)!;
+  assert.deepEqual(ollama.unavailable, { reason: 'offline', detail: 'fetch failed: connect ECONNREFUSED 127.0.0.1:11434', at: clock.now(), until: clock.now() + 120_000 });
+  assert.equal(legacy.room.agentStates![ollama.id]!.status, 'unavailable');
+  assert.equal(notices(legacy.room).at(-1), 'Ollama can\'t run right now (not running) · continuing without it.');
+});
+test('availability in Team mode: an unavailable lead hands over; steps for agents that can\'t run go to a free agent once', async () => {
+  const first = nativeEngine(req => req.kind === 'plan' ? 'Answer from Claude' : 'ok');
+  first.engine.room.mode = 'orchestrated'; first.engine.room.leadId = first.agents[0].id;
+  first.agents[0].unavailable = { reason: 'signed-out', detail: 'Sign in', at: 0 };
+  await first.engine.start('Q');
+  assert.deepEqual(turns(first.driver), ['Claude:plan']);
+  assert.ok(first.engine.room.activity.some(a => a.text === 'Codex can\'t lead this message (signed out) · Claude leads instead'));
+  assert.deepEqual(notices(first.engine.room), ['Skipping Codex (signed out) · continuing with Claude and Copilot.']);
+  assert.equal(first.engine.room.leadId, first.agents[0].id, 'the room keeps its lead');
+
+  // At the start: Copilot's step goes to the lead (everyone else is already in the plan).
+  const second = nativeEngine(req => req.kind === 'plan' ? plan([{ id: 's1', agent: 'Claude', task: 'A' }, { id: 's2', agent: 'Copilot', task: 'B' }]) : req.kind === 'synthesis' ? 'Final' : `${req.agent.name} did it`);
+  second.engine.room.mode = 'orchestrated'; second.engine.room.leadId = second.agents[0].id;
+  second.agents[2].unavailable = { reason: 'model', model: 'gpt-x', detail: '', at: 0 };
+  await second.engine.start('Work');
+  assert.deepEqual(turns(second.driver).sort(), ['Claude:step', 'Codex:plan', 'Codex:step', 'Codex:synthesis']);
+  const moved = second.engine.room.messages.find(m => m.plan)!.plan!.find(s => s.id === 's2')!;
+  assert.deepEqual([moved.agentId, moved.status, moved.detail], [second.agents[0].id, 'complete', 'Copilot can\'t run (model gpt-x is not available) · Codex took this step']);
+
+  // Mid-step: Claude runs out of usage, so its step runs again with Copilot (not in the plan); nothing is marked failed.
+  const third = nativeEngine(req => {
+    if (req.kind === 'plan') return plan([{ id: 's1', agent: 'Claude', task: 'A' }]);
+    if (req.kind === 'synthesis') return 'Final';
+    if (req.agent.name === 'Claude') throw new ProviderError('Claude Code usage limit reached.', 'usage-limit', { resetsAt: Date.now() + 3_600_000 });
+    return `${req.agent.name} did A`;
+  });
+  third.engine.room.mode = 'orchestrated'; third.engine.room.leadId = third.agents[0].id; third.engine.room.loop = loop({ kind: 'consensus', maxIterations: 1 });
+  await third.engine.start('Work');
+  assert.deepEqual(turns(third.driver), ['Codex:plan', 'Claude:step', 'Copilot:step', 'Codex:synthesis']);
+  const step = third.engine.room.messages.find(m => m.plan)!.plan![0]!;
+  assert.deepEqual([step.agentId, step.status], [third.agents[2].id, 'complete']);
+  assert.match(step.detail!, /^Claude can't run \(out of usage until .+\) · Copilot took this step$/);
+  assert.equal(third.engine.room.messages.find(m => m.author === 'Claude')!.status, 'error');
+  assert.equal(third.engine.room.loopState!.stoppedReason, 'reached 1 run', 'the loop ends on its cap, not on a failure');
+});
+test('availability: direct @mentions of an agent that can\'t run post a notice; hand-offs to it are skipped', async () => {
+  const { engine, driver, agents } = nativeEngine(() => 'ok');
+  agents[1].unavailable = { reason: 'model', model: 'opus-x', detail: '', at: 0 };
+  await engine.start({ text: 'Hi', targets: [agents[1].id] });
+  assert.equal(driver.calls.length, 0); assert.equal(engine.room.status, 'idle');
+  assert.deepEqual(notices(engine.room), ['Claude can\'t run right now (model opus-x is not available). Mention another agent, or press Try again in its settings.']);
+  await engine.start({ text: 'Both', targets: [agents[1].id, agents[2].id] });
+  assert.deepEqual(driver.calls.map(c => c.agent.name), ['Copilot']);
+  assert.equal(notices(engine.room).at(-1), 'Skipping Claude (model opus-x is not available) · continuing with Copilot.');
+
+  let blocked = false;
+  const handoff = nativeEngine(req => { if (req.agent.name === 'Codex') { blocked = true; return '@Claude check this'; } return 'ok'; },
+    { availability: a => blocked && a.name === 'Claude' ? { reason: 'signed-out', detail: '', at: 0 } : undefined });
+  await handoff.engine.start('Review');
+  assert.deepEqual(handoff.driver.calls.map(c => c.agent.name), ['Codex', 'Copilot']);
+  assert.deepEqual(notices(handoff.engine.room), ['Codex asked Claude, but Claude can\'t run right now (signed out).']);
+});
+test('availability: live status from the host skips an agent without marking it', async () => {
+  let signedOut = true;
+  const { engine, driver, agents } = nativeEngine(req => `${req.agent.name} ok`, { availability: a => signedOut && a.provider === 'copilot' ? { reason: 'signed-out', detail: 'Sign in', at: 0 } : undefined });
+  await engine.start('Hi');
+  assert.deepEqual(driver.calls.map(c => c.agent.name), ['Codex', 'Claude']);
+  assert.equal(agents[2].unavailable, undefined);
+  assert.deepEqual(notices(engine.room), ['Skipping Copilot (signed out) · continuing with Codex and Claude.']);
+  signedOut = false;
+  await engine.start('Again');
+  assert.deepEqual(driver.calls.slice(2).map(c => c.agent.name), ['Codex', 'Claude', 'Copilot']);
+});
+test('availability: when no agent can run, the pass ends idle with a notice and a loop stops', async () => {
+  const { engine, driver } = nativeEngine(() => 'ok', { availability: () => ({ reason: 'offline', detail: '', at: 0 }) });
+  engine.room.loop = loop({ kind: 'rounds', rounds: 3 });
+  await engine.start('Hi');
+  assert.equal(driver.calls.length, 0); assert.equal(engine.room.status, 'idle');
+  assert.deepEqual(notices(engine.room), ['No agent can run right now: Codex (not running), Claude (not running), Copilot (not running).']);
+  assert.equal(engine.room.loopState!.stoppedReason, 'no agent is available');
+  engine.room.mode = 'orchestrated'; engine.room.loop = loop({ kind: 'once' });
+  await engine.start('Again');
+  assert.equal(driver.calls.length, 0); assert.equal(engine.room.flow, undefined); assert.equal(engine.room.status, 'idle');
+});
+
+// ── The room's own team (pipeline) ───────────────────────────────────────────
+function teamEngine(team: unknown, script: (req: NativeTurnRequest, n: number) => Reply | Promise<Reply>, extra: Partial<EngineOptions> = {}) {
+  const made = nativeEngine(script, extra);
+  made.room.mode = 'pipeline'; made.room.team = normalizeTeam(team)!;
+  return made;
+}
+test('pipeline: stages run in order (relay one by one, parallel on a shared snapshot) and the lead writes the final answer', async () => {
+  const progress: (string | undefined)[] = [];
+  const { engine, driver, agents } = teamEngine({ name: 'Ship', stages: [
+    { name: 'Leads', agents: ['Claude'] },
+    { name: 'Drafting', agents: ['Codex', 'copilot'], run: 'relay', task: 'Write a first draft' },
+    { name: 'Review', agents: ['Codex', 'Claude'] }
+  ] }, async req => {
+    const p = engine.room.progress;
+    progress.push(p ? `${p.stage}/${p.total} ${p.name}` : undefined);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const stage = /Team stage \d of 3: (\w+)/.exec(req.ask)?.[1];
+    return req.kind === 'synthesis' ? 'Final answer' : `${req.agent.name} ${stage}${stage === 'Leads' ? '\n@Codex please draft' : ''}`;
+  });
+  await engine.start('Ship the feature');
+  assert.deepEqual(turns(driver), ['Claude:stage', 'Codex:stage', 'Copilot:stage', 'Codex:stage', 'Claude:stage', 'Claude:synthesis']);
+  assert.deepEqual(progress, ['1/3 Leads', '2/3 Drafting', '2/3 Drafting', '3/3 Review', '3/3 Review', undefined]);
+  assert.equal(engine.room.progress, undefined); assert.equal(engine.room.status, 'idle');
+  const [lead, draft, draft2, review1, review2, wrap] = driver.calls;
+  assert.match(lead!.ask, /Team stage 1 of 3: Leads\. The team works in stages: Leads \(Claude\) → Drafting \(Codex, Copilot\) → Review \(Codex, Claude\)\. You lead: if you can answer the request yourself, do it and end with \[DONE\]; otherwise set up the work for the next stages without doing their parts\.$/);
+  assert.match(draft!.ask, /Team stage 2 of 3: Drafting \(with Copilot\)\. The team works in stages: .+\. Your part: Write a first draft\. Build on the earlier stages' work above; the next stage picks up from yours\.$/);
+  assert.match(draft2!.context, /Claude Leads[\s\S]*Codex Drafting/, 'relay: the second agent sees the first');
+  assert.doesNotMatch(seenBy(review1!), /Claude Review/); assert.doesNotMatch(seenBy(review2!), /Codex Review/);
+  assert.match(review2!.context, /Codex Drafting[\s\S]*Copilot Drafting/);
+  assert.match(wrap!.ask, /^The team has finished its stages \(Leads \(Claude\) → Drafting \(Codex, Copilot\) → Review \(Codex, Claude\)\)\. Write the final answer for the user/);
+  assert.match(wrap!.context, /Codex Review/, 'the lead gets the other reviews; its own is already in its session');
+  const answers = engine.room.messages.filter(m => m.kind === 'agent');
+  assert.deepEqual(answers.map(m => m.stage), [{ index: 0, total: 3, name: 'Leads', lead: true }, { index: 1, total: 3, name: 'Drafting' }, { index: 1, total: 3, name: 'Drafting' },
+    { index: 2, total: 3, name: 'Review' }, { index: 2, total: 3, name: 'Review' }, undefined]);
+  assert.deepEqual([answers.at(-1)!.author, answers.at(-1)!.turn, answers.at(-1)!.text], ['Claude', 'synthesis', 'Final answer']);
+  assert.equal(answers[0]!.handoff, undefined);
+  assert.ok(engine.room.activity.some(a => a.text === 'Claude mentioned Codex; in a team run the stages decide who works next.'));
+  assert.equal(agents[1].model, 'sonnet');
+});
+test('pipeline: a lead that answers directly with [DONE] ends the run without the other stages or a final answer', async () => {
+  const { engine, driver } = teamEngine({ stages: [{ name: 'Lead', agents: ['Claude'] }, { name: 'Draft', agents: ['Codex'] }] }, req => req.agent.name === 'Claude' ? 'It is 4. [DONE]' : 'draft');
+  await engine.start('What is 2+2?');
+  assert.deepEqual(turns(driver), ['Claude:stage']);
+  assert.ok(engine.room.activity.some(a => a.text === 'Claude answered directly · the remaining stages are skipped'));
+  assert.equal(engine.room.messages.at(-1)!.marker, 'done'); assert.equal(engine.room.progress, undefined);
+});
+test('pipeline: a stage nobody can run goes to the lead with a notice; an agent that runs out mid-stage gets one substitute', async () => {
+  const { engine, driver, agents } = teamEngine({ wrapUp: false, stages: [{ name: 'Leads', agents: ['Claude'] }, { name: 'Drafting', agents: ['Codex'] }, { name: 'Testing', agents: ['Copilot'] }] },
+    req => { if (req.agent.name === 'Copilot') throw new Error('You have used all your premium requests.'); return `${req.agent.name} ok`; });
+  agents[0].unavailable = usageMark(Date.now() + 3_600_000);
+  await engine.start('Build it');
+  assert.deepEqual(turns(driver), ['Claude:stage', 'Claude:stage', 'Copilot:stage', 'Claude:stage']);
+  const posted = notices(engine.room);
+  assert.equal(posted.length, 3);
+  assert.match(posted[0]!, /^Drafting: Codex can't run right now \(out of usage until .+\) · Claude takes this stage\.$/);
+  assert.match(posted[1]!, /^Copilot can't run right now \(out of usage until .+\) · continuing without it\.$/);
+  assert.match(posted[2]!, /^Testing: Copilot can't run right now \(out of usage until .+\) · Claude takes this stage\.$/);
+  assert.deepEqual(engine.room.messages.filter(m => m.author === 'Claude').map(m => m.stage?.name), ['Leads', 'Drafting', 'Testing']);
+  assert.match(driver.calls[3]!.ask, /Team stage 3 of 3: Testing\. /, 'the substitute runs the stage alone');
+  // A stand-in is told whose stage it covers, so it does the work itself instead of waiting for the missing agent.
+  assert.match(driver.calls[1]!.ask, /You're standing in for Codex, who can't run right now: do this stage's work yourself\./);
+  assert.match(driver.calls[3]!.ask, /You're standing in for Copilot, who can't run right now/);
+  assert.doesNotMatch(driver.calls[0]!.ask, /standing in/);
+});
+test('pipeline: a stage preset runs the agent on that model through a copy; the agent keeps its own model', async () => {
+  const { engine, driver, agents } = teamEngine({ stages: [{ name: 'Drafting', agents: ['Codex'], preset: 'drafting' }, { name: 'Review', agents: ['Claude'], preset: 'review' }] }, () => 'ok',
+    { presetModel: (agent, preset) => preset === 'drafting' ? 'small-model' : agent.model });
+  agents[0].model = 'big-model';
+  await engine.start('Draft it');
+  assert.equal(driver.calls[0]!.agent.model, 'small-model'); assert.notEqual(driver.calls[0]!.agent, agents[0]);
+  assert.equal(agents[0].model, 'big-model'); assert.equal(agents[0].session!.id, 'Codex-1', 'the session is written to the real agent');
+  assert.equal(driver.calls[1]!.agent, agents[1], 'the same model needs no copy');
+  assert.ok(engine.room.activity.some(a => a.text === 'Codex started · Drafting · small-model'));
+});
+test('pipeline: a pause in the middle of a stage resumes there without running finished agents again', async () => {
+  const { engine, driver } = teamEngine({ wrapUp: false, stages: [{ name: 'Drafting', agents: ['Codex', 'Claude'], run: 'relay' }, { name: 'Review', agents: ['Copilot'] }] },
+    req => { if (req.agent.name === 'Codex') engine.pause(); return `${req.agent.name} ok`; });
+  await engine.start('Go');
+  assert.equal(engine.room.status, 'paused'); assert.deepEqual(driver.calls.map(c => c.agent.name), ['Codex']);
+  assert.deepEqual(engine.room.progress, { stage: 1, total: 2, name: 'Drafting' });
+  await engine.start();
+  assert.deepEqual(driver.calls.map(c => c.agent.name), ['Codex', 'Claude', 'Copilot']);
+  assert.equal(engine.room.status, 'idle'); assert.equal(engine.room.progress, undefined);
+});
+test('pipeline: a rounds loop repeats every stage; a room without a team works like Team mode', async () => {
+  const { engine, driver } = teamEngine({ wrapUp: false, stages: [{ name: 'Drafting', agents: ['Codex'] }, { name: 'Review', agents: ['Claude'] }] }, req => `${req.agent.name} ok`);
+  engine.room.loop = loop({ kind: 'rounds', rounds: 2 });
+  await engine.start('Iterate');
+  assert.deepEqual(driver.calls.map(c => c.agent.name), ['Codex', 'Claude', 'Codex', 'Claude']);
+  assert.match(driver.calls[2]!.ask, /^Round 2 of 2: keep going — respond to what's new above\. Team stage 1 of 2: Drafting\./);
+  const drafting = { index: 0, total: 2, name: 'Drafting' }, review = { index: 1, total: 2, name: 'Review' };
+  assert.deepEqual(engine.room.messages.filter(m => m.kind === 'agent').map(m => m.stage), [drafting, review, drafting, review]);
+  assert.equal(engine.room.loopState, undefined);
+  engine.room.team = undefined; engine.room.loop = loop({ kind: 'once' });
+  await engine.start('No team');
+  assert.deepEqual(turns(driver).slice(4), ['Codex:plan']);
 });
 
 // Legacy providers (Ollama, Copilot through vscode.lm) keep the <chatroom-tool> loop and the bounded transcript.

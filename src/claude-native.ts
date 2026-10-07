@@ -128,7 +128,8 @@ function resultText(content: unknown): string {
   return '';
 }
 function errorCode(text: string): ProviderErrorCode {
-  return /usage limit|rate limit|quota/i.test(text) ? 'usage-limit' : /login|api key|authenticat/i.test(text) ? 'signed-out' : 'failed';
+  return /usage limit|rate limit|quota/i.test(text) ? 'usage-limit' : /issue with the selected model|model [^\n.]{0,80}may not exist/i.test(text) ? 'model-unavailable'
+    : /login|api key|authenticat/i.test(text) ? 'signed-out' : 'failed';
 }
 function claudeError(text: string, fallback: ProviderErrorCode, resetsAt?: number): ProviderError {
   const code = errorCode(text) === 'failed' ? fallback : errorCode(text);

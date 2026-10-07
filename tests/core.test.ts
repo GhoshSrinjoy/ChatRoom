@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRoom, buildContext, parseToolCall, parsePlan, planStages, systemPrompt, message, estimateTokens, boundedNumber, roomFraming, renderEntry, renderContext,
-  unseenEntries, boundedHistory, turnAsk, migrateRoom, defaultOptions, framingHash, DEFAULT_LOOP, FramingContext, SCHEMA } from '../src/core';
-import { Connection, Message, addUsage, emptyUsage } from '../src/types';
+  unseenEntries, boundedHistory, turnAsk, migrateRoom, defaultOptions, framingHash, DEFAULT_LOOP, FramingContext, SCHEMA,
+  BUILTIN_TEAMS, classifyUnavailable, normalizeTeam, pipelineLead, stageAgents, teamPlan, unavailableText } from '../src/core';
+import { Connection, Message, ProviderError, TeamStage, Unavailable, addUsage, emptyUsage } from '../src/types';
 
 const copilotCli: Connection = { id: 'copilot', status: 'ready', runtime: 'cli', detail: '', models: [] };
 const ctx = (patch: Partial<FramingContext> = {}): FramingContext => ({ connections: [copilotCli], caps: {}, ...patch });
@@ -237,4 +238,125 @@ test('bounded history never exceeds its budget', () => {
   const history = boundedHistory(room, agent, 1000, { kind: 'discussion' });
   assert.equal(history[0]!.text, 'goal'); assert.match(history[1]!.text, /^\[\d+ earlier messages omitted\]$/);
   assert.ok(renderContext(history, room, 100000).length <= 3200);
+});
+
+// ── Availability ─────────────────────────────────────────────────────────────
+test('classifyUnavailable: provider error codes, then the message text; ordinary failures are not marks', () => {
+  const { codex, claude } = teamRoom(), now = 1_000_000, ollama = { ...codex, id: 'o', name: 'Ollama', provider: 'ollama' as const, model: 'llama3' };
+  assert.deepEqual(classifyUnavailable(new ProviderError('Codex usage limit reached.', 'usage-limit', { resetsAt: now + 5000 }), codex, now),
+    { reason: 'usage-limit', detail: 'Codex usage limit reached.', at: now, until: now + 5000 });
+  assert.equal(classifyUnavailable(new ProviderError('limit', 'usage-limit'), codex, now)!.until, now + 15 * 60000);
+  assert.deepEqual(classifyUnavailable(new ProviderError('Claude Code was not found.', 'missing'), claude, now), { reason: 'missing', detail: 'Claude Code was not found.', at: now });
+  assert.equal(classifyUnavailable(new ProviderError('Sign in', 'signed-out'), claude, now)!.reason, 'signed-out');
+  assert.deepEqual(classifyUnavailable(new ProviderError('gone', 'model-unavailable'), codex, now), { reason: 'model', detail: 'gone', at: now, model: 'gpt-5' });
+  for (const text of ['You have exceeded your monthly quota', '429 rate_limit_error', 'Your credit balance is too low', 'insufficient_quota', 'You are out of credits', 'premium requests used up', 'Claude usage limit reached'])
+    assert.deepEqual(classifyUnavailable(new Error(text), claude, now), { reason: 'usage-limit', detail: text, at: now, until: now + 15 * 60000 }, text);
+  for (const text of ['The model gpt-9 does not exist or you do not have access to it', 'model "x" not found', 'Unknown model: foo', 'invalid model id', 'The requested model isn\'t available on your plan', 'No matching Copilot model. Sign in to GitHub Copilot and refresh connections.'])
+    assert.equal(classifyUnavailable(new Error(text), codex, now)?.reason, 'model', text);
+  assert.equal(classifyUnavailable(new Error('model x not found'), { ...codex, model: '' }, now)!.model, undefined, 'the default model is not named');
+  for (const text of ['fetch failed', 'connect ECONNREFUSED 127.0.0.1:11434', 'socket hang up'])
+    assert.deepEqual(classifyUnavailable(new TypeError(text), ollama, now), { reason: 'offline', detail: text, at: now, until: now + 2 * 60000 }, text);
+  assert.equal(classifyUnavailable(new Error('fetch failed'), codex, now), undefined, 'only Ollama is offline');
+  assert.equal(classifyUnavailable(new Error('Something broke'), codex, now), undefined);
+  assert.equal(classifyUnavailable(new ProviderError('down', 'crashed'), codex, now), undefined);
+  assert.equal(classifyUnavailable('x'.repeat(400) + ' quota', codex, now)!.detail.length, 300);
+});
+test('unavailableText is a short phrase; usage times show the weekday, or the date when far away', () => {
+  const until = new Date(2026, 9, 8, 23, 23).getTime(), u = (patch: Partial<Unavailable>): Unavailable => ({ reason: 'usage-limit', detail: '', at: 0, ...patch });
+  assert.equal(unavailableText(u({ until }), until - 3_600_000), 'out of usage until Thu 23:23');
+  assert.equal(unavailableText(u({ until: new Date(2026, 9, 20, 9, 5).getTime() }), until), 'out of usage until Oct 20, 09:05');
+  assert.equal(unavailableText(u({}), 0), 'out of usage');
+  assert.equal(unavailableText(u({ reason: 'missing' }), 0), 'not installed');
+  assert.equal(unavailableText(u({ reason: 'signed-out' }), 0), 'signed out');
+  assert.equal(unavailableText(u({ reason: 'model', model: 'opus' }), 0), 'model opus is not available');
+  assert.equal(unavailableText(u({ reason: 'model' }), 0), 'model default is not available');
+  assert.equal(unavailableText(u({ reason: 'offline' }), 0), 'not running');
+});
+test('room framing lists only agents that can run, says who is unavailable, and never drops the agent itself', () => {
+  const { room, codex, claude, copilot } = teamRoom();
+  room.mode = 'orchestrated'; room.leadId = claude.id;
+  const unavailable = (a: { id: string }): Unavailable | undefined => a.id === claude.id ? { reason: 'signed-out', detail: '', at: 0 } : undefined;
+  const framing = roomFraming(codex, room, ctx({ unavailable }));
+  assert.doesNotMatch(framing, /- Claude ·/);
+  assert.match(framing, /\n- Copilot · GitHub Copilot CLI/);
+  assert.match(framing, /\nYou lead this room: [^\n]*\nUnavailable right now: Claude \(signed out\)\.$/, 'an unavailable lead is replaced by the first available agent, as the engine does');
+  assert.match(roomFraming(copilot, room, ctx({ unavailable })), /\nCodex leads this room and may ask you for help\.\nUnavailable right now: Claude \(signed out\)\.$/);
+  assert.match(roomFraming(claude, room, ctx({ unavailable })), /- Claude \(you\) · Claude Code/);
+  assert.notEqual(framingHash(framing), framingHash(roomFraming(codex, room, ctx())));
+  assert.doesNotMatch(roomFraming(copilot, room, ctx()), /Unavailable right now/);
+});
+
+// ── The user's own teams ─────────────────────────────────────────────────────
+test('normalizeTeam bounds names, agents and stages, drops empty stages, infers leads and never copies builtIn', () => {
+  for (const bad of [null, 'x', {}, { stages: [] }, { stages: [{ name: 'Empty', agents: [] }, { agents: ['', '  ', 5] }] }]) assert.equal(normalizeTeam(bad), undefined);
+  const team = normalizeTeam({ name: '  ' + 'N'.repeat(50), builtIn: true, stages: [
+    { name: 'Leaders', agents: [' Claude ', 'claude', '', 5, 'X'.repeat(50), ...Array.from({ length: 10 }, (_, i) => `A${i}`)] },
+    { agents: ['Codex'], run: 'relay', task: '  Write it  ', preset: 'drafting' },
+    { name: 'Empty', agents: [] },
+    { name: 'Lead review', agents: ['Copilot'], lead: false, task: ' ', preset: 'bogus', run: 'weird' },
+    { name: 'T'.repeat(60), agents: ['Codex'], task: 'y'.repeat(600) },
+    ...Array.from({ length: 8 }, (_, i) => ({ name: `Extra ${i}`, agents: ['Codex'] }))
+  ] })!;
+  assert.equal(team.name, 'N'.repeat(40)); assert.equal('builtIn' in team, false); assert.equal(team.stages.length, 8); assert.equal(team.wrapUp, true);
+  assert.deepEqual(team.stages[0], { name: 'Leaders', agents: ['Claude', 'X'.repeat(40), 'A0', 'A1', 'A2', 'A3', 'A4', 'A5'], run: 'parallel', lead: true });
+  assert.deepEqual(team.stages[1], { name: 'Stage 2', agents: ['Codex'], run: 'relay', lead: false, task: 'Write it', preset: 'drafting' });
+  assert.deepEqual(team.stages[2], { name: 'Lead review', agents: ['Copilot'], run: 'parallel', lead: false });
+  assert.equal(team.stages[3]!.name.length, 40); assert.equal(team.stages[3]!.task!.length, 500);
+  assert.deepEqual(normalizeTeam(team), team, 'normalizing twice changes nothing');
+  assert.deepEqual(normalizeTeam({ stages: [{ name: 'Draft', agents: ['Codex'] }] }), { name: 'My team', stages: [{ name: 'Draft', agents: ['Codex'], run: 'parallel', lead: false }], wrapUp: false });
+  assert.equal(normalizeTeam({ wrapUp: false, stages: [{ name: 'Lead', agents: ['Claude'] }] })!.wrapUp, false);
+  for (const [name, lead] of [['Lead', true], ['leads', true], ['Leader', true], ['Leaders: plan', true], ['Leading', false], ['Mislead', false]] as const)
+    assert.equal(normalizeTeam({ stages: [{ name, agents: ['Claude'] }] })!.stages[0]!.lead, lead, name);
+  for (const t of BUILTIN_TEAMS) { assert.equal(t.builtIn, true); assert.deepEqual({ ...normalizeTeam(t)!, builtIn: true }, t, t.name); }
+});
+test('stage agents resolve by name or a provider alias with one enabled agent; teamPlan names them', () => {
+  const { room, codex, claude, copilot } = teamRoom();
+  const s = (agents: string[]): TeamStage => ({ name: 'S', agents, run: 'parallel' });
+  assert.deepEqual(stageAgents(s(['claude', 'CODEX', 'Claude', 'github copilot', 'Gemini']), room), [claude, codex, copilot]);
+  claude.name = 'Sonnet';
+  assert.deepEqual(stageAgents(s(['claude code', 'codex']), room), [claude, codex]);
+  const opus = { ...claude, id: 'opus', name: 'Opus' };
+  room.agents.push(opus);
+  assert.deepEqual(stageAgents(s(['claude', 'opus', 'sonnet']), room), [opus, claude], 'two Claude agents: the alias is ambiguous, names still work');
+  copilot.enabled = false;
+  assert.deepEqual(stageAgents(s(['Copilot', 'copilot']), room), []);
+  claude.name = 'Claude'; room.agents.pop(); copilot.enabled = true;
+  assert.equal(teamPlan(BUILTIN_TEAMS[0]!, room), 'Leads (Claude) → Drafting (Codex) → Review (Claude, Copilot)');
+  assert.equal(teamPlan({ name: 'x', wrapUp: false, stages: [s(['Gemini']), s(['codex'])] }, room), 'S (nobody) → S (Codex)');
+  room.team = BUILTIN_TEAMS[1];
+  assert.equal(pipelineLead(room), claude);
+  claude.unavailable = { reason: 'usage-limit', detail: '', at: 0, until: Date.now() + 60000 };
+  assert.equal(pipelineLead(room), undefined, 'the lead stage has no other agent');
+  assert.equal(pipelineLead(room, () => true), claude);
+  room.team = BUILTIN_TEAMS[2];
+  assert.equal(pipelineLead(room, () => true), undefined, 'a team without a lead stage');
+});
+test('stage asks say the stage, the plan and the task; the lead may answer directly; the team wrap-up names the stages', () => {
+  const { room, codex, claude, copilot } = teamRoom();
+  const plan = 'Leads (Claude) → Drafting (Codex) → Review (Claude, Copilot)';
+  const stage = (index: number, name: string, extra = {}) => ({ kind: 'stage' as const, stage: { index, total: 3, name, others: [], plan, ...extra } });
+  assert.equal(turnAsk(claude, room, stage(0, 'Leads', { lead: true })),
+    `Team stage 1 of 3: Leads. The team works in stages: ${plan}. You lead: if you can answer the request yourself, do it and end with [DONE]; otherwise set up the work for the next stages without doing their parts.`);
+  assert.equal(turnAsk(codex, room, stage(1, 'Drafting', { task: 'Write a first draft.' })),
+    `Team stage 2 of 3: Drafting. The team works in stages: ${plan}. Your part: Write a first draft. Build on the earlier stages' work above; the next stage picks up from yours.`);
+  assert.equal(turnAsk(copilot, room, stage(2, 'Review', { others: ['Claude'] })),
+    `Team stage 3 of 3: Review (with Claude). The team works in stages: ${plan}. Build on the earlier stages' work above.`);
+  assert.equal(turnAsk(codex, room, stage(0, 'Drafting')), `Team stage 1 of 3: Drafting. The team works in stages: ${plan}. The next stage picks up from yours.`);
+  const done = { ...DEFAULT_LOOP, kind: 'lead-done' as const };
+  assert.match(turnAsk(claude, room, { ...stage(0, 'Leads', { lead: true }), loop: done }), / When the task is complete, end your reply with \[DONE\]\.$/);
+  assert.doesNotMatch(turnAsk(codex, room, { ...stage(1, 'Drafting'), loop: done }), /When the task is complete/);
+  assert.match(turnAsk(codex, room, { ...stage(0, 'Drafting'), loop: { ...DEFAULT_LOOP, kind: 'rounds', rounds: 2 }, iteration: 2 }), /^Round 2 of 2: keep going — respond to what's new above\. Team stage 1 of 3/);
+  assert.equal(turnAsk(claude, room, { kind: 'synthesis', teamPlan: plan }),
+    `The team has finished its stages (${plan}). Write the final answer for the user: combine their work, resolve disagreements, and fix mistakes you notice.`);
+});
+test('stage entries carry a stage attribute, and a pipeline room frames itself by its stages', () => {
+  const { room, codex, claude } = teamRoom();
+  const staged = message('agent', 'Draft', 'Codex', codex.id); staged.stage = { index: 1, total: 3, name: 'Drafting "v1"' };
+  assert.equal(renderEntry(staged, room), `<room from="Codex" stage="Drafting 'v1' (2/3)">\nDraft\n</room>`);
+  room.mode = 'pipeline'; room.leadId = claude.id; room.team = BUILTIN_TEAMS[0];
+  const framing = roomFraming(codex, room, ctx());
+  assert.match(framing, /\nThis room works as a team in stages: Leads \(Claude\) → Drafting \(Codex\) → Review \(Claude, Copilot\)\.(\n|$)/);
+  assert.doesNotMatch(framing, /leads this room|You lead/);
+  room.team = undefined;
+  assert.match(roomFraming(codex, room, ctx()), /\nClaude leads this room and may ask you for help\./, 'a pipeline room without a team works like Team mode');
 });

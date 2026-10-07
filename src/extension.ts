@@ -2,8 +2,8 @@ import * as vscode from 'vscode';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, addUsage, emptyUsage } from './types';
-import { DEFAULT_LOOP, DEFAULT_TOOLS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, leadAgent, message, migrateRoom, overLimit, patchLoop, roomFraming } from './core';
+import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, addUsage, emptyUsage } from './types';
+import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, leadAgent, message, migrateRoom, normalizeTeam, overLimit, patchLoop, roomFraming, teamPlan, unavailableText } from './core';
 import { RoomEngine } from './engine';
 import { OllamaClient } from './ollama';
 import { Drivers, createDrivers, createLegacyProviders, detectConnections, legacyCapabilities, nativeDriverFor, providerRuntime } from './providers';
@@ -12,12 +12,12 @@ import { RoomToolHost } from './room-tools';
 import { discoverSkills, prepareSkillWiring } from './skills';
 import { EditorTracker } from './editor-tracker';
 import { EFFORT_ORDER } from './codex-native';
-import { ROOM_COMMANDS, parseComposer, parseLoop, resolveMention } from './commands';
+import { ROOM_COMMANDS, parseComposer, parseLoop, parseTeam, resolveMention } from './commands';
 import { DocumentService, LocalModels } from './documents';
 import { KnowledgeStore, sha256 } from './knowledge';
 import { MAX_DOCUMENT_BYTES } from './extract';
 
-const MODES: RoomMode[] = ['orchestrated', 'sequential', 'parallel'];
+const MODES: RoomMode[] = ['orchestrated', 'sequential', 'parallel', 'pipeline'];
 const PRESETS: TaskPreset[] = ['planning', 'drafting', 'review'];
 const PROVIDERS: ProviderId[] = ['codex', 'claude', 'copilot', 'ollama'];
 const SUMMARIES = ['auto', 'concise', 'detailed', 'none'];
@@ -26,6 +26,8 @@ const AGENT_NAMES: Record<ProviderId, string> = { codex: 'Codex', claude: 'Claud
 const RUNTIME_LABELS: Record<ProviderId, string> = { claude: 'Claude Code', codex: 'Codex CLI', copilot: 'GitHub Copilot CLI', ollama: 'Ollama' };
 const BUSY = 'Wait for the agents to finish or press Stop.';
 const FULL_ACCESS = 'Enable "chatroom.allowFullAccess" in Settings to use Full access.';
+const NO_TEAM = 'Set up a team first: /team edit or /team Lead: Claude > Review: Codex';
+const BAD_TEAM = 'That team has no stage with an agent.';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 let app: ChatroomApp | undefined;
@@ -76,6 +78,9 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   private disposed?: Promise<void>;
   private discovering = false;
   private pendingCopilot = false;
+  /** The "Ollama isn't running" notice is posted once per window session. */
+  private ollamaNoticed = false;
+  private ollamaChecked = 0;
   private persistence: Promise<unknown> = Promise.resolve();
   constructor(private readonly context: vscode.ExtensionContext) {
     const saved = context.workspaceState.get<unknown[]>('chatroom.rooms.v1', []);
@@ -120,7 +125,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   private restore(raw: unknown): Room {
     const room = migrateRoom(raw, { attachEditor: this.config('attachOpenFile', true), shareSkills: this.config('shareSkills', true), permission: this.defaultPermission() });
     room.status = 'idle'; room.currentAgent = undefined; room.activeAgents = []; room.queuedTurns = 0; room.agentStates = {};
-    room.mode ??= 'sequential'; room.concurrency ??= 3; room.preset ??= 'planning'; room.flow = undefined;
+    room.mode ??= 'sequential'; room.concurrency ??= 3; room.preset ??= 'planning'; room.flow = undefined; delete room.progress;
     room.documents = (room.documents ?? []).map(d => d.status === 'ready' || d.status === 'error' ? d : { ...d, status: 'error', detail: 'Interrupted · attach it again.' });
     if (!this.userConfig('allowFullAccess', false)) for (const agent of room.agents) this.limitAccess(agent);
     return room;
@@ -190,6 +195,8 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     const room = createRoom(this.defaults(), this.config<TaskPreset>('defaultPreset', 'planning'), this.defaultPermission());
     const mode = this.config<RoomMode>('executionMode', 'orchestrated');
     room.mode = MODES.includes(mode) ? mode : 'orchestrated'; room.concurrency = boundedNumber(this.config('maxParallelAgents', 3), 1, 4, 3);
+    // A new room in Custom team mode starts with the first saved team (or template).
+    if (room.mode === 'pipeline') { const team = normalizeTeam(this.teams()[0]); if (team) room.team = team; else room.mode = 'orchestrated'; }
     room.attachEditor = this.config('attachOpenFile', true); room.shareSkills = this.config('shareSkills', true);
     return room;
   }
@@ -217,7 +224,63 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     return result;
   }
   private framingFor(agent: Agent, room: Room, legacy: boolean): string {
-    return roomFraming(agent, room, { connections: this.connections, caps: this.capsRecord(room), skillsIndex: this.wiring?.indexPath, legacy });
+    return roomFraming(agent, room, { connections: this.connections, caps: this.capsRecord(room), skillsIndex: this.wiring?.indexPath, legacy, unavailable: a => this.availabilityOf(a) });
+  }
+  /** Live reasons an agent can't run, from connections and capabilities (not stored on the agent). */
+  private liveAvailability(agent: Agent): Unavailable | undefined {
+    const connection = this.connections.find(c => c.id === agent.provider), now = Date.now();
+    const mark = (reason: Unavailable['reason'], detail = ''): Unavailable => ({ reason, detail: detail.slice(0, 300), at: now });
+    if (agent.provider === 'ollama') return connection && connection.status !== 'ready' && connection.status !== 'unchecked' ? mark('offline', connection.detail) : undefined;
+    if (this.native(agent)) {
+      const caps = this.caps.get(agent.id);
+      if (caps?.status === 'missing' || caps?.status === 'signed-out') return mark(caps.status, caps.detail);
+      if ((agent.provider === 'claude' || agent.provider === 'codex') && connection?.status === 'missing') return mark('missing', connection.detail);
+      return undefined;
+    }
+    // Copilot through VS Code chat models: no models means not signed in.
+    return agent.provider === 'copilot' && connection?.status === 'missing' ? mark('signed-out', connection.detail) : undefined;
+  }
+  /** The agent's own mark while it lasts, else live status. */
+  private availabilityOf(agent: Agent): Unavailable | undefined {
+    const mark = agent.unavailable;
+    return mark && (mark.until === undefined || mark.until > Date.now()) ? mark : this.liveAvailability(agent);
+  }
+  /** Saved teams (chatroom.teams), then the templates whose names are not taken. */
+  private teams(): TeamConfig[] {
+    const saved: TeamConfig[] = [], list = this.config<unknown>('teams', []);
+    for (const raw of Array.isArray(list) ? list : []) {
+      const team = normalizeTeam(raw);
+      if (team && !saved.some(t => t.name.toLowerCase() === team.name.toLowerCase())) saved.push(team);
+    }
+    return [...saved, ...BUILTIN_TEAMS.filter(t => !saved.some(s => s.name.toLowerCase() === t.name.toLowerCase()))];
+  }
+  /** Replaces (by name, any case) or adds a team in the user's chatroom.teams. */
+  private async writeTeams(update: (teams: unknown[]) => unknown[]): Promise<void> {
+    const config = vscode.workspace.getConfiguration('chatroom'), current = config.inspect<unknown[]>('teams')?.globalValue;
+    await config.update('teams', update(Array.isArray(current) ? current : []), vscode.ConfigurationTarget.Global);
+  }
+  private sameName(raw: unknown, name: string): boolean {
+    return !!raw && typeof raw === 'object' && typeof (raw as { name?: unknown }).name === 'string' && (raw as { name: string }).name.trim().toLowerCase() === name.trim().toLowerCase();
+  }
+  private async saveTeam(team: TeamConfig): Promise<void> {
+    await this.writeTeams(teams => {
+      const index = teams.findIndex(t => this.sameName(t, team.name));
+      return index >= 0 ? teams.map((t, i) => i === index ? team : t) : [...teams, team];
+    });
+  }
+  private async deleteTeam(name: string): Promise<boolean> {
+    const current = vscode.workspace.getConfiguration('chatroom').inspect<unknown[]>('teams')?.globalValue;
+    if (!name.trim() || !Array.isArray(current) || !current.some(t => this.sameName(t, name))) return false;
+    await this.writeTeams(teams => teams.filter(t => !this.sameName(t, name)));
+    return true;
+  }
+  /** Uses a team in the room (mode 'pipeline'). */
+  private applyTeam(room: Room, raw: unknown, inline = false): void {
+    if (this.engine.busy) throw new Error('Pause or stop the run before changing the team.');
+    const team = normalizeTeam(raw);
+    if (!team) throw new Error(BAD_TEAM);
+    room.team = team; room.mode = 'pipeline';
+    this.notice(`Team set: ${team.name} — ${teamPlan(team, room)}.${inline ? ' Keep it with /team save <name>.' : ''}`);
   }
   private makeEngine(room: Room): RoomEngine {
     return new RoomEngine(room, {
@@ -231,7 +294,9 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       timeoutMs: () => boundedNumber(this.config('turnTimeoutSeconds', 300), 15, 3600, 300) * 1000,
       approvalTimeoutMs: () => boundedNumber(this.config('approvalTimeoutSeconds', 300), 30, 3600, 300) * 1000,
       maxHandoffs: () => boundedNumber(this.config('maxHandoffs', 6), 0, 20, 6),
-      changed: () => this.changed()
+      changed: () => this.changed(),
+      availability: agent => this.liveAvailability(agent),
+      presetModel: (agent, preset) => this.defaults()[preset][agent.provider] ?? ''
     });
   }
   private copilotModels(models: vscode.LanguageModelChat[]): void {
@@ -298,7 +363,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   private broadcast(): void {
     const room = this.engine.room, attachOpenFile = this.config('attachOpenFile', true);
     const state: StatePayload = { type: 'state', room, rooms: this.rooms.map(r => ({ id: r.id, title: r.title })), connections: this.connections,
-      capabilities: this.capsRecord(room), editor: attachOpenFile ? this.tracker.snapshot() ?? null : null, sharedSkills: this.sharedSkills, roomCommands: ROOM_COMMANDS,
+      capabilities: this.capsRecord(room), editor: attachOpenFile ? this.tracker.snapshot() ?? null : null, sharedSkills: this.sharedSkills, roomCommands: ROOM_COMMANDS, teams: this.teams(),
       localModels: this.models, discovering: this.discovering, modelDefaults: this.defaults(),
       defaultPreset: this.config<TaskPreset>('defaultPreset', 'planning'), executionMode: this.config<RoomMode>('executionMode', 'orchestrated'), maxParallelAgents: this.config('maxParallelAgents', 3),
       settings: { allowFullAccess: this.userConfig('allowFullAccess', false), attachOpenFile, approvalTimeoutSeconds: boundedNumber(this.config('approvalTimeoutSeconds', 300), 30, 3600, 300) },
@@ -318,7 +383,36 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       this.pickLocalModels();
       for (const room of this.rooms) for (const agent of room.agents) if (!agent.model && room.status !== 'running') this.selectModel(agent, this.defaults()[room.preset ?? 'planning'][agent.provider] ?? '');
       for (const room of this.rooms) if (room.status !== 'running') this.availableLead(room);
+      this.clearMarks();
+      this.ollamaNotice();
     } finally { this.discovering = false; this.changed(); if (this.pendingCopilot) { this.pendingCopilot = false; void this.refresh(true); } }
+  }
+  /** Drops marks that no longer apply: a CLI that is installed again, Ollama running again, a sign-in that works. */
+  private clearMarks(): void {
+    for (const room of this.rooms) for (const agent of room.agents) {
+      const reason = agent.unavailable?.reason, ready = this.connections.find(c => c.id === agent.provider)?.status === 'ready';
+      if (((reason === 'missing' || reason === 'offline') && ready) || (reason === 'signed-out' && (ready || this.caps.get(agent.id)?.status === 'ready'))) delete agent.unavailable;
+    }
+  }
+  /** Ollama that wasn't running is checked again before a message (at most every 30 s), so starting it needs no manual refresh. */
+  private async recheckOllama(): Promise<void> {
+    const room = this.engine.room, ollama = this.connections.find(c => c.id === 'ollama');
+    if (!ollama || ollama.status === 'ready' || ollama.status === 'unchecked' || Date.now() - this.ollamaChecked < 30_000) return;
+    if (!room.documents?.length && !room.agents.some(a => a.enabled && a.provider === 'ollama')) return;
+    this.ollamaChecked = Date.now();
+    try {
+      const models = await this.ollama.models();
+      this.connections = this.connections.map(c => c.id === 'ollama' ? { ...c, status: 'ready', runtime: 'http', detail: `${models.length} installed models · loopback endpoint`, models, modelSource: 'Ollama installed models' } : c);
+      for (const agent of room.agents) if (agent.provider === 'ollama' && agent.unavailable?.reason === 'offline') delete agent.unavailable;
+      this.pickLocalModels(); this.engine.log('Ollama is running again'); this.changed();
+    } catch { /* Still not running: its agents stay skipped. */ }
+  }
+  private ollamaNotice(): void {
+    const room = this.engine.room, ollama = this.connections.find(c => c.id === 'ollama');
+    if (this.ollamaNoticed || !ollama || ollama.status === 'ready' || ollama.status === 'unchecked') return;
+    if (!room.documents?.length && !room.agents.some(a => a.enabled && a.provider === 'ollama')) return;
+    this.ollamaNoticed = true;
+    this.notice('Ollama isn\'t running: Ollama agents are skipped, documents use keyword search, and scanned pages can\'t be read until it starts.');
   }
   /** A lead whose CLI is missing or failing hands the lead to the first enabled agent whose connection is ready. */
   private availableLead(room: Room): void {
@@ -359,7 +453,9 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       let timer: NodeJS.Timeout | undefined;
       try {
         const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${PROVIDER_LABELS[agent.provider]} did not report its capabilities in time.`)), 90000); });
-        this.caps.set(agent.id, await Promise.race([driver.capabilities(room, agent), timeout]));
+        const caps = await Promise.race([driver.capabilities(room, agent), timeout]);
+        this.caps.set(agent.id, caps);
+        if (caps.status === 'ready' && (agent.unavailable?.reason === 'missing' || agent.unavailable?.reason === 'signed-out')) delete agent.unavailable;
       } catch (error) { this.caps.set(agent.id, this.errorCaps(agent, error)); }
       finally { clearTimeout(timer); this.capsLoading.delete(agent.id); this.changed(); }
     }));
@@ -425,11 +521,12 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         this.requireTrust();
         if (parsed.command) { await this.engine.runAgentCommand(parsed.command.agentIds, parsed.command.name, parsed.command.args, parsed.text); break; }
         if (this.engine.busy) throw new Error('Agents are working. Wait or press Stop.');
+        await this.recheckOllama();
         const editor = data.editor === true && room.attachEditor && this.config('attachOpenFile', true) ? this.tracker.snapshot() : undefined;
         await this.engine.start({ text: parsed.text, targets: parsed.targets, all: parsed.all, editor, flags: { think: data.think === true, ultra: data.ultra === true } });
         break;
       }
-      case 'start': this.requireTrust(); await this.engine.start(); break;
+      case 'start': this.requireTrust(); await this.recheckOllama(); await this.engine.start(); break;
       case 'pause': this.engine.pause(); break;
       case 'stop': this.engine.stop(); break;
       case 'stopAgent': if (typeof data.id === 'string') this.engine.stopAgent(data.id); break;
@@ -526,6 +623,35 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       case 'capabilities': await this.refreshCapabilities(typeof data.id === 'string' ? data.id : undefined); break;
       case 'editor': if (data.action === 'reveal') await this.tracker.reveal(); break;
       case 'copilot': if (data.action === 'install' || data.action === 'login') await this.copilotTerminal(data.action); break;
+      case 'team': {
+        if (data.team === null) {
+          if (this.engine.busy) throw new Error('Pause or stop the run before changing the team.');
+          room.mode = 'orchestrated'; delete room.team; this.changed(); break;
+        }
+        this.applyTeam(room, data.team); break;
+      }
+      case 'saveTeam': {
+        const team = normalizeTeam(data.team);
+        if (!team) throw new Error(BAD_TEAM);
+        await this.saveTeam(team);
+        this.toast('notice', `Saved team "${team.name}".`); this.changed(); break;
+      }
+      case 'deleteTeam': {
+        const name = typeof data.name === 'string' ? data.name.trim() : '';
+        if (!await this.deleteTeam(name)) throw new Error(`No saved team named "${name}".`);
+        this.toast('notice', `Deleted team "${name}".`); this.changed(); break;
+      }
+      case 'agentRetry': {
+        const agent = agentOf(data.id);
+        if (!agent) return;
+        delete agent.unavailable;
+        if (room.agentStates?.[agent.id]?.status === 'unavailable') delete room.agentStates[agent.id];
+        this.toast('notice', `${agent.name} will be tried again on the next message.`);
+        this.changed();
+        // Check it again: native agents report their capabilities, the others their connection.
+        void (this.native(agent) ? this.refreshCapabilities(agent.id) : this.refresh(agent.provider === 'copilot')).then(() => this.changed());
+        break;
+      }
     }
   }
   /** Room settings from the composer chips (§9.1). Only the editor toggle is accepted while agents work. */
@@ -533,6 +659,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     if (typeof data.attachEditor === 'boolean') room.attachEditor = data.attachEditor;
     const keys = ['mode', 'leadId', 'concurrency', 'tokenBudget', 'preset', 'loop', 'shareSkills', 'permission', 'rounds'].filter(key => data[key] !== undefined);
     if (keys.length && this.engine.busy) throw new Error('Pause or stop the run before changing room settings.');
+    if (data.mode === 'pipeline' && !room.team) throw new Error(NO_TEAM);
     if (data.permission !== undefined) this.setPermission(room.agents, data.permission, FULL_ACCESS);
     if (data.tokenBudget !== undefined) { const limit = boundedNumber(data.tokenBudget, 0, 10_000_000, room.tokenBudget); room.tokenBudget = limit && Math.max(1000, limit); }
     if (MODES.includes(data.mode)) room.mode = data.mode;
@@ -572,7 +699,10 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     if (Array.isArray(data.tools)) agent.tools = TOOL_NAMES.filter(t => data.tools.includes(t));
     if (typeof data.model === 'string') {
       const model = data.model.trim().slice(0, 160);
-      if (model !== agent.model) { if (room.activeAgents?.includes(agent.id)) agent.model = model; else this.selectModel(agent, model); }
+      if (model !== agent.model) {
+        if (room.activeAgents?.includes(agent.id)) agent.model = model; else this.selectModel(agent, model);
+        if (agent.unavailable?.reason === 'model') delete agent.unavailable;
+      }
     }
     const o = agent.options;
     if (options.permission !== undefined) { if (PERMISSIONS.includes(options.permission)) o.permission = options.permission; else warnings.push('Unknown permission level.'); }
@@ -653,10 +783,12 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       }
       case 'mode': {
         idle();
-        const mode = ({ team: 'orchestrated', orchestrated: 'orchestrated', relay: 'sequential', sequential: 'sequential', parallel: 'parallel' } as Record<string, RoomMode>)[args.trim().toLowerCase()];
-        if (!mode) throw new Error('Usage: /mode team | relay | parallel');
+        const mode = ({ team: 'orchestrated', orchestrated: 'orchestrated', relay: 'sequential', sequential: 'sequential', parallel: 'parallel', custom: 'pipeline', pipeline: 'pipeline' } as Record<string, RoomMode>)[args.trim().toLowerCase()];
+        if (!mode) throw new Error('Usage: /mode team | relay | parallel | custom');
+        if (mode === 'pipeline' && !room.team) throw new Error(NO_TEAM);
         room.mode = mode;
-        this.notice(mode === 'orchestrated' ? `Team mode: ${this.engine.lead()?.name ?? 'the lead'} leads.` : mode === 'sequential' ? 'Relay mode: agents reply one after another.' : 'Parallel mode: agents answer at the same time.');
+        this.notice(mode === 'orchestrated' ? `Team mode: ${this.engine.lead()?.name ?? 'the lead'} leads.` : mode === 'sequential' ? 'Relay mode: agents reply one after another.'
+          : mode === 'pipeline' ? `Custom team: ${room.team!.name} — ${teamPlan(room.team!, room)}.` : 'Parallel mode: agents answer at the same time.');
         return;
       }
       case 'lead': {
@@ -667,6 +799,47 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         if (!lead) throw new Error('Usage: /lead <agent>, for example /lead Claude');
         room.leadId = lead.id; room.mode = 'orchestrated';
         this.notice(`${lead.name} leads this room (Team mode).`);
+        return;
+      }
+      case 'team': {
+        const parsed = parseTeam(args);
+        if (parsed.error) throw new Error(parsed.error);
+        const teams = this.teams();
+        if (parsed.show) {
+          const saved = teams.filter(t => !t.builtIn).map(t => t.name), templates = teams.filter(t => t.builtIn).map(t => t.name);
+          this.notice([room.mode === 'pipeline' && room.team ? `Team: ${room.team.name} — ${teamPlan(room.team, room)}.` : 'This room is not using a team of its own.',
+            saved.length ? `Your teams: ${saved.join(', ')}.` : 'You have no saved teams yet.',
+            templates.length ? `Templates: ${templates.join(', ')}.` : '',
+            'Use one with /team <name>, write one like /team Lead: Claude > Draft: Codex > Review: Claude, Copilot, or open the builder with /team edit.'].filter(Boolean).join('\n'));
+          return;
+        }
+        if (parsed.edit) { for (const view of this.views) void view.postMessage({ type: 'openTeam' }); return; }
+        if (parsed.off) {
+          idle(); room.mode = 'orchestrated';
+          this.notice(`Team mode: ${this.engine.lead()?.name ?? 'the lead'} leads.`);
+          return;
+        }
+        if (parsed.remove !== undefined) {
+          if (!await this.deleteTeam(parsed.remove)) throw new Error(`No saved team named "${parsed.remove}".`);
+          this.notice(`Deleted team "${parsed.remove}".`);
+          return;
+        }
+        if (parsed.save !== undefined) {
+          if (!room.team) throw new Error(NO_TEAM);
+          const name = parsed.save || (room.team.name === 'Custom team' ? '' : room.team.name);
+          if (!name) throw new Error('Usage: /team save <name>');
+          room.team.name = name;
+          await this.saveTeam({ ...room.team, name });
+          this.notice(`Saved team "${name}".`);
+          return;
+        }
+        if (parsed.use !== undefined) {
+          const team = teams.find(t => t.name.toLowerCase() === parsed.use!.toLowerCase());
+          if (!team) throw new Error(`No team named "${parsed.use}". Teams: ${teams.map(t => t.name).join(', ')}.`);
+          this.applyTeam(room, team);
+          return;
+        }
+        if (parsed.team) this.applyTeam(room, parsed.team, true);
         return;
       }
       case 'model': {
@@ -714,7 +887,8 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
           const caps = this.capsFor(agent), connection = this.connections.find(c => c.id === agent.provider), native = !!this.native(agent);
           const runtime = native ? RUNTIME_LABELS[agent.provider] : agent.provider === 'copilot' ? 'GitHub Copilot (VS Code chat model)' : PROVIDER_LABELS[agent.provider];
           const version = caps?.version ?? connection?.version ?? '';
-          return `${agent.name} · ${runtime}${version ? ' ' + version : ''} · ${agent.model || 'default'} · effort ${agent.options.effort || 'default'} · ${native ? PERMISSION_LABELS[agent.options.permission] : 'Read-only (Chatroom tools)'} · session ${agent.session?.id?.slice(0, 8) || 'new'} · context ${agent.session?.context?.percent ?? '—'}%${agent.enabled ? '' : ' · off'}`;
+          const away = this.availabilityOf(agent);
+          return `${agent.name} · ${runtime}${version ? ' ' + version : ''} · ${agent.model || 'default'} · effort ${agent.options.effort || 'default'} · ${native ? PERMISSION_LABELS[agent.options.permission] : 'Read-only (Chatroom tools)'} · session ${agent.session?.id?.slice(0, 8) || 'new'} · context ${agent.session?.context?.percent ?? '—'}%${agent.enabled ? '' : ' · off'}${away ? ` · unavailable: ${unavailableText(away, Date.now())}` : ''}`;
         }).join('\n'));
         return;
       }

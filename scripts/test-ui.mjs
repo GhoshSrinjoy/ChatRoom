@@ -14,6 +14,7 @@ const roomCommands = [
   ['compact', '[instructions]', 'Summarize each agent\'s native session to free context', true], ['new', '', 'Open a new room', false],
   ['export', '', 'Export this conversation as Markdown', false], ['loop', '[N | consensus | done | every 10m <prompt> | off]', 'Repeat the room\'s work until a condition or limit', false],
   ['mode', 'team | relay | parallel', 'Choose how agents collaborate', false], ['lead', '<agent>', 'Choose the lead for Team mode', false],
+  ['team', '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', 'Set up your own team: stages such as lead, drafting, review, testing', false],
   ['model', '<model>', 'Set the model of the mentioned agent', true], ['effort', '<level>', 'Set reasoning effort for the mentioned agents (or all)', true],
   ['permissions', 'plan | ask | auto | full', 'Set what agents may do without asking', true], ['status', '', 'Show sessions, models and context use', true],
   ['stop', '', 'Stop all running agents', false]].map(([name, args, description, agentScoped]) => ({ name, ...(args ? { args } : {}), description, agentScoped }));
@@ -30,13 +31,20 @@ const capabilities = {
   a3: { provider: 'copilot', runtime: 'cli', status: 'signed-out', detail: 'Sign in to the GitHub Copilot CLI: run "copilot login" in a terminal, then try again.', action: 'copilotLogin',
     models: [], efforts: [], tools: [], skills: [], commands: [], mcpServers: [], supports: supports({ ultraTurn: true, customAgent: true }), updatedAt: now - 600000 }
 };
+// The built-in templates, as the host sends them (BUILTIN_TEAMS in src/core.ts).
+const stage = (name, agents, extra = {}) => ({ name, agents, run: 'parallel', lead: false, ...extra });
+const teams = [
+  { name: 'Lead, draft, review', builtIn: true, wrapUp: true, stages: [stage('Leads', ['Claude'], { lead: true }), stage('Drafting', ['Codex'], { preset: 'drafting' }), stage('Review', ['Claude', 'Copilot'], { preset: 'review' })] },
+  { name: 'Build and test', builtIn: true, wrapUp: true, stages: [stage('Leads', ['Claude'], { lead: true }), stage('Coding', ['Codex']), stage('Testing', ['Copilot'], { task: 'Write and run tests for the change' }), stage('Review', ['Claude'], { preset: 'review' })] },
+  { name: 'Draft and review', builtIn: true, wrapUp: false, stages: [stage('Drafting', ['Codex'], { preset: 'drafting' }), stage('Review', ['Claude'])] }];
+const outOfUsage = { reason: 'usage-limit', detail: 'You have hit your usage limit. Try again later.', at: now, until: now + 3 * 3600000 };
 const state = {
-  type: 'state', workspace: 'chatroom', trusted: true, discovering: false, defaultPreset: 'planning', executionMode: 'parallel', maxParallelAgents: 2,
+  type: 'state', workspace: 'chatroom', teams, trusted: true, discovering: false, defaultPreset: 'planning', executionMode: 'parallel', maxParallelAgents: 2,
   modelDefaults: { planning: { codex: 'test-large' }, drafting: { codex: 'test-small' }, review: {} },
   room: { id: 'preview', title: 'New conversation', createdAt: now, status: 'idle', mode: 'parallel', concurrency: 2, activeAgents: [], queuedTurns: 0, tokenBudget: 50000, completedTurns: 0, messages: [], activity: [], usage: {},
     loop: { kind: 'once', rounds: 2, everyMinutes: 10, maxIterations: 5, maxMinutes: 60, maxTokens: 0 }, attachEditor: true, shareSkills: true,
     agents: [
-      { id: 'a1', name: 'Codex', provider: 'codex', model: '', role: '', enabled: true, tools, options: options(), session: { id: 'thread-1234567890', context: { percent: 41, tokens: 105000, window: 258000 } } },
+      { id: 'a1', name: 'Codex', provider: 'codex', model: '', role: '', enabled: true, tools, options: options(), session: { id: 'thread-1234567890', context: { percent: 41, tokens: 105000, window: 258000 } }, unavailable: outOfUsage },
       { id: 'a2', name: 'Claude', provider: 'claude', model: 'sonnet', role: '', enabled: true, tools, options: options({ effort: 'high' }), session: { id: 'abcdef12-3456-7890', context: { percent: 23, tokens: 46000, window: 200000 } } },
       { id: 'a3', name: 'Copilot', provider: 'copilot', model: '', role: '', enabled: true, tools, options: options({ copilotRuntime: 'auto' }) }
     ] },
@@ -68,7 +76,8 @@ try {
     window.acquireVsCodeApi = () => ({ postMessage: message => window.__outbox.push(message), getState: () => ({}), setState: () => {} });
   });
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  const deliver = async data => page.evaluate(data => window.postMessage(data, '*'), data);
+  // Resolves after the webview has handled the message: listeners run in order, and this one is added after the app's.
+  const deliver = async data => page.evaluate(data => new Promise(resolve => { window.addEventListener('message', () => resolve(), { once: true }); window.postMessage(data, '*'); }), data);
   const outbox = () => page.evaluate(() => window.__outbox);
   const sent = async test => (await outbox()).filter(test);
   const lastSend = async () => (await sent(m => m.type === 'send')).at(-1);
@@ -96,6 +105,13 @@ try {
   assert.equal(await page.locator('#context-ring').isVisible(), true);
   assert.match(await page.locator('#context-ring').getAttribute('title'), /Codex 41% · Claude 23%/);
   assert.match(await page.locator('.agent-pill[data-agent="a1"]').getAttribute('title'), /Ask \(sandbox read-only\)/, 'Codex pill shows the effective sandbox');
+  // An agent out of usage is dimmed and skipped; its pill says when it is back.
+  assert.equal(await page.locator('.agent-pill[data-agent="a1"].status-unavailable').count(), 1, 'Out-of-usage Codex is marked unavailable');
+  assert.match(await page.locator('.agent-pill[data-agent="a1"] .pill-meta').textContent(), /^back (\w{3} )?\d\d:\d\d$/);
+  assert.match(await page.locator('.agent-pill[data-agent="a1"]').getAttribute('title'), /Out of usage · back \w{3} \d\d:\d\d · lead · You have hit your usage limit\. Try again later\. · Skipped until then · click for settings$/);
+  assert.equal(await page.locator('.agent-pill[data-agent="a1"] .pill-icon svg').count(), 1, 'A clock replaces the status dot');
+  assert.equal(await page.locator('.agent-pill[data-agent="a1"] .pill-dot').count(), 0);
+  assert.equal(await page.locator('.agent-pill.status-unavailable').count(), 1, 'Live status (signed-out Copilot) keeps the setup state');
   await page.locator('.agent-pill[data-agent="a2"]').focus();
   state.room.agentStates = { a2: { status: 'thinking' } }; await deliver(state);
   assert.equal(await page.evaluate(() => document.activeElement.dataset.agent), 'a2', 'Pill keeps focus when the strip re-renders');
@@ -104,6 +120,13 @@ try {
   // 12. Agent settings dialog from a pill.
   await page.locator('.agent-pill[data-agent="a1"]').click();
   await page.locator('#agent-form').waitFor();
+  assert.match(await page.locator('#dialog-layer .unavailable-banner').textContent(), /^Out of usage · back \w{3} \d\d:\d\d\. Chatroom skips Codex and continues with the others\.You have hit your usage limit/);
+  await page.locator('.unavailable-banner').getByRole('button', { name: 'Try again now' }).click();
+  assert.deepEqual((await sent(m => m.type === 'agentRetry')).at(-1), { type: 'agentRetry', id: 'a1' });
+  delete state.room.agents[0].unavailable; await deliver(state);
+  assert.equal(await page.locator('.unavailable-banner').count(), 0, 'The banner goes once the host clears the mark');
+  assert.equal(await page.locator('.agent-pill[data-agent="a1"].status-unavailable').count(), 0);
+  assert.equal(await page.locator('#agent-form').count(), 1, 'Try again keeps the dialog open');
   assert.deepEqual(await page.locator('#agent-effort option').allTextContents(), ['Default', 'Low', 'Medium', 'High', 'Extra high']);
   for (const id of ['agent-permission', 'agent-summary', 'agent-sandbox', 'agent-websearch', 'agent-use-mcp', 'agent-dirs', 'agent-role', 'agent-enabled']) assert.equal(await page.locator('#' + id).count(), 1, `#${id}`);
   assert.equal(await page.locator('#agent-thinking').count(), 0);
@@ -422,6 +445,152 @@ try {
   await page.screenshot({ path: 'artifacts/preview-usage.png' });
   state.room.usage = {}; state.room.tokenBudget = 0;
   await page.locator('.inspector-close').click();
+
+  // Availability in the Tools tab: a model that is not available.
+  state.room.agents[1].unavailable = { reason: 'model', model: 'sonnet', detail: 'Model "sonnet" was not found.', at: now };
+  await deliver(state);
+  assert.equal(await page.locator('.agent-pill[data-agent="a2"] .pill-meta').textContent(), 'no model');
+  await page.locator('.inspector-toggle').click(); await page.locator('[data-tab="tools"]').click();
+  const claudeCard = page.locator('.caps-card').nth(1);
+  assert.match(await claudeCard.locator('.unavail-line').textContent(), /^Model sonnet unavailable\. Chatroom skips Claude and continues with the others\. Choose another model in its settings\./);
+  await claudeCard.getByRole('button', { name: 'Try again now' }).click();
+  assert.deepEqual((await sent(m => m.type === 'agentRetry')).at(-1), { type: 'agentRetry', id: 'a2' });
+  await page.locator('[data-tab="usage"]').click(); await page.locator('.inspector-close').click();
+  delete state.room.agents[1].unavailable;
+
+  // Custom team: the chip, stage chips on messages and the progress footer.
+  const plainTeam = ({ builtIn, ...team }) => structuredClone(team);
+  Object.assign(state.room, { mode: 'pipeline', team: plainTeam(teams[0]), status: 'running', activeAgents: ['a1'], currentAgent: 'a1', queuedTurns: 0, progress: { stage: 2, total: 3, name: 'Drafting' }, agentStates: { a1: { status: 'thinking' } }, documents: [],
+    messages: [
+      { id: 'u3', kind: 'user', text: 'Add a CSV export to the report page.', author: 'You', status: 'complete', createdAt: now },
+      { id: 'st1', kind: 'agent', agentId: 'a2', author: 'Claude', turn: 'stage', stage: { index: 0, total: 3, name: 'Leads', lead: true }, text: 'Codex drafts the exporter in src/report.ts; the review checks quoting and large files.', status: 'complete', createdAt: now },
+      { id: 'st2', kind: 'agent', agentId: 'a1', author: 'Codex', turn: 'stage', stage: { index: 1, total: 3, name: 'Drafting' }, text: '', status: 'streaming', createdAt: now }] });
+  await deliver(state);
+  await page.locator('.message[data-id="st1"]').waitFor();
+  assert.equal(await page.locator('#chip-team .chip-label').textContent(), 'Team · Lead, draft, review');
+  assert.match(await page.locator('#chip-team').getAttribute('title'), /Leads \(Claude\) → Drafting \(Codex\) → Review \(Claude, Copilot\)/);
+  assert.match(await page.locator('#runtime-status').textContent(), /^Custom team · stage 2\/3: Drafting · 1 running/);
+  assert.equal(await page.locator('.message[data-id="st1"] .turn-chip.stage.lead').textContent(), 'Leads · 1/3');
+  assert.equal(await page.locator('.message[data-id="st2"] .turn-chip.stage:not(.lead)').textContent(), 'Drafting · 2/3');
+  await page.screenshot({ path: 'artifacts/preview-custom-team.png' });
+  Object.assign(state.room, { status: 'idle', activeAgents: [], currentAgent: undefined, progress: undefined, agentStates: {} });
+  state.room.messages[2] = { ...state.room.messages[2], text: 'Added exportCsv() with RFC 4180 quoting.', status: 'complete' };
+  await deliver(state);
+  assert.match(await page.locator('#runtime-status').textContent(), /^Custom team · Lead, draft, review · 0 running/);
+
+  // Team popover: Custom team in the mode list, and the team select.
+  await page.locator('#chip-team').click();
+  assert.equal(await page.locator('#popover input[name="mode"][value="pipeline"]').isChecked(), true);
+  assert.deepEqual(await page.locator('#team-select option').allTextContents(), ['Lead, draft, review · template', 'Build and test · template', 'Draft and review · template']);
+  assert.equal(await page.locator('#popover .team-plan').textContent(), 'Leads (Claude) → Drafting (Codex) → Review (Claude, Copilot)');
+  await page.locator('#team-select').selectOption({ label: 'Build and test · template' });
+  const chosen = (await sent(m => m.type === 'team')).at(-1).team;
+  assert.equal(chosen.name, 'Build and test'); assert.equal('builtIn' in chosen, false, 'Templates are sent without builtIn');
+  assert.deepEqual(chosen.stages.map(s => s.name), ['Leads', 'Coding', 'Testing', 'Review']);
+
+  // Team builder: Edit team… opens the room's team.
+  await page.locator('#popover').getByRole('button', { name: 'Edit team…' }).click();
+  await page.getByRole('heading', { name: 'Your team' }).waitFor();
+  assert.equal(await page.locator('#popover').isHidden(), true);
+  assert.equal(await page.locator('#team-name').inputValue(), 'Lead, draft, review');
+  assert.equal(await page.locator('#team-from').inputValue(), 'Lead, draft, review');
+  assert.equal(await page.locator('.stage-card').count(), 3);
+  assert.deepEqual(await page.locator('.stage-card').nth(2).locator('.agent-toggle[aria-pressed="true"]').allTextContents(), ['Claude', 'Copilot']);
+  assert.equal(await page.locator('#ts-0-lead').isChecked(), true); assert.equal(await page.locator('#team-wrapup').isChecked(), true);
+  assert.equal(await page.locator('#ts-2-run').count(), 1, 'Run shows for a stage with two agents'); assert.equal(await page.locator('#ts-1-run').count(), 0);
+  assert.equal(await page.locator('#ts-1-preset').inputValue(), 'drafting');
+  assert.equal(await page.locator('#team-delete').count(), 0, 'Templates have no Delete');
+  // A broadcast while typing keeps the field, its value and the caret.
+  await page.locator('#team-name').fill('My review team'); await page.locator('#team-name').press('Home');
+  await deliver(state);
+  assert.equal(await page.evaluate(() => [document.activeElement.id, document.activeElement.value, document.activeElement.selectionStart].join('|')), 'team-name|My review team|0');
+  // A new stage needs an agent before the team can be used.
+  await page.getByRole('button', { name: 'Add stage' }).click();
+  assert.equal(await page.locator('.stage-card').count(), 4);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'ts-3-name', 'Focus moves to the new stage');
+  await page.keyboard.type('Testing');
+  const teamsSent = (await sent(m => m.type === 'team')).length;
+  await page.getByRole('button', { name: 'Use in this room' }).click();
+  assert.match(await page.locator('#team-error').textContent(), /^Stage 4 \(Testing\) needs at least one agent/);
+  assert.equal(await page.locator('.stage-card.invalid').count(), 1);
+  assert.equal((await sent(m => m.type === 'team')).length, teamsSent, 'An invalid team is not sent');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'ts-3-a-a1', 'Focus moves to the stage that needs an agent');
+  await page.locator('#ts-3-a-a3').click();
+  assert.equal(await page.locator('#ts-3-a-a3').getAttribute('aria-pressed'), 'true');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'ts-3-a-a3', 'Toggling keeps focus');
+  assert.equal(await page.locator('#team-error').count(), 0, 'The error clears once fixed');
+  await page.locator('#ts-3-task').fill('Write and run the tests');
+  await page.locator('#ts-3-up').click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'ts-2-up', 'Focus follows the moved stage');
+  assert.equal(await page.locator('#ts-2-name').inputValue(), 'Testing');
+  await page.locator('#ts-1-preset').selectOption('');
+  await page.getByRole('button', { name: 'Save to my teams' }).click();
+  const savedTeam = (await sent(m => m.type === 'saveTeam')).at(-1).team;
+  assert.deepEqual(savedTeam, { name: 'My review team', wrapUp: true, stages: [
+    { name: 'Leads', agents: ['Claude'], run: 'parallel', lead: true },
+    { name: 'Drafting', agents: ['Codex'], run: 'parallel', lead: false },
+    { name: 'Testing', agents: ['Copilot'], run: 'parallel', lead: false, task: 'Write and run the tests' },
+    { name: 'Review', agents: ['Claude', 'Copilot'], run: 'parallel', lead: false, preset: 'review' }] }, 'Stages carry agent names');
+  assert.equal(await page.locator('#dialog-layer').isVisible(), true, 'Saving keeps the builder open');
+  await page.getByRole('button', { name: 'Use in this room' }).click();
+  assert.deepEqual((await sent(m => m.type === 'team')).at(-1), { type: 'team', team: savedTeam });
+  assert.equal(await page.locator('#dialog-layer').isHidden(), true);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'chip-team', 'Focus returns to the Team chip');
+  state.teams = [structuredClone(savedTeam), ...teams]; state.room.team = structuredClone(savedTeam); await deliver(state);
+  assert.equal(await page.locator('#chip-team .chip-label').textContent(), 'Team · My review team');
+
+  // Models and defaults: saved teams with Edit and Delete; Custom team as a default.
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  assert.deepEqual(await page.locator('#default-mode option').allTextContents(), ['Lead + team', 'Relay', 'Parallel', 'Custom team']);
+  assert.equal(await page.locator('#defaults-teams .team-row').count(), 1);
+  assert.match(await page.locator('#defaults-teams .team-row').textContent(), /My review team.*Leads \(Claude\) → Drafting \(Codex\) → Testing \(Copilot\) → Review \(Claude, Copilot\)/);
+  await page.getByRole('button', { name: 'Edit My review team' }).click();
+  await page.getByRole('heading', { name: 'Your team' }).waitFor();
+  assert.equal(await page.locator('#team-delete').count(), 1, 'A saved team can be deleted from the builder');
+  await page.keyboard.press('Escape');
+  await page.getByRole('heading', { name: 'Models and defaults' }).waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement.getAttribute('aria-label')), 'Edit My review team', 'Closing the builder returns to the defaults');
+  await page.getByRole('button', { name: 'Delete My review team' }).click();
+  await page.getByRole('button', { name: 'Delete team' }).click();
+  assert.deepEqual((await sent(m => m.type === 'deleteTeam')).at(-1), { type: 'deleteTeam', name: 'My review team' });
+  state.teams = teams; await deliver(state);
+  assert.equal(await page.locator('#defaults-teams .team-row').count(), 0, 'The list updates in place');
+  await page.keyboard.press('Escape');
+
+  // Room setup: choosing Custom team without a team opens the builder instead of switching.
+  delete state.room.team; state.room.mode = 'orchestrated'; await deliver(state);
+  await page.locator('[data-action="room-setup"]').click();
+  await page.getByRole('heading', { name: 'Room setup' }).waitFor();
+  assert.equal(await page.locator('#dialog-layer').getByRole('button', { name: 'Edit team…' }).count(), 1);
+  const pipelineOptions = (await sent(m => m.type === 'options' && m.mode === 'pipeline')).length;
+  await page.locator('input[name="setup-mode"][value="pipeline"]').click();
+  await page.getByRole('heading', { name: 'Your team' }).waitFor();
+  assert.equal((await sent(m => m.type === 'options' && m.mode === 'pipeline')).length, pipelineOptions, 'No mode change without a team');
+  assert.equal(await page.locator('#team-name').inputValue(), 'Lead, draft, review', 'It starts from the first template');
+  await page.keyboard.press('Escape');
+  await page.getByRole('heading', { name: 'Room setup' }).waitFor();
+  assert.equal(await page.locator('input[name="setup-mode"][value="orchestrated"]').isChecked(), true);
+  await page.keyboard.press('Escape');
+
+  // The host's openTeam message (/team edit), and New team… from the popover.
+  await deliver({ type: 'openTeam' });
+  await page.getByRole('heading', { name: 'Your team' }).waitFor();
+  assert.equal(await page.locator('.stage-card').count(), 3);
+  await page.keyboard.press('Escape'); assert.equal(await page.locator('#dialog-layer').isHidden(), true);
+  await page.locator('#chip-team').click();
+  await page.locator('#popover').getByRole('button', { name: 'New team…' }).click();
+  assert.equal(await page.locator('#team-name').inputValue(), '');
+  assert.equal(await page.locator('.stage-card').count(), 1);
+  assert.equal(await page.locator('.stage-card .agent-toggle[aria-pressed="true"]').count(), 0);
+  assert.equal(await page.locator('#team-wrapup').isDisabled(), true, 'The wrap-up needs a lead stage');
+  await page.locator('#ts-0-lead').click();
+  assert.equal(await page.locator('#ts-0-lead').isChecked(), true); assert.equal(await page.locator('#team-wrapup').isDisabled(), false);
+  await page.keyboard.press('Escape');
+
+  // /team in the slash menu.
+  await prompt.fill(''); await prompt.pressSequentially('/tea');
+  assert.ok((await page.locator('#menu .menu-name').allTextContents()).includes('/team'));
+  await prompt.press('Escape'); await prompt.fill('');
   state.room.mode = 'parallel'; state.room.documents = [];
   for (const width of [360, 320]) {
     await page.setViewportSize({ width, height: 900 });
@@ -447,6 +616,10 @@ try {
     const pop = await page.locator('#popover').boundingBox();
     assert.ok(pop.x >= 0 && pop.x + pop.width <= width, `Popover fits at ${width}px`);
     await page.keyboard.press('Escape');
+    await deliver({ type: 'openTeam' });
+    await page.getByRole('heading', { name: 'Your team' }).waitFor();
+    assert.ok(await page.evaluate(() => { const d = document.querySelector('#dialog-layer .dialog'); return d.scrollWidth <= d.clientWidth && document.documentElement.scrollWidth <= window.innerWidth; }), `The team builder fits at ${width}px`);
+    await page.keyboard.press('Escape');
     await page.locator('.inspector-toggle').click();
     await page.locator('[data-tab="tools"]').click();
     assert.equal(await page.locator('#vision-model').isVisible(), true);
@@ -468,5 +641,5 @@ try {
   await page.setViewportSize({ width: 600, height: 180 });
   await page.setContent('<html><body style="margin:0;background:white;color:black;font:46px Arial;padding:38px">CHATROOM 123</body></html>');
   await page.screenshot({ path: 'artifacts/ocr-fixture.png' });
-  console.log('UI checks passed: team strip, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, 360px/320px sidebar, escaping and logo rendering.');
+  console.log('UI checks passed: team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, 360px/320px sidebar, escaping and logo rendering.');
 } finally { await browser.close(); await new Promise(r => server.close(r)); }

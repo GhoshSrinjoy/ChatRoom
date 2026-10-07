@@ -75,10 +75,16 @@ const sharedSkills = [
 const roomCommands = [
   ['help', 'Show Chatroom commands'], ['clear', 'Start fresh native sessions; agents forget earlier messages', '', true], ['compact', "Summarize each agent's native session to free context", '[instructions]', true],
   ['new', 'Open a new room'], ['export', 'Export this conversation as Markdown'], ['loop', "Repeat the room's work until a condition or limit", '[N | consensus | done | every 10m <prompt> | off]'],
-  ['mode', 'Choose how agents collaborate', 'team | relay | parallel'], ['lead', 'Choose the lead for Team mode', '<agent>'], ['model', 'Set the model of the mentioned agent', '<model>', true],
+  ['mode', 'Choose how agents collaborate', 'team | relay | parallel | custom'], ['lead', 'Choose the lead for Team mode', '<agent>'],
+  ['team', 'Set up your own team: stages such as lead, drafting, review, testing', '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]'], ['model', 'Set the model of the mentioned agent', '<model>', true],
   ['effort', 'Set reasoning effort for the mentioned agents (or all)', '<level>', true], ['permissions', 'Set what agents may do without asking', 'plan | ask | auto | full', true],
   ['status', 'Show sessions, models and context use', '', true], ['stop', 'Stop all running agents']
 ].map(([name, description, args, agentScoped = false]) => ({ name, description, ...(args ? { args } : {}), agentScoped }));
+// The built-in team templates, in the shape the host broadcasts.
+const teams = [
+  { name: 'Lead, draft, review', wrapUp: true, builtIn: true, stages: [{ name: 'Leads', agents: ['Claude'], run: 'parallel', lead: true }, { name: 'Drafting', agents: ['Codex'], run: 'parallel', lead: false, preset: 'drafting' }, { name: 'Review', agents: ['Claude', 'Copilot'], run: 'parallel', lead: false, preset: 'review' }] },
+  { name: 'Build and test', wrapUp: true, builtIn: true, stages: [{ name: 'Leads', agents: ['Claude'], run: 'parallel', lead: true }, { name: 'Coding', agents: ['Codex'], run: 'parallel', lead: false }, { name: 'Testing', agents: ['Copilot'], run: 'parallel', lead: false, task: 'Write and run tests for the change' }, { name: 'Review', agents: ['Claude'], run: 'parallel', lead: false, preset: 'review' }] },
+  { name: 'Draft and review', wrapUp: false, builtIn: true, stages: [{ name: 'Drafting', agents: ['Codex'], run: 'parallel', lead: false, preset: 'drafting' }, { name: 'Review', agents: ['Claude'], run: 'parallel', lead: false }] }];
 const editor = { path: '/work/chatroom/src/process.ts', relPath: 'src/process.ts', label: 'process.ts', languageId: 'typescript', kind: 'text',
   selection: { startLine: 120, endLine: 164, text: 'export function runJsonLines(…) { … }' }, openTabs: [{ label: 'process.test.ts', relPath: 'tests/process.test.ts' }] };
 const approvalRequest = (id, agentId, provider, kind, tool, title, extra) => ({ id: `m-${id}`, kind: 'approval', agentId, author: agentId === 'a2' ? 'Claude' : 'Codex', text: tool, status: 'complete', createdAt: now,
@@ -86,7 +92,7 @@ const approvalRequest = (id, agentId, provider, kind, tool, title, extra) => ({ 
 const room = overrides => ({ id: 'demo', title: 'Review the subprocess handling for reliability issues', createdAt: now, status: 'idle', mode: 'orchestrated', leadId: 'a2', concurrency: 3,
   activeAgents: [], queuedTurns: 0, loop: { kind: 'once', rounds: 2, everyMinutes: 10, maxIterations: 5, maxMinutes: 60, maxTokens: 0 }, attachEditor: true, shareSkills: true, tokenBudget: 0, runStartTokens: 0, completedTurns: 5, activity: [], usage, agents, ...overrides });
 const state = room => ({ type: 'state', workspace: 'chatroom', trusted: true, discovering: false, modelDefaults: { planning: {}, drafting: {}, review: {} }, defaultPreset: 'planning', executionMode: 'orchestrated', maxParallelAgents: 3,
-  rooms: [{ id: 'demo', title: room.title }], connections, capabilities, editor, sharedSkills, roomCommands,
+  rooms: [{ id: 'demo', title: room.title }], connections, capabilities, editor, sharedSkills, roomCommands, teams,
   settings: { allowFullAccess: false, attachOpenFile: true, approvalTimeoutSeconds: 300 }, localModels: { vision: 'glm-ocr:latest', embedding: 'embeddinggemma:latest' }, room });
 const running = room({ status: 'running', activeAgents: ['a3'], currentAgent: 'a3', queuedTurns: 1, completedTurns: 2, documents: documents(true),
   agentStates: { a1: { status: 'complete' }, a2: { status: 'queued' }, a3: { status: 'thinking' } },
@@ -97,6 +103,17 @@ const fixing = room({ title: 'Run the tests and fix what fails', mode: 'parallel
     approvalRequest('ap1', 'a2', 'claude', 'command', 'Bash', 'npm test -- tests/process.test.ts', { detail: 'Run the process tests', status: 'pending' }),
     approvalRequest('ap2', 'a1', 'codex', 'edit', 'apply_patch', 'src/process.ts', { status: 'pending',
       diff: '--- a/src/process.ts\n+++ b/src/process.ts\n@@ -456,4 +456,6 @@ export function runJsonLines(\n-    later(STOP_GRACE_MS, () => signalTree(true));\n+    later(STOP_GRACE_MS, () => {\n+      if (closed) return; signalTree(true);\n+      later(RELEASE_GRACE_MS, release);\n+    });' })] });
+// A custom team run: Codex is out of usage, so Claude stands in for the Drafting stage.
+const back = Date.now() + 2 * 86400000, backText = new Date(back).toLocaleString('en', { weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+const { builtIn: _, ...ownTeam } = teams[0];
+const teamRun = room({ title: 'Add a CSV export to the report page', mode: 'pipeline', team: ownTeam, status: 'running', activeAgents: ['a2'], currentAgent: 'a2', completedTurns: 1,
+  progress: { stage: 2, total: 3, name: 'Drafting' },
+  agents: agents.map(a => a.id === 'a1' ? { ...a, unavailable: { reason: 'usage-limit', detail: 'Codex usage limit reached.', at: now, until: back } } : a),
+  agentStates: { a1: { status: 'unavailable', detail: `out of usage until ${backText}` }, a2: { status: 'thinking' }, a3: { status: 'queued' } },
+  messages: [{ ...user, text: 'Add a CSV export to the report page.' },
+    say('lead', 'a2', 'Claude', 'Drafting: add `exportCsv(rows)` in src/report.ts with a header row and proper quoting. Review: check commas, quotes and newlines in values.', { turn: 'stage', stage: { index: 0, total: 3, name: 'Leads', lead: true } }),
+    { id: 'skip', kind: 'notice', author: 'Chatroom', status: 'complete', createdAt: now, text: `Drafting: Codex can't run right now (out of usage until ${backText}) · Claude takes this stage.` },
+    say('draft', 'a2', 'Claude', 'Drafting `exportCsv` now: a header from the first row, values quoted when they contain a comma, quote or newline.', { turn: 'stage', status: 'streaming', stage: { index: 1, total: 3, name: 'Drafting' } })] });
 const done = room({ documents: documents(false), messages: [user, plan(['complete', 'complete', 'complete']), tool, s1, s2, s3, final] });
 
 const server = createServer(async (req, res) => {
@@ -110,7 +127,8 @@ const browser = await chromium.launch({ channel: 'chrome', headless: true });
 try {
   // scrollTo: a message to bring to the top (default: the end). tab: capture only that inspector panel.
   // slash: type this into the composer to open its menu. section: inspector heading text to scroll to the top.
-  const shoot = async (file, data, { width, height, tab, scrollTo, collapseAgents, slash, section }) => {
+  // openTeam: open the team builder as /team edit does.
+  const shoot = async (file, data, { width, height, tab, scrollTo, collapseAgents, slash, section, openTeam }) => {
     const page = await browser.newPage({ viewport: { width, height }, deviceScaleFactor: 2 });
     await page.addInitScript(() => { window.acquireVsCodeApi = () => ({ postMessage: () => {}, getState: () => ({}), setState: () => {} }); });
     await page.goto(`http://127.0.0.1:${server.address().port}`);
@@ -124,6 +142,7 @@ try {
       const list = document.getElementById('messages'), target = selector && list.querySelector(selector);
       list.scrollTop = target ? target.offsetTop - list.offsetTop - 8 : list.scrollHeight;
     }, scrollTo);
+    if (openTeam) { await page.evaluate(() => window.postMessage({ type: 'openTeam' }, '*')); await page.locator('.dialog').waitFor(); }
     if (slash) { await page.locator('#prompt').click(); await page.locator('#prompt').pressSequentially(slash); await page.locator('#menu:not([hidden])').waitFor(); }
     await page.waitForTimeout(150);
     await (tab ? page.locator('#inspector') : page).screenshot({ path: `${out}/${file}` });
@@ -138,4 +157,6 @@ try {
   await shoot('usage.png', state(done), { width: 1100, height: 1220, tab: 'usage' });
   await shoot('approvals.png', state(fixing), { width: 420, height: 1000 });
   await shoot('commands.png', state(done), { width: 420, height: 1000, slash: '/' });
+  await shoot('team-run.png', state(teamRun), { width: 420, height: 1000 });
+  await shoot('team.png', state(room({ ...done, mode: 'pipeline', team: ownTeam })), { width: 1100, height: 1300, openTeam: true });
 } finally { await browser.close(); await new Promise(r => server.close(r)); }

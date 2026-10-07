@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, ToolCall, TurnFlags, TurnSink, addUsage, emptyUsage } from './types';
-import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, planStages, renderContext, renderEntry, roomFresh, roomUpdate, turnAsk, unseenEntries } from './core';
+import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, TaskPreset, TeamStage, ToolCall, TurnFlags, TurnSink, Unavailable, addUsage, emptyUsage } from './types';
+import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, classifyUnavailable, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, pipelineLead, planStages, renderContext, renderEntry, roomFresh, roomUpdate, stageAgents, teamPlan, turnAsk, unavailableText, unseenEntries } from './core';
 import { extractHandoffs, markerOf } from './commands';
 import { plainEditorText } from './editor-context';
 
@@ -22,6 +22,10 @@ export interface EngineOptions {
   maxHandoffs: () => number;
   changed: () => void;
   clock?: Clock;
+  /** Live status from the host (connections, capabilities); not stored on the agent. */
+  availability?: (agent: Agent) => Unavailable | undefined;
+  /** The model a team stage with this preset uses for the agent ('' = the agent's own model). */
+  presetModel?: (agent: Agent, preset: TaskPreset) => string;
 }
 export interface Clock { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(handle: unknown): void }
 export interface StartOptions { text?: string; targets?: string[]; all?: boolean; editor?: EditorSnapshot; flags?: TurnFlags; author?: string }
@@ -36,6 +40,8 @@ interface Pass {
   failed?: string;
   /** Team mode: agents that already failed to lead this pass. */
   leadTried?: Set<string>;
+  /** The room's own team: the current stage and the agents that finished it. */
+  pipeline?: { index: number; done: Set<string>; noticed?: boolean };
 }
 interface Watchdog { readonly done: boolean; arm(): void; suspend(): void; resume(): void; end(): void }
 interface PendingApproval { agentId: string; finish: (status: ApprovalInfo['status'], decision: ApprovalDecision) => void }
@@ -52,6 +58,9 @@ const MAX_DELTA_CHARS = 400_000;
 const rank = (level: PermissionLevel) => PERMISSIONS.indexOf(level);
 const display = (text: string) => text.split('<chatroom-tool>')[0]!.split('<chatroom-plan>')[0]!.slice(0, 100000);
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+/** "A", "A and B", "A, B and C". */
+const andList = (items: string[]) => items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
+const skipKey = (agent: Agent, u: Unavailable) => `${agent.id}:${u.reason}:${u.until ?? ''}`;
 
 export class RoomEngine {
   private queue: QueueItem[] = [];
@@ -67,6 +76,12 @@ export class RoomEngine {
   private writers = 0;
   private loopTimer?: unknown;
   private readonly clock: Clock;
+  /** The last pass-start skip notice, so an identical one is not posted again. */
+  private lastSkipKey = '';
+  /** Answers that failed because their agent cannot run for now (usage limit, model, sign-in…). */
+  private blocked = new WeakSet<Message>();
+  /** Team steps already handed to another agent once. */
+  private moved = new WeakSet<PlanStep>();
   constructor(public room: Room, private readonly options: EngineOptions) { this.clock = options.clock ?? realClock; }
   get busy(): boolean { return !!this.running; }
   /** Resolves when the current run (if any) has settled. */
@@ -86,6 +101,17 @@ export class RoomEngine {
     (this.room.agentStates ??= {})[id] = detail ? { status, detail } : { status };
   }
   lead(): Agent | undefined { return leadAgent(this.room); }
+  /** Why an agent cannot run right now: its own mark until that runs out, else live status from the host. */
+  private unavailable(agent: Agent): Unavailable | undefined {
+    const mark = agent.unavailable;
+    if (mark?.until !== undefined && mark.until <= this.clock.now()) delete agent.unavailable;
+    else if (mark) return mark;
+    return this.options.availability?.(agent);
+  }
+  private available(agent: Agent): boolean { return !this.unavailable(agent); }
+  private why(agent: Agent): string { const u = this.unavailable(agent); return u ? unavailableText(u, this.clock.now()) : 'available'; }
+  /** "Codex (out of usage until Thu 23:23) and Ollama (not running)". */
+  private named(agents: Agent[]): string { return andList(agents.map(a => `${a.name} (${this.why(a)})`)); }
 
   // ── Runs and passes ───────────────────────────────────────────────────────
   start(input?: string | StartOptions, target?: string): Promise<void> {
@@ -120,15 +146,43 @@ export class RoomEngine {
     this.clearLoopTimer();
     this.room.loopState = !direct && this.room.loop.kind !== 'once' ? { iteration: 1, startedAt: this.clock.now(), startTokens: roomFresh(this.room) } : undefined;
   }
+  /** Starts a pass. Agents that cannot run right now are skipped with a notice; the others continue. */
   private newPass(trigger: Message, targets: string[]): void {
-    const enabled = this.room.agents.filter(a => a.enabled), direct = targets.length > 0, lead = this.lead();
+    const enabled = this.room.agents.filter(a => a.enabled), direct = targets.length > 0;
     // A paused plan that a new message replaces ends here, so its pending steps do not stay pending.
     if (this.room.flow) this.endFlow(this.room.flow, 'Replaced by a new message.');
-    this.queue = []; this.room.agentStates = {};
-    this.pass = { trigger, direct, parallel: !direct && this.room.mode === 'parallel', hops: 0, keys: new Set(), limitLogged: false, turns: new Map(), deferred: [] };
-    if (direct) this.queue = targets.filter(id => enabled.some(a => a.id === id)).map(id => ({ id, kind: 'direct' }));
-    else if (this.room.mode === 'orchestrated') { if (lead) this.room.flow = { wave: 0, leadId: lead.id, phase: 'plan', steps: [] }; }
-    else this.queue = enabled.map(a => ({ id: a.id, kind: 'discussion' }));
+    this.queue = []; this.room.agentStates = {}; delete this.room.progress;
+    const pass: Pass = this.pass = { trigger, direct, parallel: !direct && this.room.mode === 'parallel', hops: 0, keys: new Set(), limitLogged: false, turns: new Map(), deferred: [] };
+    const ready = enabled.filter(a => this.available(a)), away = enabled.filter(a => !ready.includes(a));
+    for (const agent of away) this.state(agent.id, 'unavailable', this.why(agent));
+    if (direct) {
+      const asked = targets.map(id => enabled.find(a => a.id === id)).filter((a): a is Agent => !!a);
+      const go = asked.filter(a => ready.includes(a)), blocked = asked.filter(a => !ready.includes(a));
+      if (blocked.length) {
+        this.log(`Skipping ${this.named(blocked)}`);
+        this.notice(go.length ? `Skipping ${this.named(blocked)} · continuing with ${andList(go.map(a => a.name))}.`
+          : `${blocked.length === 1 ? `${blocked[0]!.name} can't run right now (${this.why(blocked[0]!)})` : `${this.named(blocked)} can't run right now`}. Mention another agent, or press Try again in its settings.`);
+      }
+      this.queue = go.map(a => ({ id: a.id, kind: 'direct' }));
+      return;
+    }
+    if (away.length) this.log(`Skipping ${this.named(away)}`);
+    if (!ready.length) { this.notice(`No agent can run right now: ${away.map(a => `${a.name} (${this.why(a)})`).join(', ')}.`); this.lastSkipKey = ''; return; }
+    // The room's own team: its stages post their own skip notices.
+    if (this.room.mode === 'pipeline' && this.room.team?.stages.length) { pass.pipeline = { index: 0, done: new Set() }; return; }
+    const key = away.map(a => skipKey(a, this.unavailable(a)!)).sort().join('|');
+    if (key && key !== this.lastSkipKey) this.notice(`Skipping ${this.named(away)} · continuing with ${andList(ready.map(a => a.name))}.`);
+    this.lastSkipKey = key;
+    // A pipeline room without a team works like Team mode.
+    if (this.room.mode === 'orchestrated' || this.room.mode === 'pipeline') {
+      const lead = this.lead();
+      if (!lead) return;
+      const leader = ready.includes(lead) ? lead : ready[0]!;
+      if (leader !== lead) this.log(`${lead.name} can't lead this message (${this.why(lead)}) · ${leader.name} leads instead`);
+      this.room.flow = { wave: 0, leadId: leader.id, phase: 'plan', steps: [] };
+      return;
+    }
+    this.queue = ready.map(a => ({ id: a.id, kind: 'discussion' }));
   }
   private launch(): Promise<void> {
     this.pauseRequested = false; this.stopping = false; this.room.status = 'running'; this.room.runStartTokens = roomFresh(this.room);
@@ -143,7 +197,7 @@ export class RoomEngine {
     this.stopping = true;
     for (const { id } of this.queue) if (!this.controllers.has(id)) this.state(id, 'stopped');
     for (const step of this.room.flow?.steps ?? []) if (step.status === 'pending') { step.status = 'skipped'; step.detail = 'Stopped by you.'; }
-    this.queue = []; this.pass = undefined; this.room.flow = undefined;
+    this.queue = []; this.pass = undefined; this.room.flow = undefined; delete this.room.progress;
     this.room.loopState = undefined; this.clearLoopTimer();
     this.briefingController?.abort(new Error('Stopped by you.'));
     for (const controller of this.controllers.values()) controller.abort(new Error('Stopped by you.'));
@@ -171,14 +225,14 @@ export class RoomEngine {
       while (this.pass && !this.stopping) {
         if (this.halted()) return;
         const pass = this.pass;
-        const done = this.room.flow ? await this.orchestrate(pass) : await this.discuss(pass);
+        const done = pass.pipeline ? await this.pipeline(pass) : this.room.flow ? await this.orchestrate(pass) : await this.discuss(pass);
         if (!done || this.stopping || this.pass !== pass) break;
         this.pass = undefined; this.queue = [];
         if (!this.nextIteration(pass)) break;
       }
       if (this.room.status === 'running') this.room.status = 'idle';
     } catch (error) { this.room.status = 'idle'; this.log(errorText(error), 'error'); }
-    finally { this.changed(); }
+    finally { if (this.room.status !== 'paused') delete this.room.progress; this.changed(); }
   }
   private async refreshBriefing(): Promise<void> {
     const latest = this.latestUser(), ready = (this.room.documents ?? []).filter(d => d.status === 'ready');
@@ -221,11 +275,12 @@ export class RoomEngine {
   private async runItem(item: QueueItem, pass: Pass, contextRoom: Room): Promise<void> {
     const agent = this.room.agents.find(a => a.id === item.id);
     if (!agent?.enabled) { this.changed(); return; }
+    if (!this.available(agent)) { this.state(agent.id, 'unavailable', this.why(agent)); this.changed(); return; }
     const spec: TurnSpec = { kind: item.kind, parallel: pass.parallel && item.kind === 'discussion', ...this.loopSpec(pass),
       ...(item.handoff ? { handoff: { from: item.handoff.from, line: item.handoff.line } } : {}) };
     const answer = await this.turn(agent, contextRoom, spec, item.handoff?.fromId);
     if (answer.status === 'complete') { pass.turns.set(agent.id, answer); this.handoffs(answer, agent, pass); }
-    else if (answer.status === 'error') pass.failed ??= agent.name;
+    else if (answer.status === 'error' && !this.blocked.has(answer)) pass.failed ??= agent.name;
   }
   private handoffs(answer: Message, author: Agent, pass: Pass): void {
     const enabled = this.room.agents.filter(a => a.enabled);
@@ -234,6 +289,7 @@ export class RoomEngine {
     for (const { agentId, line } of found) {
       const target = enabled.find(a => a.id === agentId), key = `${author.id}>${agentId}>${line}`;
       if (!target || agentId === author.id || pass.keys.has(key)) continue;
+      if (!this.available(target)) { pass.keys.add(key); this.notice(`${author.name} asked ${target.name}, but ${target.name} can't run right now (${this.why(target)}).`); continue; }
       if (pass.hops >= Math.max(0, this.options.maxHandoffs())) {
         if (!pass.limitLogged) { pass.limitLogged = true; this.log('Hand-off limit reached'); }
         continue;
@@ -272,17 +328,27 @@ export class RoomEngine {
         }
         flow.phase = 'synthesis'; this.state(lead.id, 'queued'); continue;
       }
+      if (!this.available(lead)) {
+        // A lead that can't run now (usage limit…) hands its plan or final answer to the next agent that can.
+        (pass.leadTried ??= new Set()).add(lead.id);
+        const next = this.room.agents.find(a => a.enabled && this.available(a) && !pass.leadTried!.has(a.id));
+        if (next) { this.log(`${lead.name} can't run right now (${this.why(lead)}) · ${next.name} ${flow.phase === 'synthesis' ? 'writes the final answer' : 'leads this message'}`); flow.leadId = next.id; this.state(next.id, 'queued'); continue; }
+        this.log(`${lead.name} can't run right now (${this.why(lead)}) · no other agent can take over`, 'error');
+        this.endFlow(flow, 'No agent can run right now.'); return true;
+      }
       const wavesLeft = Math.max(0, (this.room.loop.kind === 'rounds' ? this.room.loop.rounds : 1) - flow.wave - 1);
       const answer = await this.turn(lead, this.room, { kind: flow.phase, flow, wavesLeft, ...this.loopSpec(pass) });
       if (this.stopping || this.room.flow !== flow) return !this.stopping;
       if (answer.status !== 'complete') {
-        // A lead that cannot run (missing CLI, usage limit) hands this message to the next enabled agent instead of failing it.
-        if (answer.status === 'error' && flow.phase === 'plan' && flow.wave === 0) {
+        // A lead that cannot run (missing CLI, usage limit) hands this message to the next enabled agent instead of failing it;
+        // a final answer whose writer became unavailable goes to the next available agent.
+        const blocked = this.blocked.has(answer);
+        if (answer.status === 'error' && ((flow.phase === 'plan' && flow.wave === 0) || (blocked && flow.phase === 'synthesis'))) {
           (pass.leadTried ??= new Set()).add(lead.id);
-          const next = this.room.agents.find(a => a.enabled && !pass.leadTried!.has(a.id));
-          if (next) { this.log(`${lead.name} could not lead this message · ${next.name} takes over`); flow.leadId = next.id; this.state(next.id, 'queued'); continue; }
+          const next = this.room.agents.find(a => a.enabled && this.available(a) && !pass.leadTried!.has(a.id));
+          if (next) { this.log(`${lead.name} could not ${flow.phase === 'plan' ? 'lead this message' : 'write the final answer'} · ${next.name} takes over`); flow.leadId = next.id; this.state(next.id, 'queued'); continue; }
         }
-        if (answer.status === 'error') pass.failed ??= lead.name;
+        if (answer.status === 'error' && !blocked) pass.failed ??= lead.name;
         this.room.flow = undefined; return true;
       }
       pass.turns.set(lead.id, answer);
@@ -315,8 +381,10 @@ export class RoomEngine {
     while (!this.stopping && this.room.flow === flow) {
       for (const step of flow.steps) {
         if (step.status !== 'pending') continue;
-        if (!this.room.agents.find(a => a.id === step.agentId)?.enabled) { step.status = 'skipped'; step.detail = 'Its agent is disabled.'; }
+        const owner = this.room.agents.find(a => a.id === step.agentId);
+        if (!owner?.enabled) { step.status = 'skipped'; step.detail = 'Its agent is disabled.'; }
         else if (step.after.some(id => status(id) === 'error' || status(id) === 'skipped')) { step.status = 'skipped'; step.detail = 'A step it builds on did not finish.'; }
+        else if (!this.available(owner)) this.reassign(flow, step, owner);
       }
       // One turn per agent at a time; dependencies gate the rest.
       const busy = new Set(flow.steps.filter(s => s.status === 'running').map(s => s.agentId));
@@ -327,9 +395,10 @@ export class RoomEngine {
         step.status = 'running'; busy.add(agent.id);
         running.set(step.id, this.turn(agent, this.room, { kind: 'step', flow, step, ...this.loopSpec(pass) }).then(answer => {
           step.messageId = answer.id;
+          if (this.blocked.has(answer) && this.room.flow === flow) { step.status = 'pending'; this.reassign(flow, step, agent); return; }
           step.status = answer.status === 'complete' ? 'complete' : answer.status === 'cancelled' ? 'skipped' : 'error';
           if (answer.status !== 'complete') step.detail = answer.status === 'cancelled' ? 'Stopped.' : 'The agent failed.';
-          if (answer.status === 'error') pass.failed ??= agent.name;
+          if (answer.status === 'error' && !this.blocked.has(answer)) pass.failed ??= agent.name;
           if (answer.status === 'complete') {
             pass.turns.set(agent.id, answer);
             const mentioned = extractHandoffs(answer.text, agent, this.room.agents.filter(a => a.enabled), flow.leadId);
@@ -342,6 +411,127 @@ export class RoomEngine {
       await Promise.race(running.values());
     }
     await Promise.allSettled(running.values());
+  }
+  /** Hands a Team step whose agent can't run to a free agent, preferring one not in the plan, else the lead; once per step, then it is skipped. */
+  private reassign(flow: Flow, step: PlanStep, from: Agent): void {
+    const why = this.why(from);
+    this.state(from.id, 'unavailable', why);
+    const busy = new Set(flow.steps.filter(s => s.status === 'running').map(s => s.agentId)), planned = new Set([flow.leadId, ...flow.steps.map(s => s.agentId)]);
+    const free = this.moved.has(step) ? [] : this.room.agents.filter(a => a.enabled && a.id !== from.id && !busy.has(a.id) && this.available(a));
+    const sub = free.find(a => !planned.has(a.id)) ?? free.find(a => a.id === flow.leadId) ?? free[0];
+    if (!sub) { step.status = 'skipped'; step.detail = `${from.name} can't run (${why}).`; this.log(`Step ${step.id} skipped · ${from.name} can't run (${why})`); return; }
+    this.moved.add(step);
+    Object.assign(step, { agentId: sub.id, status: 'pending', detail: `${from.name} can't run (${why}) · ${sub.name} took this step` });
+    this.state(sub.id, 'queued'); this.log(`Step ${step.id}: ${from.name} can't run (${why}) · ${sub.name} took this step`);
+  }
+
+  // ── The room's own team (pipeline) ─────────────────────────────────────────
+  /** Runs the team's stages in order from the current one, then the final answer. Returns false when the run paused. */
+  private async pipeline(pass: Pass): Promise<boolean> {
+    const state = pass.pipeline!;
+    for (;;) {
+      const team = this.room.team;
+      if (this.stopping || this.pass !== pass) return !this.stopping;
+      if (!team || state.index >= team.stages.length) break;
+      if (this.halted()) return false;
+      if (this.capHit()) return true;
+      const index = state.index, total = team.stages.length, stage = team.stages[index]!;
+      this.room.progress = { stage: index + 1, total, name: stage.name }; this.changed();
+      const result = await this.runStage(pass, stage, index, total, teamPlan(team, this.room));
+      if (result === 'paused') return false;
+      if (this.stopping || this.pass !== pass) return !this.stopping;
+      if (result === 'end') return true;
+      state.index++; state.done.clear(); state.noticed = false;
+    }
+    delete this.room.progress;
+    const team = this.room.team;
+    if (!team?.wrapUp) return true;
+    if (this.halted()) return false;
+    if (this.capHit()) return true;
+    // The first lead writes the final answer; when it can't run, the next available agent tries once.
+    const tried = new Set<string>(), ok = (a: Agent) => a.enabled && !tried.has(a.id) && this.available(a);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const writer = (attempt === 0 ? pipelineLead(this.room, ok) : undefined) ?? this.room.agents.find(ok);
+      if (!writer) { this.log('No agent can write the final answer right now', 'error'); return true; }
+      tried.add(writer.id);
+      const answer = await this.turn(writer, this.room, { kind: 'synthesis', teamPlan: teamPlan(team, this.room), ...this.loopSpec(pass) });
+      if (this.stopping || this.pass !== pass) return !this.stopping;
+      if (answer.status === 'complete') { pass.turns.set(writer.id, answer); return true; }
+      if (!this.blocked.has(answer)) { if (answer.status === 'error') pass.failed ??= writer.name; return true; }
+    }
+    return true;
+  }
+  /** One stage: its available agents together (on a shared snapshot) or one after another. 'end' = a lead answered directly or the loop stopped. */
+  private async runStage(pass: Pass, stage: TeamStage, index: number, total: number, plan: string): Promise<'next' | 'end' | 'paused'> {
+    const state = pass.pipeline!, agents = stageAgents(stage, this.room);
+    const ready = agents.filter(a => this.available(a)), away = agents.filter(a => !ready.includes(a));
+    const reasons = (list: Agent[]) => list.map(a => this.why(a)).join('; ');
+    let runners = ready, substituted = false, standIn: string[] | undefined;
+    if (!ready.length && !state.done.size) {
+      const sub = this.stageSubstitute(state.done);
+      const who = away.length ? `${andList(away.map(a => a.name))} can't run right now (${reasons(away)})` : 'nobody can run right now';
+      if (!sub) { this.notice(`${stage.name}: no agent can run · skipped.`); return 'next'; }
+      if (!state.noticed) this.notice(`${stage.name}: ${who} · ${sub.name} takes this stage.`);
+      runners = [sub]; substituted = true; standIn = away.length ? away.map(a => a.name) : stage.agents;
+    } else if (away.length && !state.noticed) this.notice(`${stage.name}: skipping ${andList(away.map(a => a.name))} (${reasons(away)}).`);
+    state.noticed = true;
+    const blocked: Agent[] = [];
+    const runOne = async (agent: Agent, contextRoom: Room, others: string[], standIn?: string[]) => {
+      const spec: TurnSpec = { kind: 'stage', stage: { index, total, name: stage.name, ...(stage.lead ? { lead: true } : {}), ...(stage.task ? { task: stage.task } : {}), others, plan, ...(standIn?.length ? { standIn } : {}) }, ...this.loopSpec(pass) };
+      const answer = await this.turn(agent, contextRoom, spec, undefined, this.stageModel(agent, stage));
+      if (answer.status === 'complete') {
+        pass.turns.set(agent.id, answer); state.done.add(agent.id);
+        const mentioned = extractHandoffs(answer.text, agent, this.room.agents.filter(a => a.enabled));
+        if (mentioned.length) this.log(`${agent.name} mentioned ${[...new Set(mentioned.map(h => this.room.agents.find(a => a.id === h.agentId)?.name ?? h.agentId))].join(', ')}; in a team run the stages decide who works next.`);
+      } else if (this.blocked.has(answer)) blocked.push(agent);
+      else if (answer.status === 'error') pass.failed ??= agent.name;
+    };
+    const others = (agent: Agent) => runners.filter(a => a !== agent).map(a => a.name);
+    const pending = runners.filter(a => !state.done.has(a.id));
+    for (const agent of pending) this.state(agent.id, 'queued');
+    if (stage.run === 'relay' || pending.length < 2) {
+      for (const agent of pending) {
+        if (this.stopping || this.pass !== pass) return 'next';
+        if (this.halted()) return 'paused';
+        if (this.capHit()) return 'end';
+        await runOne(agent, this.room, others(agent), standIn);
+      }
+    } else {
+      // Workers share a snapshot taken when the stage began: agents in the stage don't see each other's answers.
+      const snapshot = { ...this.room, messages: this.room.messages.slice() }, queue = [...pending];
+      const workers = Math.max(1, Math.min(4, this.room.concurrency ?? 3));
+      await Promise.all(Array.from({ length: workers }, async () => {
+        while (queue.length && !this.stopping && this.pass === pass && !this.pauseRequested && !overLimit(this.room) && !this.capHit()) { const agent = queue.shift()!; await runOne(agent, snapshot, others(agent)); }
+      }));
+      if (this.stopping || this.pass !== pass) return 'next';
+      if (queue.length) { if (this.halted()) return 'paused'; if (this.capHit()) return 'end'; }
+    }
+    if (this.stopping || this.pass !== pass) return 'next';
+    // Nobody in the stage finished because some could not run: one substitute does the stage.
+    if (!substituted && blocked.length && !runners.some(a => state.done.has(a.id))) {
+      const sub = this.stageSubstitute(state.done, blocked);
+      if (sub) {
+        this.notice(`${stage.name}: ${andList(blocked.map(a => a.name))} can't run right now (${reasons(blocked)}) · ${sub.name} takes this stage.`);
+        if (this.halted()) return 'paused';
+        if (this.capHit()) return 'end';
+        await runOne(sub, this.room, [], blocked.map(a => a.name));
+      }
+    }
+    if (stage.lead) {
+      const direct = [...state.done].map(id => pass.turns.get(id)).find(m => m?.marker === 'done' && m.stage?.index === index);
+      if (direct) { this.log(`${this.room.agents.find(a => a.id === direct.agentId)?.name ?? direct.author} answered directly · the remaining stages are skipped`); return 'end'; }
+    }
+    return 'next';
+  }
+  /** The agent that takes a stage nobody in it can run: the team's lead if it can, else the first available agent. */
+  private stageSubstitute(skip: Set<string>, exclude: Agent[] = []): Agent | undefined {
+    const ok = (a: Agent) => a.enabled && !skip.has(a.id) && !exclude.includes(a) && this.available(a);
+    return pipelineLead(this.room, ok) ?? this.room.agents.find(ok);
+  }
+  /** A stage with a model preset runs the agent with that preset's model, without changing the agent's own model. */
+  private stageModel(agent: Agent, stage: TeamStage): { model?: string } | undefined {
+    const model = stage.preset ? this.options.presetModel?.(agent, stage.preset)?.trim() : '';
+    return model && model !== agent.model ? { model } : undefined;
   }
 
   // ── Loops (§6.7) ──────────────────────────────────────────────────────────
@@ -374,14 +564,19 @@ export class RoomEngine {
     if (pass.failed) { this.stopLoop(`${pass.failed} failed`); return false; }
     if (loop.kind === 'once') return this.finishLoop('');
     if (!this.room.agents.some(a => a.enabled)) { this.stopLoop('no agent is turned on'); return false; }
-    if (loop.kind === 'rounds' && (this.room.mode === 'orchestrated' || state.iteration >= loop.rounds)) return this.finishLoop(this.room.mode === 'orchestrated' ? '' : `Loop finished · ${state.iteration} rounds`);
+    if (!this.room.agents.some(a => a.enabled && this.available(a))) { this.stopLoop('no agent is available'); return false; }
+    // Team mode delegates the rounds as waves; a pipeline repeats every stage each round.
+    const waves = !pass.pipeline && (this.room.mode === 'orchestrated' || this.room.mode === 'pipeline');
+    if (loop.kind === 'rounds' && (waves || state.iteration >= loop.rounds)) return this.finishLoop(waves ? '' : `Loop finished · ${state.iteration} rounds`);
     if (loop.kind === 'consensus') {
       const turns = [...pass.turns.values()];
       if (turns.length && turns.every(m => m.marker === 'agree')) return this.finishLoop('Loop finished · every agent agrees');
     }
     if (loop.kind === 'lead-done') {
-      const lead = this.lead(), last = lead && pass.turns.get(lead.id);
-      if (last?.marker === 'done') return this.finishLoop(`Loop finished · ${lead!.name} marked the task done`);
+      const first = pass.pipeline ? this.room.team?.stages.find(s => s.lead) : undefined;
+      const leads = pass.pipeline ? (first ? stageAgents(first, this.room) : []) : [this.lead()].filter((a): a is Agent => !!a);
+      const lead = leads.find(a => pass.turns.get(a.id)?.marker === 'done');
+      if (lead) return this.finishLoop(`Loop finished · ${lead.name} marked the task done`);
     }
     const cap = this.capReason(true);
     if (cap) { this.stopLoop(cap); return false; }
@@ -414,6 +609,7 @@ export class RoomEngine {
     const cap = this.capReason(true);
     if (cap) { this.stopLoop(cap); return; }
     if (!this.room.agents.some(a => a.enabled)) { this.stopLoop('no agent is turned on'); return; }
+    if (!this.room.agents.some(a => a.enabled && this.available(a))) { this.stopLoop('no agent is available'); return; }
     const text = loop.prompt?.trim() || this.latestUser()?.text;
     if (!text) { this.stopLoop('there is no message to repeat'); return; }
     state.iteration++; delete state.nextAt;
@@ -425,9 +621,10 @@ export class RoomEngine {
   }
 
   // ── Turns ─────────────────────────────────────────────────────────────────
-  private turn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string): Promise<Message> {
+  /** `override.model` runs this turn with another model (a team stage's preset); the agent's own model does not change. */
+  private turn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, override?: { model?: string }): Promise<Message> {
     const driver = this.options.native(agent);
-    return driver ? this.nativeTurn(agent, driver, contextRoom, spec, handoffFrom) : this.legacyTurn(agent, contextRoom, spec, handoffFrom);
+    return driver ? this.nativeTurn(agent, driver, contextRoom, spec, handoffFrom, undefined, override) : this.legacyTurn(agent, contextRoom, spec, handoffFrom, override);
   }
   private purpose(spec: TurnSpec, command?: { name: string }): string {
     switch (spec.kind) {
@@ -437,6 +634,7 @@ export class RoomEngine {
       case 'direct': return ' · 1:1';
       case 'handoff': return ` · asked by ${spec.handoff?.from ?? 'a teammate'}`;
       case 'command': return ` · /${command?.name ?? 'command'}`;
+      case 'stage': return ` · ${spec.stage?.name ?? 'stage'}`;
       default: return '';
     }
   }
@@ -444,6 +642,7 @@ export class RoomEngine {
     const answer = message('agent', '', agent.name, agent.id);
     answer.createdAt = this.clock.now(); answer.status = 'streaming'; answer.turn = spec.kind;
     if (spec.kind === 'step' && spec.step) answer.step = { id: spec.step.id, plan: spec.flow?.planId, task: spec.step.task, after: spec.step.after };
+    if (spec.kind === 'stage' && spec.stage) answer.stage = { index: spec.stage.index, total: spec.stage.total, name: spec.stage.name, ...(spec.stage.lead ? { lead: true } : {}) };
     if (handoffFrom) answer.handoff = { from: handoffFrom, to: [agent.id] };
     return answer;
   }
@@ -536,7 +735,9 @@ export class RoomEngine {
       list.splice(old >= 0 ? old : 0, 1);
     }
   }
-  private async nativeTurn(agent: Agent, driver: NativeDriver, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, command?: { name: string; args: string }): Promise<Message> {
+  private async nativeTurn(agent: Agent, driver: NativeDriver, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, command?: { name: string; args: string }, override?: { model?: string }): Promise<Message> {
+    // The driver gets a shallow copy with the override model; sink, session, usage and state keep writing to the real agent.
+    const model = override?.model || agent.model, runAgent = model !== agent.model ? { ...agent, model } : agent;
     const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
     this.controllers.set(id, controller); this.state(id, 'thinking');
     const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec, command);
@@ -562,7 +763,7 @@ export class RoomEngine {
         if (unseen) { editor = trigger!.editor; if (spec.kind !== 'handoff' && trigger!.flags) flags = { ...trigger!.flags }; }
       }
       this.room.messages.push(answer); timer.arm();
-      this.log(`${agent.name} started${purpose} · ${agent.model || 'default model'}`);
+      this.log(`${agent.name} started${purpose} · ${model || 'default model'}`);
       const touch = () => timer.arm();
       const sink: TurnSink = {
         text: full => { if (timer.done) return; answer.text = display(String(full ?? '')); touch(); this.changed(); },
@@ -587,7 +788,7 @@ export class RoomEngine {
           touch(); this.changed();
         }
       };
-      const result = await this.bounded(driver.turn({ room: this.room, agent, kind: spec.kind, framing, context, fullContext, ask, editor, flags, ...(command ? { command } : {}), signal, sink }), signal);
+      const result = await this.bounded(driver.turn({ room: this.room, agent: runAgent, kind: spec.kind, framing, context, fullContext, ask, editor, flags, ...(command ? { command } : {}), signal, sink }), signal);
       timer.end();
       answer.text = String(result?.text || answer.text || '').slice(0, 100000);
       const usage = result?.usage ?? emptyUsage();
@@ -614,12 +815,12 @@ export class RoomEngine {
     return answer;
   }
   private complete(agent: Agent, answer: Message, spec: TurnSpec, purpose: string): void {
-    if (spec.kind === 'plan' || spec.kind === 'synthesis') {
+    if (spec.kind === 'plan' || (spec.kind === 'synthesis' && !spec.teamPlan)) {
       const parsed = parsePlan(answer.text, this.room.agents.filter(a => a.enabled));
       if (parsed) { answer.text = parsed.text; if (parsed.steps.length) answer.plan = parsed.steps; parsed.notes.forEach(note => this.log(note)); }
     }
     if (!answer.text.trim() && !answer.plan && !answer.activity?.length) throw new Error('The agent returned an empty answer.');
-    answer.status = 'complete'; this.room.completedTurns++; this.state(agent.id, 'complete');
+    answer.status = 'complete'; this.room.completedTurns++; this.state(agent.id, 'complete'); delete agent.unavailable;
     const marker = spec.kind === 'command' ? undefined : markerOf(answer.text);
     if (marker) answer.marker = marker;
     const usage = answer.usage ?? emptyUsage();
@@ -645,8 +846,18 @@ export class RoomEngine {
     this.queue = this.queue.filter(item => item.id !== agent.id);
     this.log(`${agent.name}: ${detail}`, 'error');
     if (error instanceof ProviderError && error.extra?.action) this.notice(error.message);
+    // Out of usage, signed out, model not available, Ollama not running: mark the agent and continue without it (not a failed run).
+    const mark = classifyUnavailable(error, agent, this.clock.now());
+    if (!mark) return;
+    agent.unavailable = mark; this.blocked.add(answer);
+    const text = unavailableText(mark, this.clock.now());
+    this.state(agent.id, 'unavailable', text);
+    this.notice(`${agent.name} can't run right now (${text}) · continuing without it.`);
+    // This notice already covers the next pass's skip.
+    this.lastSkipKey = [...this.lastSkipKey.split('|').filter(k => k && !k.startsWith(`${agent.id}:`)), skipKey(agent, mark)].sort().join('|');
   }
-  private async legacyTurn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string): Promise<Message> {
+  private async legacyTurn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, override?: { model?: string }): Promise<Message> {
+    const model = override?.model || agent.model, runAgent = model !== agent.model ? { ...agent, model } : agent;
     const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
     this.controllers.set(id, controller); this.state(id, 'thinking');
     const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec);
@@ -657,7 +868,7 @@ export class RoomEngine {
       const system = legacySystem(this.options.framing(agent, this.room, true), agent, this.room);
       const context = legacyContext(contextRoom, agent, this.options.contextTokens(), { ...spec, briefing: this.briefing?.text }, system);
       this.room.messages.push(answer); timer.arm();
-      this.log(`${agent.name} started${purpose} · ${agent.model || 'client default'}`);
+      this.log(`${agent.name} started${purpose} · ${model || 'client default'}`);
       if (context.omitted) this.log(`Context bounded · ${context.omitted} earlier messages omitted for ${agent.name}`);
       const editor = spec.trigger?.editor ? `\n\n${plainEditorText(spec.trigger.editor)}` : '';
       let prompt = context.prompt + editor, continuation: unknown, toolResults: { call: ToolCall; output: string }[] | undefined, toolCount = 0, wrapUp = false;
@@ -670,7 +881,7 @@ export class RoomEngine {
         }
         pendingInput = system + prompt;
         this.state(id, 'thinking'); timer.arm();
-        const result = await this.bounded(provider.run({ agent, system, prompt, signal, continuation, toolResults, allowTools: toolCount < 8 && !wrapUp,
+        const result = await this.bounded(provider.run({ agent: runAgent, system, prompt, signal, continuation, toolResults, allowTools: toolCount < 8 && !wrapUp,
           onText: text => { if (timer.done) return; answer.text = display(text); timer.arm(); this.changed(); }, onActivity: text => { timer.arm(); this.log(text, 'tool'); } }), signal);
         aggregate = addUsage(aggregate, result.usage); pendingInput = undefined; answer.usage = aggregate;
         this.room.usage[id] = addUsage(this.room.usage[id] ?? emptyUsage(), result.usage);
