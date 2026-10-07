@@ -1,9 +1,22 @@
 import { randomUUID } from 'node:crypto';
-import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, TaskPreset, TeamStage, ToolCall, TurnFlags, TurnSink, Unavailable, addUsage, emptyUsage } from './types';
-import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, classifyUnavailable, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, pipelineLead, planStages, renderContext, renderEntry, roomFresh, roomUpdate, stageAgents, teamPlan, turnAsk, unavailableText, unseenEntries } from './core';
+import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, TaskPreset, TeamStage, ToolCall, TurnFlags, TurnKind, TurnSink, Unavailable, addUsage, emptyUsage } from './types';
+import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, classifyUnavailable, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, pipelineLead, planStages, renderContext, renderEntry, roomFresh, roomUpdate, stageAgents, teamPlan, turnAsk, unavailableText, unseenEntries, upsertChangesCard } from './core';
 import { extractHandoffs, markerOf } from './commands';
 import { plainEditorText } from './editor-context';
 
+/** Per-agent git worktrees (optional): isolated agents edit their own branch, and the room combines the branches for review. */
+export interface Isolation {
+  /** Whether this agent should work in its own worktree for this turn (mode, permission, agent.isolate, and whether another agent could edit at the same time). */
+  wants(agent: Agent, room: Room, kind?: TurnKind): boolean;
+  /** Creates or reuses the agent's worktree (and the room base when needed); sets agent.worktree; returns its path. */
+  prepare(room: Room, agent: Agent): Promise<string>;
+  checkpoint(room: Room, agent: Agent, note: string): Promise<void>;
+  /** Combines every isolated agent's branch into the room's integration branch, then fast-forwards clean agents to it; updates room.changes. */
+  integrate(room: Room): Promise<{ conflicts: { agentId: string; files: string[] }[] }>;
+  /** For a conflicting agent: merges the integration branch into its worktree and returns the conflicted files (markers left), or [] if it merged cleanly. */
+  mergeInto(room: Room, agent: Agent): Promise<string[]>;
+  finishMerge(room: Room, agent: Agent): Promise<boolean>;
+}
 export interface EngineOptions {
   /** Legacy providers (Ollama, Copilot through vscode.lm). */
   providers: Partial<Record<ProviderId, Provider>>;
@@ -26,6 +39,7 @@ export interface EngineOptions {
   availability?: (agent: Agent) => Unavailable | undefined;
   /** The model a team stage with this preset uses for the agent ('' = the agent's own model). */
   presetModel?: (agent: Agent, preset: TaskPreset) => string;
+  isolation?: Isolation;
 }
 export interface Clock { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(handle: unknown): void }
 export interface StartOptions { text?: string; targets?: string[]; all?: boolean; editor?: EditorSnapshot; flags?: TurnFlags; author?: string }
@@ -82,6 +96,8 @@ export class RoomEngine {
   private blocked = new WeakSet<Message>();
   /** Team steps already handed to another agent once. */
   private moved = new WeakSet<PlanStep>();
+  /** An isolated agent saved work since the room last combined the worktrees. */
+  private integrationDue = false;
   constructor(public room: Room, private readonly options: EngineOptions) { this.clock = options.clock ?? realClock; }
   get busy(): boolean { return !!this.running; }
   /** Resolves when the current run (if any) has settled. */
@@ -227,6 +243,9 @@ export class RoomEngine {
         const pass = this.pass;
         const done = pass.pipeline ? await this.pipeline(pass) : this.room.flow ? await this.orchestrate(pass) : await this.discuss(pass);
         if (!done || this.stopping || this.pass !== pass) break;
+        await this.combine(pass);
+        this.postChanges();
+        if (this.stopping || this.pass !== pass) break;
         this.pass = undefined; this.queue = [];
         if (!this.nextIteration(pass)) break;
       }
@@ -264,6 +283,7 @@ export class RoomEngine {
       await Promise.all(Array.from({ length: workers }, async () => {
         while (this.queue.length && !this.stopping && !this.pauseRequested && !overLimit(this.room) && !this.capHit()) await this.runItem(this.queue.shift()!, pass, snapshot);
       }));
+      if (!this.stopping) await this.combine(pass);
       if (this.loopStopped()) { this.queue = []; pass.deferred = []; }
     }
     return !this.stopping;
@@ -326,6 +346,9 @@ export class RoomEngine {
           if (this.loopStopped()) { this.endFlow(flow, 'The loop stopped.'); return true; }
           for (const step of flow.steps) if (step.status === 'pending') { step.status = 'skipped'; step.detail = 'It could not be scheduled.'; }
         }
+        // The lead writes the final answer on the combined work.
+        await this.combine(pass);
+        if (this.stopping || this.room.flow !== flow) return !this.stopping;
         flow.phase = 'synthesis'; this.state(lead.id, 'queued'); continue;
       }
       if (!this.available(lead)) {
@@ -441,6 +464,9 @@ export class RoomEngine {
       if (result === 'paused') return false;
       if (this.stopping || this.pass !== pass) return !this.stopping;
       if (result === 'end') return true;
+      // The next stage builds on the combined work of this one.
+      await this.combine(pass);
+      if (this.stopping || this.pass !== pass) return !this.stopping;
       state.index++; state.done.clear(); state.noticed = false;
     }
     delete this.room.progress;
@@ -532,6 +558,54 @@ export class RoomEngine {
   private stageModel(agent: Agent, stage: TeamStage): { model?: string } | undefined {
     const model = stage.preset ? this.options.presetModel?.(agent, stage.preset)?.trim() : '';
     return model && model !== agent.model ? { model } : undefined;
+  }
+
+  // ── Worktrees ─────────────────────────────────────────────────────────────
+  /**
+   * Combines the isolated agents' branches (after a stage, a parallel round, Team steps and every pass). An agent whose branch
+   * conflicts gets one merge turn in its own worktree; what still conflicts after that is posted as a notice.
+   */
+  private async combine(pass?: Pass): Promise<void> {
+    const isolation = this.options.isolation;
+    if (!isolation || !this.integrationDue || !this.room.agents.some(a => a.worktree)) return;
+    this.integrationDue = false;
+    const integrate = async () => {
+      try { return (await isolation.integrate(this.room)).conflicts; }
+      catch (error) { this.log(`Couldn't combine the agents' worktrees · ${errorText(error)}`, 'error'); return undefined; }
+    };
+    let conflicts = await integrate();
+    if (!conflicts) return;
+    const tried = new Set<string>();
+    for (;;) {
+      const next = conflicts.find(c => !tried.has(c.agentId));
+      if (!next || this.stopping || this.pauseRequested || overLimit(this.room)) break;
+      tried.add(next.agentId);
+      const agent = this.room.agents.find(a => a.id === next.agentId), driver = agent ? this.options.native(agent) : undefined;
+      if (!agent?.worktree || !driver || !agent.enabled || !this.available(agent)) continue;
+      let files: string[];
+      try { files = await isolation.mergeInto(this.room, agent); }
+      catch (error) { this.log(`${agent.name}: ${errorText(error)}`, 'error'); continue; }
+      if (files.length) {
+        this.log(`${agent.name}'s changes conflict with the combined work in ${files.join(', ')} · ${agent.name} merges them`);
+        await this.nativeTurn(agent, driver, this.room, { kind: 'merge', merge: { files }, ...(pass ? { trigger: pass.trigger } : {}) });
+        try { await isolation.finishMerge(this.room, agent); } catch (error) { this.log(`${agent.name}: ${errorText(error)}`, 'error'); }
+      }
+      conflicts = await integrate() ?? [];
+    }
+    if (this.stopping) return;
+    // A pause leaves the remaining merges for the next combine.
+    if (conflicts.some(c => !tried.has(c.agentId))) this.integrationDue = true;
+    for (const conflict of conflicts.filter(c => tried.has(c.agentId))) {
+      const name = this.room.agents.find(a => a.id === conflict.agentId)?.name ?? 'An agent';
+      this.notice(`Couldn't combine ${name}'s changes in ${conflict.files.join(', ') || 'some files'} · review them or keep the branch.`);
+    }
+  }
+  /** One live card for the room's changes, posted at the end of a pass and updated in place after that. */
+  private postChanges(): void {
+    const changes = this.room.changes;
+    if (!this.options.isolation || !changes?.files.length || (changes.status !== 'ready' && changes.status !== 'conflict')) return;
+    upsertChangesCard(this.room, this.clock.now());
+    this.changed();
   }
 
   // ── Loops (§6.7) ──────────────────────────────────────────────────────────
@@ -635,6 +709,7 @@ export class RoomEngine {
       case 'handoff': return ` · asked by ${spec.handoff?.from ?? 'a teammate'}`;
       case 'command': return ` · /${command?.name ?? 'command'}`;
       case 'stage': return ` · ${spec.stage?.name ?? 'stage'}`;
+      case 'merge': return ' · merging';
       default: return '';
     }
   }
@@ -736,20 +811,36 @@ export class RoomEngine {
     }
   }
   private async nativeTurn(agent: Agent, driver: NativeDriver, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, command?: { name: string; args: string }, override?: { model?: string }): Promise<Message> {
-    // The driver gets a shallow copy with the override model; sink, session, usage and state keep writing to the real agent.
-    const model = override?.model || agent.model, runAgent = model !== agent.model ? { ...agent, model } : agent;
+    const model = override?.model || agent.model;
     const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
     this.controllers.set(id, controller); this.state(id, 'thinking');
-    const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec, command);
-    let release: (() => void) | undefined;
+    const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec, command), isolation = this.options.isolation;
+    let release: (() => void) | undefined, isolated = !!agent.worktree;
     try {
-      release = await this.writerLock(agent, signal);
+      // An isolated agent works in its own worktree (made on its first such turn) and edits without waiting for the others.
+      if (isolation && !command && (agent.worktree || isolation.wants(agent, this.room, spec.kind))) {
+        if (!agent.worktree) { this.state(id, 'thinking', 'Setting up its own worktree'); this.changed(); }
+        try { await isolation.prepare(this.room, agent); isolated = !!agent.worktree; }
+        catch (error) { isolated = false; this.log(`${agent.name} can't use its own worktree · it works in the shared folder (${errorText(error)})`, 'error'); }
+      }
+      const folder = isolated ? agent.worktree?.path : undefined;
+      // The driver gets a shallow copy with the override model; sink, session, usage and state keep writing to the real agent.
+      const runAgent = model !== agent.model ? { ...agent, model } : agent;
+      release = isolated ? undefined : await this.writerLock(agent, signal);
       this.state(id, 'thinking');
       const framing = this.options.framing(agent, this.room, false), maxChars = this.options.contextTokens() * 3;
       let context = '', ask = '', fullContext = () => '', editor: EditorSnapshot | undefined, flags: TurnFlags = {}, seen: string | undefined;
       if (!command) {
+        // A native session lives in the folder it started in: another folder means a new session with the room history.
+        const moved = !!isolation && !!agent.session?.id && agent.session.cwd !== folder;
+        if (moved) {
+          this.log(folder ? `${agent.name} works in its own worktree from now on · new session with the room history` : `${agent.name} is back in the shared folder · new session with the room history`);
+          const kept = { ...agent.session };
+          for (const key of ['id', 'cost', 'context', 'startedAt'] as const) delete kept[key];
+          agent.session = kept;
+        }
         const session = agent.session, trigger = spec.trigger;
-        const entries = session ? unseenEntries(contextRoom, agent, spec) : boundedHistory(contextRoom, agent, this.options.contextTokens(), spec);
+        const entries = session && !moved ? unseenEntries(contextRoom, agent, spec) : boundedHistory(contextRoom, agent, this.options.contextTokens(), spec);
         seen = contextRoom.messages.at(-1)?.id;
         const unseen = !!trigger && entries.some(m => m.id === trigger.id);
         const rest = unseen ? entries.filter(m => m.id !== trigger!.id) : entries;
@@ -796,6 +887,7 @@ export class RoomEngine {
       const delivered = () => {
         const seenId = spec.kind === 'step' && spec.flow?.planId ? spec.flow.planId : seen;
         agent.session = { ...agent.session, ...(seenId ? { seen: seenId } : {}), framingHash: framingHash(framing), provider: agent.provider, lastUsedAt: this.clock.now() };
+        if (isolation) { if (folder) agent.session.cwd = folder; else delete agent.session.cwd; }
       };
       if (result?.status === 'interrupted') {
         // Stopped after the CLI received the input (it says so, or the model already answered): its session holds it, so later turns must not send it again.
@@ -809,6 +901,11 @@ export class RoomEngine {
       this.failed(agent, answer, signal, error);
     } finally {
       timer.end(); release?.();
+      // A completed turn in a worktree becomes a commit on the agent's branch (finishMerge commits a merge turn).
+      if (isolated && isolation && !command && spec.kind !== 'merge' && answer.status === 'complete' && agent.worktree) {
+        try { await isolation.checkpoint(this.room, agent, `turn ${this.room.completedTurns}${purpose}`); this.integrationDue = true; }
+        catch (error) { this.log(`${agent.name}'s work could not be saved in its worktree · ${errorText(error)}`, 'error'); }
+      }
       if (this.controllers.get(id) === controller) this.controllers.delete(id);
       this.changed();
     }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseTeam, resolveMention, stripCode } from '../src/commands';
+import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseTeam, parseWorktrees, resolveMention, stripCode } from '../src/commands';
 import { Agent, AgentCapabilities, NativeCommand, ProviderId } from '../src/types';
 
 const agent = (id: string, name: string, provider: ProviderId, enabled = true): Agent => ({ id, name, provider, model: '', role: '', enabled, tools: [],
@@ -20,12 +20,25 @@ const capsMap: Record<string, AgentCapabilities> = {
 };
 
 test('room commands table is exact and agent-scoped names are derived from it', () => {
-  assert.deepEqual(ROOM_COMMANDS.map(c => c.name), ['help', 'clear', 'compact', 'new', 'export', 'loop', 'mode', 'lead', 'team', 'model', 'effort', 'permissions', 'status', 'stop']);
+  assert.deepEqual(ROOM_COMMANDS.map(c => c.name), ['help', 'clear', 'compact', 'new', 'export', 'loop', 'mode', 'lead', 'team', 'worktrees', 'model', 'effort', 'permissions', 'status', 'stop']);
   assert.deepEqual(AGENT_SCOPED, ['clear', 'compact', 'model', 'effort', 'permissions', 'status']);
   assert.equal(ROOM_COMMANDS.find(c => c.name === 'loop')?.args, '[N | consensus | done | every 10m <prompt> | off]');
   assert.equal(ROOM_COMMANDS.find(c => c.name === 'compact')?.description, "Summarize each agent's native session to free context");
   assert.equal(NATIVE_COMMAND_DENYLIST.codex.length, 0);
   assert.deepEqual(ROOM_COMMANDS.find(c => c.name === 'team'), { name: 'team', args: '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', description: 'Set up your own team: stages such as lead, drafting, review, testing', agentScoped: false });
+  assert.deepEqual(ROOM_COMMANDS.find(c => c.name === 'worktrees'), { name: 'worktrees', args: 'off | auto | always | status | apply | keep [name] | discard | cleanup', description: 'Give agents their own git worktrees so parallel edits never collide', agentScoped: false });
+});
+test('/worktrees arguments: a mode, status, apply, keep with an optional name, discard, cleanup; anything else is usage', () => {
+  assert.deepEqual(parseWorktrees(''), { action: 'status' });
+  assert.deepEqual(parseWorktrees('status'), { action: 'status' });
+  for (const mode of ['off', 'auto', 'always'] as const) assert.deepEqual(parseWorktrees(` ${mode.toUpperCase()} `), { mode });
+  assert.deepEqual(parseWorktrees('apply'), { action: 'apply' });
+  assert.deepEqual(parseWorktrees('keep'), { action: 'keep' });
+  assert.deepEqual(parseWorktrees('keep login fix'), { action: 'keep', name: 'login fix' });
+  assert.deepEqual(parseWorktrees('discard'), { action: 'discard' });
+  assert.deepEqual(parseWorktrees('cleanup'), { action: 'cleanup' });
+  for (const bad of ['on', 'apply now', 'auto please']) assert.match(parseWorktrees(bad).error!, /^Usage: \/worktrees /);
+  assert.deepEqual(parseComposer('/worktrees keep v2', [], {}).command, { name: 'worktrees', args: 'keep v2', scope: 'room', agentIds: [] });
 });
 
 test('stripCode blanks fences and inline code but keeps offsets and lines', () => {

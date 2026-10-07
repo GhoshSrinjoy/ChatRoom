@@ -360,3 +360,26 @@ test('stage entries carry a stage attribute, and a pipeline room frames itself b
   room.team = undefined;
   assert.match(roomFraming(codex, room, ctx()), /\nClaude leads this room and may ask you for help\./, 'a pipeline room without a team works like Team mode');
 });
+test('worktrees: an isolated agent gets one framing line; the merge ask names the files; migration drops malformed worktree fields', () => {
+  const { room, codex, claude } = teamRoom();
+  const plain = roomFraming(codex, room, ctx());
+  assert.doesNotMatch(plain, /worktree/);
+  codex.worktree = { path: '/wt/roomaa-codex', branch: 'chatroom/roomaa/codex', createdAt: 1, checkpoints: 0 };
+  const isolated = roomFraming(codex, room, ctx());
+  assert.equal(isolated.split('\n').length, plain.split('\n').length + 1);
+  assert.match(isolated, /\nYou work in your own git worktree \(branch chatroom\/roomaa\/codex\); your edits reach the user's folder only after the room combines and reviews them\. Other agents' changes reach you when the room combines the work\./);
+  assert.doesNotMatch(roomFraming(claude, room, ctx()), /own git worktree/, 'only the isolated agent');
+  assert.doesNotMatch(roomFraming(codex, room, ctx({ legacy: true })), /own git worktree/);
+  assert.equal(turnAsk(claude, room, { kind: 'merge', merge: { files: ['src/a.ts', 'b.md'] } }),
+    'Your changes conflict with the team\'s combined work in: src/a.ts, b.md. The conflict markers are in your files now. Resolve them so both changes\' intent is kept, then reply with one line saying what you kept.');
+  assert.match(turnAsk(claude, room, { kind: 'merge', merge: { files: Array.from({ length: 25 }, (_, i) => `f${i}.ts`) } }), /f19\.ts and 5 more\./);
+  const saved = JSON.parse(JSON.stringify({ ...room, worktrees: 'sometimes', changes: { base: 'b' } }));
+  saved.agents[0].isolate = 'yes'; saved.agents[0].worktree = { path: 1 };
+  saved.agents[1].isolate = true; saved.agents[1].worktree = { path: '/wt/x', branch: 'chatroom/x/y', createdAt: 1, checkpoints: 2 };
+  const migrated = migrateRoom(saved, { attachEditor: true, shareSkills: true, permission: 'ask' });
+  assert.equal(migrated.worktrees, undefined); assert.equal(migrated.changes, undefined);
+  assert.equal(migrated.agents[0]!.isolate, undefined); assert.equal(migrated.agents[0]!.worktree, undefined);
+  assert.equal(migrated.agents[1]!.isolate, true); assert.equal(migrated.agents[1]!.worktree!.checkpoints, 2);
+  const kept = migrateRoom(JSON.parse(JSON.stringify({ ...room, worktrees: 'auto', changes: { base: 'b', branch: 'c', path: 'p', files: [], added: 0, removed: 0, status: 'ready', updatedAt: 1 } })), { attachEditor: true, shareSkills: true, permission: 'ask' });
+  assert.equal(kept.worktrees, 'auto'); assert.equal(kept.changes!.branch, 'c');
+});

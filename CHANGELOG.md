@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+- **Worktrees (optional, off by default).** Agents that edit at the same time can each work in their own git worktree and branch, so they can't overwrite each other.
+  - Modes: Off, Auto (agents that edit without asking, when another agent could edit at the same time), Always. An agent can also be set to always work in its own worktree, and in Full access it can turn this on itself with the `isolate_workspace` room tool.
+  - Worktrees start from a snapshot of your folder, including uncommitted and untracked files, without touching your files or git index. Every turn is a checkpoint commit on the agent's branch.
+  - The room combines the branches after every stage, round, Team plan and message. A conflicting agent gets one merge turn in its own worktree to resolve it.
+  - A Changes card lists every file. **Review diff**, **Apply to my folder** (uncommitted, unstaged, keeping your own edits), **Keep as branch** or **Discard**. Worktrees and branches are removed afterwards; leftovers are swept on startup.
+  - `/worktrees`, Room setup and Team chip toggles, settings `chatroom.worktrees`, `worktreeCopy`, `worktreeLinks` and `worktreeAutoApply`.
+  - Verified live: Claude Code and Codex working in parallel in their own worktrees, combined and applied to the folder.
+
 ## 0.5.1
 
 - Copilot CLI: a model that the CLI lists twice (1.0.92 lists "Auto" twice on accounts that only have Auto) now appears once. Verified live: signing in, a native session that remembers across turns, and usage reporting.

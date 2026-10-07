@@ -1,4 +1,4 @@
-import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo, TeamConfig } from './types';
+import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo, TeamConfig, WorktreeMode } from './types';
 import { normalizeTeam } from './core';
 
 export const ROOM_COMMANDS: RoomCommandInfo[] = [
@@ -11,6 +11,7 @@ export const ROOM_COMMANDS: RoomCommandInfo[] = [
   { name: 'mode', args: 'team | relay | parallel | custom', description: 'Choose how agents collaborate', agentScoped: false },
   { name: 'lead', args: '<agent>', description: 'Choose the lead for Team mode', agentScoped: false },
   { name: 'team', args: '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', description: 'Set up your own team: stages such as lead, drafting, review, testing', agentScoped: false },
+  { name: 'worktrees', args: 'off | auto | always | status | apply | keep [name] | discard | cleanup', description: 'Give agents their own git worktrees so parallel edits never collide', agentScoped: false },
   { name: 'model', args: '<model>', description: 'Set the model of the mentioned agent', agentScoped: true },
   { name: 'effort', args: '<level>', description: 'Set reasoning effort for the mentioned agents (or all)', agentScoped: true },
   { name: 'permissions', args: 'plan | ask | auto | full', description: 'Set what agents may do without asking', agentScoped: true },
@@ -228,7 +229,19 @@ function offsetOf(text: string, n: number): number {
   while ((m = re.exec(text))) { if (i++ === n) return m.index; }
   return text.length;
 }
-const TEAM_USAGE = 'Usage: /team · /team <saved name> · /team Lead: Claude > Draft: Codex > Review: Claude, Copilot · /team save <name> · /team edit · /team off';
+const WORKTREES_USAGE = 'Usage: /worktrees off | auto | always | status | apply | keep [name] | discard | cleanup';
+export interface ParsedWorktrees { mode?: WorktreeMode; action?: 'status' | 'apply' | 'keep' | 'discard' | 'cleanup'; name?: string; error?: string }
+/** /worktrees arguments: a mode, or an action on the room's combined changes (keep takes an optional branch name). */
+export function parseWorktrees(args: string): ParsedWorktrees {
+  const text = (args ?? '').trim(), [first = '', ...rest] = text.split(/\s+/), word = first.toLowerCase();
+  if (word === 'keep') { const name = text.slice(first.length).trim().slice(0, 80); return { action: 'keep', ...(name ? { name } : {}) }; }
+  if (rest.length) return { error: WORKTREES_USAGE };
+  if (!word || word === 'status') return { action: 'status' };
+  if (word === 'off' || word === 'auto' || word === 'always') return { mode: word };
+  if (word === 'apply' || word === 'discard' || word === 'cleanup') return { action: word };
+  return { error: WORKTREES_USAGE };
+}
+const TEAM_USAGE ='Usage: /team · /team <saved name> · /team Lead: Claude > Draft: Codex > Review: Claude, Copilot · /team save <name> · /team edit · /team off';
 export interface ParsedTeam { show?: true; off?: true; edit?: true; save?: string; remove?: string; use?: string; team?: TeamConfig; error?: string }
 /** /team arguments: show, off, edit, save <name>, delete <name>, an inline team ("Lead: Claude > Draft: Codex (first pass) > Review: Claude, Copilot") or a team name. */
 export function parseTeam(args: string): ParsedTeam {

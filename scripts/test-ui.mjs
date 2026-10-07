@@ -17,7 +17,8 @@ const roomCommands = [
   ['team', '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', 'Set up your own team: stages such as lead, drafting, review, testing', false],
   ['model', '<model>', 'Set the model of the mentioned agent', true], ['effort', '<level>', 'Set reasoning effort for the mentioned agents (or all)', true],
   ['permissions', 'plan | ask | auto | full', 'Set what agents may do without asking', true], ['status', '', 'Show sessions, models and context use', true],
-  ['stop', '', 'Stop all running agents', false]].map(([name, args, description, agentScoped]) => ({ name, ...(args ? { args } : {}), description, agentScoped }));
+  ['stop', '', 'Stop all running agents', false],
+  ['worktrees', 'off | auto | always | status | apply | keep [name] | discard | cleanup', 'Give agents their own git worktrees so parallel edits never collide', false]].map(([name, args, description, agentScoped]) => ({ name, ...(args ? { args } : {}), description, agentScoped }));
 const capabilities = {
   a1: { provider: 'codex', runtime: 'cli', status: 'ready', version: '0.160.1', models: [], efforts: ['low', 'medium', 'high', 'xhigh'], tools: [], skills: [{ name: 'pdf', description: 'Work with PDF files' }],
     commands: [{ name: 'review', description: 'Review your changes with a subagent', source: 'mapped' }, { name: 'goal', argumentHint: '<objective> | clear', description: 'Set a goal to keep pursuing', source: 'mapped' }, { name: 'pdf', description: 'Work with PDF files', source: 'skill' }],
@@ -58,7 +59,7 @@ const state = {
     { name: 'pdf', description: 'Read, merge and split PDF files.', path: '/skills/pdf/SKILL.md', dir: '/skills/pdf', source: 'agents-user', nativeTo: ['codex', 'copilot'] }],
   roomCommands,
   localModels: { vision: 'glm-ocr:latest', embedding: 'embeddinggemma:latest' },
-  settings: { allowFullAccess: false, attachOpenFile: true, approvalTimeoutSeconds: 300 }
+  settings: { allowFullAccess: false, attachOpenFile: true, approvalTimeoutSeconds: 300, worktrees: 'off', worktreesAvailable: true }
 };
 const server = createServer(async (req, res) => {
   if (req.url === '/') { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><html lang="en"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/app.css"><title>Chatroom UI test</title><div id="app"></div><script src="/app.js"></script></html>'); return; }
@@ -591,6 +592,161 @@ try {
   await prompt.fill(''); await prompt.pressSequentially('/tea');
   assert.ok((await page.locator('#menu .menu-name').allTextContents()).includes('/team'));
   await prompt.press('Escape'); await prompt.fill('');
+
+  // Worktrees: the pill, the changes card and its buttons, the Worktrees select, the agent's own-worktree switch, the Tools section and /worktrees.
+  const lastWorktree = async () => (await sent(m => m.type === 'worktree')).at(-1);
+  const releaseCard = async () => { await deliver({ type: 'notice', text: 'Done.' }); await page.evaluate(() => { document.getElementById('toast').hidden = true; }); };
+  Object.assign(state.room.agents[1], { isolate: true, worktree: { path: 'C:\\storage\\wt\\3f2a1c\\previe-claude', branch: 'chatroom/previe/claude', createdAt: now, checkpoints: 2 } });
+  const changedFiles = Array.from({ length: 11 }, (_, i) => ({ path: i ? `src/report/export-part-${i}.ts` : 'src/report/<b>csv</b>.ts', added: 6, removed: i % 2, status: i ? 'M' : 'A' }));
+  const changes = { base: '4f1c2d3e5a6b7c8d9e0f11223344556677889900', branch: 'chatroom/previe/integration', path: 'C:\\storage\\wt\\3f2a1c\\previe-integration', files: changedFiles, added: 66, removed: 5, status: 'ready', updatedAt: now };
+  const cardMessage = (id, extra = {}) => ({ id, kind: 'notice', author: 'Chatroom', text: 'Agents changed 11 file(s) in their worktrees (+66 −5). Review them, then apply them to your folder or keep them as a branch.', status: 'complete', createdAt: now, changes: { ...structuredClone(changes), ...extra } });
+  Object.assign(state.room, { mode: 'parallel', changes: structuredClone(changes), messages: [
+    { id: 'u4', kind: 'user', text: 'Add a CSV export, with tests.', author: 'You', status: 'complete', createdAt: now },
+    { id: 'r4', kind: 'agent', agentId: 'a2', author: 'Claude', text: 'Added exportCsv() and its tests.', status: 'complete', createdAt: now },
+    cardMessage('wt1')] });
+  await deliver(state);
+  assert.equal(await page.locator('.agent-pill[data-agent="a2"] .pill-branch svg').count(), 1, 'An isolated agent\'s pill shows a branch');
+  assert.equal(await page.locator('.agent-pill[data-agent="a1"] .pill-branch, .agent-pill[data-agent="a3"] .pill-branch').count(), 0);
+  assert.match(await page.locator('.agent-pill[data-agent="a2"]').getAttribute('title'), / · own worktree · chatroom\/previe\/claude · click for settings$/);
+  assert.equal(await page.locator('.agent-pill[data-agent="a2"]').getAttribute('aria-label'), 'Claude settings, own worktree');
+  const wcard = page.locator('.changes-card');
+  assert.equal(await wcard.count(), 1); assert.equal(await page.locator('.notice-line[data-id="wt1"]').count(), 0, 'A card, not a notice line');
+  assert.equal(await wcard.locator('.changes-head').textContent(), 'Changes from the agentsReady');
+  assert.equal(await wcard.locator('.changes-totals').textContent(), '11 files · +66 −5');
+  assert.equal(await wcard.locator('.cf:visible').count(), 8, 'The first 8 files');
+  assert.equal(await wcard.locator('.cf').first().textContent(), 'AAdded: src/report/<b>csv</b>.ts+6 −0', 'File paths are escaped');
+  assert.equal(await wcard.locator('.cf b').count(), 0);
+  await wcard.getByRole('button', { name: '+3 more' }).click();
+  assert.equal(await wcard.locator('.cf:visible').count(), 11);
+  assert.equal(await wcard.locator('[data-changes-more]').getAttribute('aria-expanded'), 'true');
+  assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Show fewer', 'The toggle keeps focus');
+  await wcard.locator('.changes-files summary').click();
+  assert.equal(await wcard.locator('.cf:visible').count(), 0, 'The file list collapses');
+  await wcard.locator('.changes-files summary').click();
+  assert.deepEqual(await wcard.locator('.changes-actions button').allTextContents(), ['Review diff', 'Apply to my folder', 'Keep as branch…', 'Discard']);
+  await wcard.getByRole('button', { name: 'Review diff' }).click();
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'review' });
+  await wcard.getByRole('button', { name: 'Apply to my folder' }).click();
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'apply' });
+  assert.equal(await wcard.getByRole('button', { name: 'Discard' }).isDisabled(), true, 'The buttons wait for the host');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.id), 'wt1', 'Focus stays on the card');
+  await releaseCard();
+  assert.equal(await wcard.getByRole('button', { name: 'Discard' }).isDisabled(), false, 'A toast from the host releases them');
+  // Keep as branch: an inline, optional name. A rebuilt card keeps the typed name, the focus and the caret.
+  await wcard.getByRole('button', { name: 'Keep as branch…' }).click();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'keep-name', 'The name field opens with focus');
+  assert.equal(await wcard.getByRole('button', { name: 'Keep as branch…' }).getAttribute('aria-expanded'), 'true');
+  await page.keyboard.type('csv export');
+  state.room.messages[2].changes.updatedAt = now + 1; await deliver(state);
+  assert.equal(await page.evaluate(() => [document.activeElement.id, document.activeElement.value, document.activeElement.selectionStart].join('|')), 'keep-name|csv export|10');
+  for (const width of [300, 360]) {
+    await page.setViewportSize({ width, height: 900 }); await deliver(state);
+    assert.ok(await page.evaluate(() => { const c = document.querySelector('.changes-card'), box = c.getBoundingClientRect(); return document.documentElement.scrollWidth <= window.innerWidth && c.scrollWidth <= c.clientWidth
+      && [...c.querySelectorAll('button, input')].every(el => { const r = el.getBoundingClientRect(); return r.left >= box.left && r.right <= box.right + 0.5; }); }), `The changes card fits at ${width}px`);
+  }
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.locator('#keep-name').press('Enter');
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'keep', name: 'csv export' });
+  assert.equal(await page.locator('#keep-form').count(), 0);
+  await releaseCard();
+  await wcard.getByRole('button', { name: 'Keep as branch…' }).click();
+  assert.equal(await page.locator('#keep-name').inputValue(), '', 'The form starts empty');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#keep-form').count(), 0, 'Escape closes the form');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.worktree), 'keep');
+  await page.keyboard.press('Enter');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'keep-name');
+  await wcard.getByRole('button', { name: 'Keep', exact: true }).click();
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'keep' }, 'No name: the host picks one');
+  await releaseCard();
+  // Discard asks first.
+  await wcard.getByRole('button', { name: 'Discard' }).click();
+  await page.getByText(/^Discard the agents' changes\? Their worktrees and branches are deleted\./).waitFor();
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  assert.equal((await sent(m => m.type === 'worktree' && m.action === 'discard')).length, 0);
+  await wcard.getByRole('button', { name: 'Discard' }).click();
+  await page.getByRole('button', { name: 'Discard changes' }).click();
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'discard' });
+  // A conflict updates the same card: Apply is disabled and the conflict is named.
+  Object.assign(state.room.messages[2].changes, { status: 'conflict', conflicts: [{ agentId: 'a1', files: ['src/report/export-part-1.ts', 'src/report/export-part-2.ts'] }] });
+  await deliver(state);
+  assert.equal(await wcard.count(), 1, 'The card updates in place');
+  assert.equal(await page.locator('#messages > *').nth(2).getAttribute('data-id'), 'wt1');
+  assert.equal(await wcard.locator('.changes-chip').textContent(), 'Conflict');
+  assert.equal(await wcard.getByRole('button', { name: 'Apply to my folder' }).isDisabled(), true, 'No Apply while the changes conflict');
+  assert.equal(await wcard.getByRole('button', { name: 'Review diff' }).isDisabled(), false);
+  assert.equal(await wcard.locator('.changes-conflict').textContent(), 'Couldn\'t combine Codex\'s changes in src/report/export-part-1.ts, src/report/export-part-2.ts');
+  assert.equal(await wcard.locator('.cf:visible').count(), 11, 'Show more stays open across updates');
+  await wcard.getByRole('button', { name: 'Keep as branch…' }).click(); await page.keyboard.press('Enter');
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'keep' }, 'A conflict can still be kept as a branch');
+  // Only the latest card has buttons; final states have none.
+  state.room.messages.push(cardMessage('wt2'));
+  await deliver(state);
+  assert.equal(await wcard.count(), 2);
+  assert.equal(await wcard.first().locator('.changes-actions').count(), 0); assert.match(await wcard.first().textContent(), /A newer update is below\./);
+  assert.equal(await wcard.last().locator('.changes-actions button').count(), 4);
+  for (const [status, chip, extra] of [['applied', 'Applied'], ['kept', 'Kept as chatroom/kept/csv-export', { kept: 'chatroom/kept/csv-export' }], ['discarded', 'Discarded']]) {
+    Object.assign(state.room.messages[3].changes, { status, ...extra }); await deliver(state);
+    assert.equal(await wcard.last().locator('.changes-chip').textContent(), chip);
+    assert.equal(await wcard.last().locator('button[data-worktree]').count(), 0, `No buttons once ${status}`);
+  }
+  // No card while nothing changed.
+  state.room.messages = [state.room.messages[0], cardMessage('wt3', { files: [], added: 0, removed: 0 })];
+  await deliver(state);
+  assert.equal(await wcard.count(), 0, 'No card without files');
+  // The Worktrees select in the Team popover and in Room setup.
+  await page.locator('#chip-team').click();
+  assert.deepEqual(await page.locator('#worktrees-select option').allTextContents(), ['Off — agents share the folder', 'Auto — isolate agents that edit without asking when others could edit too', 'Always — every agent that edits gets its own worktree']);
+  assert.equal(await page.locator('#worktrees-select').inputValue(), 'off', 'The setting applies until the room has its own');
+  await page.locator('#worktrees-select').selectOption('auto');
+  assert.deepEqual((await sent(m => m.type === 'options' && 'worktrees' in m)).at(-1), { type: 'options', worktrees: 'auto' });
+  await page.keyboard.press('Escape');
+  state.room.worktrees = 'auto'; await deliver(state);
+  await page.locator('[data-action="room-setup"]').click();
+  assert.equal(await page.locator('#setup-worktrees').inputValue(), 'auto');
+  await page.locator('#setup-worktrees').selectOption('always');
+  assert.deepEqual((await sent(m => m.type === 'options' && 'worktrees' in m)).at(-1), { type: 'options', worktrees: 'always' });
+  state.settings.worktreesAvailable = false; await deliver(state);
+  assert.equal(await page.locator('#setup-worktrees').isDisabled(), true, 'Disabled outside a git repository');
+  assert.match(await page.locator('#dialog-layer label:has(#setup-worktrees)').textContent(), /^Worktrees Needs a git repository/);
+  await page.keyboard.press('Escape');
+  await page.locator('#chip-team').click();
+  assert.equal(await page.locator('#worktrees-select').isDisabled(), true);
+  assert.match(await page.locator('#popover label:has(#worktrees-select)').textContent(), /^Worktrees Needs a git repository/);
+  await page.keyboard.press('Escape');
+  state.settings.worktreesAvailable = true; await deliver(state);
+  // The agent's own worktree: shown for native agents, sent only when changed.
+  await page.locator('.agent-pill[data-agent="a2"]').click();
+  assert.equal(await page.getByRole('checkbox', { name: 'Work in its own worktree' }).isChecked(), true);
+  assert.equal(await page.locator('#agent-isolate-help').textContent(), 'Its edits stay on its own branch until you apply them. In Full access the agent can also turn this on itself. Now on chatroom/previe/claude · 2 checkpoints.');
+  await page.getByRole('button', { name: 'Save agent' }).click();
+  assert.equal('isolate' in (await sent(m => m.type === 'agent' && m.id === 'a2')).at(-1), false, 'Unchanged: not sent');
+  await page.locator('.agent-pill[data-agent="a3"]').click();
+  await page.getByRole('checkbox', { name: 'Work in its own worktree' }).check();
+  await page.getByRole('button', { name: 'Save agent' }).click();
+  assert.equal((await sent(m => m.type === 'agent' && m.id === 'a3')).at(-1).isolate, true);
+  state.room.agents.push({ id: 'a4', name: 'Llama', provider: 'ollama', model: '', role: '', enabled: false, tools, options: options() }); await deliver(state);
+  await page.locator('.agent-pill[data-agent="a4"]').click();
+  assert.equal(await page.locator('#agent-form').count(), 1); assert.equal(await page.locator('#agent-isolate').count(), 0, 'Chat models have no worktree');
+  await page.keyboard.press('Escape');
+  state.room.agents.pop(); await deliver(state);
+  // The Tools tab: isolated agents, the base and Clean up.
+  await page.locator('.inspector-toggle').click(); await page.locator('[data-tab="tools"]').click();
+  const wtSection = page.locator('.inspector-section', { has: page.locator('.section-heading', { hasText: 'WORKTREES' }) });
+  assert.match(await wtSection.locator('.muted').textContent(), /^Auto in this room\./);
+  assert.equal(await wtSection.locator('.wt-row').count(), 1);
+  assert.equal(await wtSection.locator('.wt-row').textContent(), 'Claudechatroom/previe/claude2 checkpoints');
+  assert.match(await wtSection.locator('.wt-base').textContent(), /^Base 4f1c2d3 · /);
+  await wtSection.getByRole('button', { name: 'Clean up old worktrees' }).click();
+  assert.deepEqual(await lastWorktree(), { type: 'worktree', action: 'cleanup' });
+  await page.locator('[data-tab="usage"]').click(); await page.locator('.inspector-close').click();
+  // /worktrees in the slash menu.
+  await prompt.fill(''); await prompt.pressSequentially('/wor');
+  const wtCommand = page.locator('#menu .menu-item', { hasText: '/worktrees' });
+  assert.equal(await wtCommand.count(), 1);
+  assert.equal(await wtCommand.locator('.menu-hint').textContent(), 'off | auto | always | status | apply | keep [name] | discard | cleanup');
+  await prompt.press('Enter'); assert.equal(await prompt.inputValue(), '/worktrees ');
+  await prompt.fill('');
   state.room.mode = 'parallel'; state.room.documents = [];
   for (const width of [360, 320]) {
     await page.setViewportSize({ width, height: 900 });
@@ -641,5 +797,5 @@ try {
   await page.setViewportSize({ width: 600, height: 180 });
   await page.setContent('<html><body style="margin:0;background:white;color:black;font:46px Arial;padding:38px">CHATROOM 123</body></html>');
   await page.screenshot({ path: 'artifacts/ocr-fixture.png' });
-  console.log('UI checks passed: team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, 360px/320px sidebar, escaping and logo rendering.');
+  console.log('UI checks passed: team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, worktrees (pill, changes card, select, agent switch, Tools section, /worktrees), 360px/320px sidebar, escaping and logo rendering.');
 } finally { await browser.close(); await new Promise(r => server.close(r)); }

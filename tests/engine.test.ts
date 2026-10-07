@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { RoomEngine, EngineOptions, Clock } from '../src/engine';
+import { RoomEngine, EngineOptions, Clock, Isolation } from '../src/engine';
 import { createRoom, roomFraming, DEFAULT_LOOP, patchLoop, defaultOptions, normalizeTeam, unavailableText } from '../src/core';
 import { parseLoop } from '../src/commands';
-import { Agent, AgentCapabilities, ApprovalDecision, LoopConfig, NativeDriver, NativeTurnRequest, NativeTurnResult, Provider, ProviderError, ProviderRequest, Room, Unavailable, emptyUsage } from '../src/types';
+import { Agent, AgentCapabilities, ApprovalDecision, LoopConfig, NativeDriver, NativeTurnRequest, NativeTurnResult, Provider, ProviderError, ProviderRequest, Room, TurnKind, Unavailable, emptyUsage } from '../src/types';
 import { waitFor } from './helpers';
 
 const usage = { ...emptyUsage(), input: 30, output: 10, requests: 1 };
@@ -881,4 +881,149 @@ test('legacy: an agent over the limit mid-turn finishes its answer without tools
   await engine.start('Review');
   assert.equal(requests.length, 2); assert.equal(requests[1]!.allowTools, false); assert.match(requests[1]!.prompt, /Do not request any more tools/);
   assert.equal(engine.room.messages.find(m => m.kind === 'agent')!.text, 'Answer from what I read'); assert.equal(engine.room.status, 'paused');
+});
+
+// ── Worktrees (a fake Isolation; the real one is tested with git in worktrees.test.ts) ──
+class FakeIsolation implements Isolation {
+  calls: string[] = [];
+  want: (agent: Agent, room: Room, kind?: TurnKind) => boolean = () => true;
+  /** Conflicts reported by the n-th integrate (1-based). */
+  conflicts: (n: number) => { agentId: string; files: string[] }[] = () => [];
+  merged = ['a.ts'];
+  base = 'base1';
+  integrations = 0;
+  wants(agent: Agent, room: Room, kind?: TurnKind) { return this.want(agent, room, kind); }
+  async prepare(room: Room, agent: Agent) {
+    this.calls.push(`prepare ${agent.name}`);
+    agent.worktree ??= { path: `/wt/${agent.name}`, branch: `chatroom/r/${agent.name.toLowerCase()}`, createdAt: 0, checkpoints: 0 };
+    room.changes ??= { base: this.base, branch: 'chatroom/r/integration', path: '/wt/integration', files: [], added: 0, removed: 0, status: 'ready', updatedAt: 0 };
+    return agent.worktree.path;
+  }
+  async checkpoint(_room: Room, agent: Agent, note: string) { this.calls.push(`checkpoint ${agent.name} ${note}`); agent.worktree!.checkpoints++; }
+  async integrate(room: Room) {
+    const conflicts = this.conflicts(++this.integrations);
+    this.calls.push('integrate');
+    room.changes = { base: this.base, branch: 'chatroom/r/integration', path: '/wt/integration', files: [{ path: `f${this.integrations}.ts`, added: 2, removed: 1, status: 'M' }], added: 2, removed: 1,
+      status: conflicts.length ? 'conflict' : 'ready', ...(conflicts.length ? { conflicts } : {}), updatedAt: this.integrations };
+    return { conflicts };
+  }
+  async mergeInto(_room: Room, agent: Agent) { this.calls.push(`mergeInto ${agent.name}`); return this.merged; }
+  async finishMerge(_room: Room, agent: Agent) { this.calls.push(`finishMerge ${agent.name}`); return true; }
+}
+const cards = (room: Room) => room.messages.filter(m => m.kind === 'notice' && m.changes);
+
+test('worktrees: a turn runs in the agent\'s worktree, and its native session follows the folder there and back', async () => {
+  const iso = new FakeIsolation(); iso.want = () => false;
+  const { engine, driver, agents } = nativeEngine(req => `${req.agent.name} ok`, { isolation: iso });
+  agents[1].enabled = false; agents[2].enabled = false;
+  await engine.start('First');
+  assert.deepEqual([agents[0].session!.id, agents[0].session!.cwd, agents[0].worktree], ['Codex-1', undefined, undefined]);
+  assert.equal(iso.calls.length, 0, 'nobody isolated: nothing to prepare, save or combine');
+  iso.want = (_agent, _room, kind) => kind === 'discussion';
+  await engine.start('Second');
+  const moved = driver.calls[1]!;
+  assert.equal(moved.agent.worktree!.path, '/wt/Codex', 'the driver reads the folder from agent.worktree (host.cwdFor)');
+  assert.equal(agents[0].session!.id, 'Codex-2', 'a new native session in the worktree');
+  assert.match(moved.context, /First[\s\S]*Codex ok/, 'the new session gets the room history');
+  assert.equal(agents[0].session!.cwd, '/wt/Codex');
+  assert.match(moved.framing, /You work in your own git worktree \(branch chatroom\/r\/codex\); your edits reach the user's folder only after the room combines and reviews them\. Other agents' changes reach you when the room combines the work\./);
+  assert.ok(engine.room.activity.some(a => a.text === 'Codex works in its own worktree from now on · new session with the room history'));
+  await engine.start('Third');
+  assert.equal(agents[0].session!.id, 'Codex-2', 'the same folder resumes the session'); assert.doesNotMatch(driver.calls[2]!.context, /First/);
+  assert.deepEqual(iso.calls.filter(c => c.startsWith('checkpoint')), ['checkpoint Codex turn 2', 'checkpoint Codex turn 3']);
+  delete agents[0].worktree; iso.want = () => false;
+  await engine.start('Fourth');
+  assert.deepEqual([agents[0].session!.id, agents[0].session!.cwd], ['Codex-4', undefined]);
+  assert.ok(engine.room.activity.some(a => a.text === 'Codex is back in the shared folder · new session with the room history'));
+  assert.doesNotMatch(driver.calls[3]!.framing, /own git worktree/);
+  await engine.runAgentCommand([agents[0].id], 'compact', '');
+  assert.equal(iso.calls.filter(c => c.startsWith('prepare')).length, 2, 'native commands never prepare a worktree');
+});
+test('worktrees: isolated agents edit at the same time (no writer lock); every completed turn is saved, a failed one is not', async () => {
+  const iso = new FakeIsolation();
+  let active = 0, peak = 0;
+  const { engine, agents } = nativeEngine(async req => {
+    peak = Math.max(peak, ++active); await new Promise(resolve => setTimeout(resolve, 15)); active--;
+    if (req.agent.name === 'Copilot') throw new Error('broke');
+    return 'edited';
+  }, { isolation: iso });
+  engine.room.mode = 'parallel'; engine.room.concurrency = 3;
+  agents.forEach(a => a.options.permission = 'auto-edit');
+  await engine.start('Edit files');
+  assert.equal(peak, 3);
+  assert.deepEqual(iso.calls.filter(c => c.startsWith('checkpoint')).map(c => c.replace(/\d+$/, 'N')).sort(), ['checkpoint Claude turn N', 'checkpoint Codex turn N']);
+  assert.deepEqual(agents.map(a => a.worktree?.path), ['/wt/Codex', '/wt/Claude', '/wt/Copilot']);
+});
+test('worktrees: the room combines after each parallel round, after Team steps (before the final answer), after each stage, and at the end of a pass', async () => {
+  const order = (iso: FakeIsolation) => iso.calls.filter(c => c === 'integrate' || c.startsWith('turn'));
+  const parallel = new FakeIsolation();
+  const rounds = nativeEngine(req => { parallel.calls.push(`turn ${req.agent.name}`); return 'ok'; }, { isolation: parallel });
+  rounds.engine.room.mode = 'parallel'; rounds.engine.room.loop = loop({ kind: 'rounds', rounds: 2 });
+  await rounds.engine.start('Go');
+  assert.deepEqual(order(parallel).map(c => c === 'integrate' ? c : 'turn'), ['turn', 'turn', 'turn', 'integrate', 'turn', 'turn', 'turn', 'integrate'], 'once per round; the end of the pass has nothing new');
+
+  const lead = new FakeIsolation();
+  const teamRun = nativeEngine(req => { lead.calls.push(`turn ${req.agent.name} ${req.kind}`); return req.kind === 'plan' ? '@Claude a\n@Copilot b' : req.kind === 'synthesis' ? 'Final' : 'step done'; }, { isolation: lead });
+  teamRun.engine.room.mode = 'orchestrated';
+  await teamRun.engine.start('Build');
+  const team = order(lead);
+  assert.equal(team.filter(c => c === 'integrate').length, 2);
+  assert.ok(team.indexOf('integrate') > team.indexOf('turn Claude step') && team.indexOf('integrate') > team.indexOf('turn Copilot step') && team.indexOf('integrate') < team.indexOf('turn Codex synthesis'), team.join(', '));
+  assert.equal(team.at(-1), 'integrate', 'and the final answer is combined at the end of the pass');
+
+  const staged = new FakeIsolation();
+  const stages = teamEngine({ wrapUp: false, stages: [{ name: 'Draft', agents: ['Codex'] }, { name: 'Review', agents: ['Claude'] }] }, req => { staged.calls.push(`turn ${req.agent.name}`); return 'ok'; }, { isolation: staged });
+  await stages.engine.start('Ship');
+  assert.deepEqual(order(staged), ['turn Codex', 'integrate', 'turn Claude', 'integrate']);
+});
+test('worktrees: a conflicting agent gets one merge turn in its worktree; what still conflicts, or an agent that can\'t run, is posted', async () => {
+  for (const still of [false, true]) {
+    const iso = new FakeIsolation();
+    const { engine, driver, agents } = nativeEngine(req => req.kind === 'merge' ? 'Kept both: the new name and the null check.' : `${req.agent.name} ok`, { isolation: iso });
+    iso.conflicts = n => n === 1 || (still && n === 2) ? [{ agentId: agents[1].id, files: ['a.ts'] }] : [];
+    engine.room.mode = 'parallel';
+    await engine.start('Rename it');
+    const merge = driver.calls.find(c => c.kind === 'merge')!;
+    assert.equal(merge.agent.name, 'Claude');
+    assert.match(merge.ask, /Your changes conflict with the team's combined work in: a\.ts\. The conflict markers are in your files now\. Resolve them so both changes' intent is kept, then reply with one line saying what you kept\.$/);
+    assert.deepEqual(iso.calls.slice(iso.calls.indexOf('integrate')), ['integrate', 'mergeInto Claude', 'prepare Claude', 'finishMerge Claude', 'integrate'], 'one merge turn, no checkpoint for it, then combine again');
+    assert.equal(engine.room.messages.find(m => m.turn === 'merge')!.text, 'Kept both: the new name and the null check.');
+    assert.ok(engine.room.activity.some(a => a.text === 'Claude started · merging · sonnet'));
+    assert.deepEqual(notices(engine.room).filter(t => t.startsWith('Couldn\'t combine')), still ? ['Couldn\'t combine Claude\'s changes in a.ts · review them or keep the branch.'] : [], `still=${still}`);
+  }
+  const iso = new FakeIsolation();
+  const { engine, driver, agents } = nativeEngine(() => 'ok', { isolation: iso });
+  agents[2].enabled = false; agents[2].worktree = { path: '/wt/Copilot', branch: 'chatroom/r/copilot', createdAt: 0, checkpoints: 1 };
+  iso.conflicts = () => [{ agentId: agents[2].id, files: ['b.ts', 'c.ts'] }];
+  await engine.start('Go');
+  assert.equal(driver.calls.filter(c => c.kind === 'merge').length, 0);
+  assert.deepEqual(notices(engine.room).filter(t => t.startsWith('Couldn\'t')), ['Couldn\'t combine Copilot\'s changes in b.ts, c.ts · review them or keep the branch.']);
+});
+test('worktrees: one live changes card per base, posted at the end of a pass and updated in place; agents never receive it', async () => {
+  const iso = new FakeIsolation();
+  const { engine, driver, agents } = nativeEngine(req => `${req.agent.name} ok`, { isolation: iso });
+  agents[2].enabled = false;
+  await engine.start('One');
+  assert.equal(cards(engine.room).length, 1);
+  const card = cards(engine.room)[0]!;
+  assert.equal(card.author, 'Chatroom');
+  assert.equal(card.text, 'Agents changed 1 file in their worktrees (+2 −1). Review them, then apply them to your folder or keep them as a branch.');
+  assert.deepEqual(card.changes!.files.map(f => f.path), ['f1.ts']); assert.notEqual(card.changes, engine.room.changes, 'the card holds a copy');
+  await engine.start('Two');
+  assert.equal(cards(engine.room).length, 1, 'updated in place');
+  assert.deepEqual(card.changes!.files.map(f => f.path), ['f2.ts']);
+  for (const call of driver.calls) assert.doesNotMatch(call.context + call.ask, /Agents changed/);
+  card.changes!.status = 'applied'; delete engine.room.changes; iso.base = 'base2';
+  await engine.start('Three');
+  assert.equal(cards(engine.room).length, 2, 'new changes after an applied card get a new card');
+  assert.equal(card.changes!.status, 'applied');
+});
+test('worktrees: with isolation available but nobody isolated, turns keep the writer lock and nothing is prepared, saved, combined or posted', async () => {
+  const iso = new FakeIsolation(); iso.want = () => false;
+  let active = 0, peak = 0;
+  const { engine, agents } = nativeEngine(async () => { peak = Math.max(peak, ++active); await new Promise(resolve => setTimeout(resolve, 10)); active--; return 'ok'; }, { isolation: iso });
+  engine.room.mode = 'parallel'; agents.forEach(a => a.options.permission = 'auto-edit');
+  await engine.start('Edit');
+  assert.equal(peak, 1); assert.deepEqual(iso.calls, []); assert.equal(engine.room.changes, undefined); assert.equal(cards(engine.room).length, 0);
+  assert.ok(agents.every(a => a.session && !('cwd' in a.session)));
 });

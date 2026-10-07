@@ -51,9 +51,10 @@ export function claudeArgs(agent: Agent, room: Room, model: ModelInfo | undefine
   if (o.customAgent) args.push('--agent', o.customAgent);
   return args;
 }
-function spawnKey(agent: Agent, room: Room, wiring: SkillWiring | undefined, settings: DriverSettings): string {
+/** What a live process was spawned with; a different value (the folder included) needs a new process. */
+function spawnKey(agent: Agent, room: Room, wiring: SkillWiring | undefined, settings: DriverSettings, cwd: string): string {
   const o = agent.options;
-  return JSON.stringify({ full: permissionOf(agent, settings) === 'full', thinking: o.thinking, plugin: room.shareSkills ? wiring?.claudePluginDir : undefined,
+  return JSON.stringify({ cwd, full: permissionOf(agent, settings) === 'full', thinking: o.thinking, plugin: room.shareSkills ? wiring?.claudePluginDir : undefined,
     indexDir: room.shareSkills ? wiring?.indexDir : undefined, extraDirs: o.extraDirs, mcp: settings.sharedMcpServers ?? {}, useMcp: o.useMcp,
     useProjectSettings: o.useProjectSettings, useSkills: o.useSkills, webSearch: o.webSearch, customAgent: o.customAgent });
 }
@@ -239,6 +240,8 @@ export class ClaudeDriver implements NativeDriver {
     if (!runtime) throw new ProviderError('Claude Code was not found. Install Claude Code (or its VS Code extension) or set chatroom.claudePath.', 'missing');
     return runtime;
   }
+  /** The agent's folder: its worktree while it is isolated, else the workspace. */
+  private cwd(room: Room, agent: Agent): string { return this.host.cwdFor?.(room, agent) ?? this.host.cwd(); }
   private modelFor(agent: Agent): ModelInfo | undefined {
     return this.models.find(m => m.id === (agent.model || 'default')) ?? (agent.model ? undefined : this.models.find(m => m.isDefault));
   }
@@ -253,7 +256,7 @@ export class ClaudeDriver implements NativeDriver {
   /** A live, initialized process for this agent: reused, or (re)spawned with --session-id / --resume. */
   private async prepare(room: Room, agent: Agent, runtime: Runtime, framing: string | undefined): Promise<Live> {
     const key = keyOf(room.id, agent.id), settings = this.host.settings(), wiring = this.host.skillWiring();
-    const plan = this.plan(key, agent), wanted = spawnKey(agent, room, wiring, settings);
+    const plan = this.plan(key, agent), wanted = spawnKey(agent, room, wiring, settings, this.cwd(room, agent));
     const existing = this.lives.get(key);
     if (existing) {
       const framed = framing === undefined || existing.framing === framing || (plan.resume && existing.framing !== undefined);
@@ -274,7 +277,7 @@ export class ClaudeDriver implements NativeDriver {
     const live = { key, roomId: room.id, agentId: agent.id, agent, sessionId: plan.id, resumed: plan.resume, spawnKey: wanted, version: runtime.version,
       ...(framing !== undefined ? { framing } : {}), controls: new Map(), approvals: new Map(), abort: new AbortController(), closing: false,
       applied: { model: agent.model, effort: agent.options.effort, permission: permissionOf(agent, settings), ultra: false } } as unknown as Live;
-    live.proc = spawnJsonl(runtime.executable, args, { cwd: this.host.cwd(), env: childEnv(runtime.executable, 'claude'), spawnProcess: this.spawnProcess,
+    live.proc = spawnJsonl(runtime.executable, args, { cwd: this.cwd(room, agent), env: childEnv(runtime.executable, 'claude'), spawnProcess: this.spawnProcess,
       onMessage: message => this.route(live, message), onExit: code => this.exited(live, code) });
     this.lives.set(key, live);
     live.ready = this.control(live, { subtype: 'initialize', hooks: {}, ...(framing ? { appendSystemPrompt: framing } : {}), sdkMcpServers: ['chatroom'] }, INIT_TIMEOUT_MS, 'init-1')

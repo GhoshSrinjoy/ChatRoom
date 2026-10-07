@@ -7,6 +7,8 @@
   let droppedKey = '', think = false, ultra = false, pop = '', popAnchor, popHtml = '', confirmClose;
   // Team builder: the draft being edited (agent NAMES, not ids), the saved team it came from, and the dialog to return to.
   let teamDraft, teamOrigin = '', teamFrom = '', teamError = '', teamBack;
+  // Worktree changes card: the latest card's message id, the open "Keep as branch" form, and buttons held after an action.
+  let liveCard, keepDraft, changesHold;
   const ultraConfirmed = saved.ultraConfirmed || {}, openState = new Map(), nodes = new Map(), capsAsked = {};
   const menu = { open: false, kind: '', query: '', start: 0, end: 0, items: [], index: 0 };
   const $ = id => document.getElementById(id);
@@ -51,7 +53,8 @@
     compress: '<path d="M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5"/>',
     clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
     ban: '<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>',
-    up: '<path d="m6 15 6-6 6 6"/>', down: '<path d="m6 9 6 6 6-6"/>'
+    up: '<path d="m6 15 6-6 6 6"/>', down: '<path d="m6 9 6 6 6-6"/>',
+    branch: '<circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="7.5" r="2"/><path d="M6.5 7.5v9M17.5 9.5c0 4-3.5 5.5-9.2 7.4"/>'
   };
   const icon = name => name === 'logo' ? icons.logo : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.grid}</svg>`;
   // Provider glyphs. Copilot (copilot-16) and Ollama (cpu-16) are Primer Octicons, MIT (see ThirdPartyNotices.txt); Codex and Claude are drawn here.
@@ -211,7 +214,7 @@
     if (!state) return;
     const r = state.room, running = busy();
     r.loop = { ...DEFAULT_LOOP, ...(r.loop || {}) };
-    if (lastRoom !== r.id) { lastRoom = r.id; nearBottom = true; nodes.clear(); think = false; ultra = false; closePopover(); }
+    if (lastRoom !== r.id) { lastRoom = r.id; nearBottom = true; nodes.clear(); think = false; ultra = false; keepDraft = undefined; closePopover(); }
     if (droppedKey && state.editor?.key !== droppedKey) droppedKey = '';
     if (lastSent && r.messages.some(m => m.kind === 'user' && m.text === lastSent.text && m.createdAt >= lastSent.at - 5000)) lastSent = undefined;
     $('workspace').textContent = state.workspace || '';
@@ -250,10 +253,10 @@
     $('team-strip').classList.toggle('team-mode', r.mode === 'orchestrated');
     setHtml($('team-pills'), r.agents.map(a => {
       const s = statusOf(a), isLead = lead?.id === a.id, native = isNative(a), effort = native ? opts(a).effort : '', u = s === 'unavailable' && unavailOf(a);
-      const tip = [a.name, runtimeLabel(a), modelName(a), 'effort ' + (effort ? effortLabel(effort) : 'default'), native ? permLabels[perm(a)] + (supports(a, 'sandbox') ? ' (sandbox ' + sandboxOf(opts(a)) + ')' : '') : 'Read-only (Chatroom tools)', stateLabel(a, s)].join(' · ') + (isLead ? ' · lead' : '')
-        + (u ? (u.detail ? ' · ' + clip(u.detail, 160) : '') + (u.until ? ' · Skipped until then' : ' · Skipped for now') : '') + ' · click for settings';
+      const wt = a.worktree, tip = [a.name, runtimeLabel(a), modelName(a), 'effort ' + (effort ? effortLabel(effort) : 'default'), native ? permLabels[perm(a)] + (supports(a, 'sandbox') ? ' (sandbox ' + sandboxOf(opts(a)) + ')' : '') : 'Read-only (Chatroom tools)', stateLabel(a, s)].join(' · ') + (isLead ? ' · lead' : '')
+        + (wt ? ' · own worktree · ' + wt.branch : '') + (u ? (u.detail ? ' · ' + clip(u.detail, 160) : '') + (u.until ? ' · Skipped until then' : ' · Skipped for now') : '') + ' · click for settings';
       const meta = u ? unavailShort(u) : shortModel(a) + (effort ? ' · ' + effortLabel(effort) : '');
-      return `<button type="button" class="agent-pill status-${esc(s)}${isLead ? ' is-lead' : ''}${a.enabled ? '' : ' is-off'}" data-agent="${esc(a.id)}" aria-label="${esc(a.name + ' settings' + (u ? ', ' + unavailLabel(u) : ''))}" title="${esc(tip)}">${avatar(a, 'mini')}<span class="pill-name">${esc(a.name)}</span><span class="pill-meta">${esc(meta)}</span>${isLead ? `<span class="lead-star">${icon('star')}</span>` : ''}${u ? `<span class="pill-icon">${icon(unavailIcon(u))}</span>` : '<span class="pill-dot"></span>'}</button>`;
+      return `<button type="button" class="agent-pill status-${esc(s)}${isLead ? ' is-lead' : ''}${a.enabled ? '' : ' is-off'}" data-agent="${esc(a.id)}" aria-label="${esc(a.name + ' settings' + (u ? ', ' + unavailLabel(u) : '') + (wt ? ', own worktree' : ''))}" title="${esc(tip)}">${avatar(a, 'mini')}<span class="pill-name">${esc(a.name)}</span><span class="pill-meta">${esc(meta)}</span>${isLead ? `<span class="lead-star">${icon('star')}</span>` : ''}${wt ? `<span class="pill-branch">${icon('branch')}</span>` : ''}${u ? `<span class="pill-icon">${icon(unavailIcon(u))}</span>` : '<span class="pill-dot"></span>'}</button>`;
     }).join('') || '<span class="strip-empty">No agents yet. Add one with +</span>');
   }
   function loopLabel(r) {
@@ -333,8 +336,8 @@
   const isOpen = (key, fallback) => openState.has(key) ? openState.get(key) : fallback;
   function signature(m) {
     const a = agentById(m.agentId), plan = m.step?.plan ? state.room.messages.find(p => p.id === m.step.plan)?.plan : undefined;
-    const people = [...(m.targets || []), ...(m.handoff ? [m.handoff.from, ...m.handoff.to] : [])].map(id => agentById(id)?.name);
-    return JSON.stringify([m, a?.name, a?.model, a?.provider, plan, people, m.plan ? state.room.agents.map(x => x.name + x.provider) : 0]);
+    const people = [...(m.targets || []), ...(m.handoff ? [m.handoff.from, ...m.handoff.to] : []), ...(m.changes?.conflicts || []).map(c => c.agentId)].map(id => agentById(id)?.name);
+    return JSON.stringify([m, a?.name, a?.model, a?.provider, plan, people, m.plan ? state.room.agents.map(x => x.name + x.provider) : 0, m.changes ? liveCard === m.id : 0]);
   }
   function emptyHtml() {
     return `<div class="empty-state"><span class="empty-icon">${icon('logo')}</span><h2>Chat with your agents</h2><p>Claude Code, Codex and Copilot work here with their own tools, skills and sessions. Type <strong>@</strong> to talk to one agent and <strong>/</strong> for commands. Click an agent above to set its model, effort and permissions; <strong>Room setup</strong> chooses who takes part and who leads the team.</p><div class="suggestions"><button data-prompt="Look through this repository, then explain its architecture and suggest next steps.">Explain this repository ${icon('arrow')}</button><button data-prompt="Review this workspace for reliability issues. Split the review by area, read the relevant files, and challenge each other's findings.">Review the code as a team ${icon('arrow')}</button></div></div>`;
@@ -343,6 +346,10 @@
     const container = $('messages'), messages = state.room.messages;
     if (!messages.length) { nodes.clear(); if (!container.querySelector('.empty-state')) container.innerHTML = emptyHtml(); return; }
     container.querySelector('.empty-state')?.remove();
+    // A rebuilt message (an updated changes card) gets keyboard focus back on the same control, with the caret.
+    const active = document.activeElement, focusKey = active !== container && container.contains(active) ? keyOf(active) : '';
+    const caret = focusKey && typeof active.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd] : undefined;
+    liveCard = [...messages].reverse().find(m => m.changes)?.id;
     const oldScroll = container.scrollTop, wanted = [], used = new Set();
     messages.forEach((m, i) => {
       const key = used.has(m.id) ? `${m.id}#${i}` : m.id, sig = signature(m), cached = nodes.get(key);
@@ -355,6 +362,7 @@
     wanted.forEach((node, i) => { const at = container.children[i]; if (at !== node) container.insertBefore(node, at || null); });
     while (container.children.length > wanted.length) container.lastElementChild.remove();
     container.scrollTop = nearBottom ? container.scrollHeight : oldScroll;
+    if (focusKey && !container.contains(document.activeElement)) { const el = container.querySelector(focusKey); el?.focus({ preventScroll: true }); if (el && caret) el.setSelectionRange?.(...caret); }
   }
   function buildMessage(m) {
     if (m.kind === 'tool') {
@@ -363,7 +371,7 @@
       const pre = document.createElement('pre'); pre.textContent = m.text;
       detail.append(summary, pre); return detail;
     }
-    if (m.kind === 'notice') return noticeNode(m);
+    if (m.kind === 'notice') return m.changes ? changesNode(m) : noticeNode(m);
     if (m.kind === 'approval') return approvalNode(m);
     return chatNode(m);
   }
@@ -373,6 +381,74 @@
     const action = /npm i(?:nstall)? -g @github\/copilot/.test(m.text) ? 'install' : /copilot login/.test(m.text) ? 'login' : '';
     if (action) { const b = document.createElement('button'); b.type = 'button'; b.className = 'outline-button inline'; b.dataset.copilot = action; b.textContent = action === 'install' ? 'Install Copilot CLI' : 'Sign in to Copilot'; div.append(b); }
     return div;
+  }
+  // The room's combined worktree changes. Only the latest card has buttons; the host keeps it up to date.
+  const CHANGE_STATUS = { ready: 'Ready', conflict: 'Conflict', applied: 'Applied', discarded: 'Discarded' };
+  const FILE_STATUS = { A: 'Added', M: 'Modified', D: 'Deleted', R: 'Renamed' };
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const listText = (list, max = 5) => list.length > max ? `${list.slice(0, max).join(', ')} and ${list.length - max} more` : list.join(', ');
+  const SHOWN_FILES = 8;
+  function changesNode(m) {
+    const c = m.changes, files = c.files || [], div = document.createElement('div');
+    div.dataset.id = m.id;
+    if (!files.length) { div.hidden = true; return div; }
+    const status = c.status, live = liveCard === m.id, open = live && (status === 'ready' || status === 'conflict'), keeping = open && keepDraft?.id === m.id, all = isOpen(m.id + '-all', false);
+    const chip = status === 'kept' ? `Kept as ${c.kept || c.branch}` : CHANGE_STATUS[status] || status;
+    div.className = `changes-card ${status}`; div.tabIndex = -1; div.setAttribute('role', 'group'); div.setAttribute('aria-label', 'Changes from the agents');
+    const count = n => Number(n) || 0;
+    const rows = files.map((f, i) => `<li class="cf"${i >= SHOWN_FILES && !all ? ' hidden' : ''}><span class="cf-status ${esc(f.status)}" title="${esc(FILE_STATUS[f.status] || f.status)}" aria-hidden="true">${esc(f.status)}</span><span class="sr-only">${esc(FILE_STATUS[f.status] || f.status)}: </span><span class="cf-path" title="${esc(f.path)}">${esc(f.path)}</span><span class="cf-stat"><span class="add${count(f.added) ? '' : ' zero'}">+${count(f.added)}</span> <span class="del${count(f.removed) ? '' : ' zero'}">−${count(f.removed)}</span></span></li>`).join('');
+    const more = files.length > SHOWN_FILES ? `<button type="button" class="text-button link changes-more" data-changes-more="${esc(m.id)}" aria-expanded="${all}">${all ? 'Show fewer' : `+${files.length - SHOWN_FILES} more`}</button>` : '';
+    const name = id => agentById(id)?.name || 'an agent';
+    const conflicts = status !== 'conflict' ? '' : (c.conflicts || []).length
+      ? c.conflicts.map(x => `<p class="changes-conflict">${icon('alert')}<span>Couldn't combine ${esc(name(x.agentId))}'s changes in ${esc(listText(x.files || []))}</span></p>`).join('')
+      : `<p class="changes-conflict">${icon('alert')}<span>Some changes couldn't be combined</span></p>`;
+    const keepForm = keeping ? `<form class="keep-form" id="keep-form" aria-label="Keep as branch"><label class="keep-label" for="keep-name">Branch name <span class="subtle">optional</span></label><div class="keep-row"><input id="keep-name" maxlength="60" autocomplete="off" spellcheck="false" placeholder="for example csv-export" value="${esc(keepDraft.name)}" aria-describedby="keep-help"><button type="submit" class="primary-button">Keep</button><button type="button" class="text-button" data-keep-cancel="1">Cancel</button></div><p class="fine-print" id="keep-help">Saved as chatroom/kept/&lt;name&gt;. Empty uses the room title and time.</p></form>` : '';
+    const actions = open ? `<div class="changes-actions"><button type="button" class="outline-button" data-worktree="review" title="Open the combined diff in an editor">Review diff</button>`
+      + `<button type="button" class="primary-button" data-worktree="apply"${status === 'conflict' ? ' disabled' : ' title="Apply the combined changes to your folder. Nothing is committed."'}>Apply to my folder</button>`
+      + `<button type="button" class="outline-button" data-worktree="keep" aria-expanded="${keeping}" title="Keep the combined changes on a branch and remove the agents' worktrees">Keep as branch…</button>`
+      + `<button type="button" class="outline-button danger" data-worktree="discard" title="Delete the agents' worktrees and branches">Discard</button></div>`
+      + (status === 'conflict' ? '<p class="fine-print changes-note">Apply is available once the changes combine cleanly. Review the diff, or keep them as a branch.</p>' : '') + keepForm
+      : !live && (status === 'ready' || status === 'conflict') ? '<p class="fine-print changes-note">A newer update is below.</p>' : '';
+    div.innerHTML = `<div class="changes-head">${icon('branch')}<strong>Changes from the agents</strong><span class="changes-chip ${esc(status)}" title="${esc(chip)}">${esc(chip)}</span></div>`
+      + `<details class="changes-files" id="cf-${esc(m.id)}" data-id="${esc(m.id)}-f"${isOpen(m.id + '-f', open) ? ' open' : ''}><summary><span class="changes-totals">${plural(files.length, 'file')} · <span class="add">+${count(c.added)}</span> <span class="del">−${count(c.removed)}</span></span></summary><ul class="changes-list">${rows}</ul>${more}</details>`
+      + conflicts + actions;
+    return div;
+  }
+  // Rebuilds the live card, for example to open or close the Keep as branch form.
+  function rebuildCard() { if (liveCard) nodes.delete(liveCard); renderMessages(); }
+  function closeKeep(refocus) { keepDraft = undefined; rebuildCard(); if (refocus) $('messages').querySelector('[data-worktree="keep"]')?.focus(); }
+  // After Apply, Keep or Discard the card's buttons wait for the host: a new state rebuilds the card, and a toast (error or notice) releases them.
+  function holdChanges(id) {
+    releaseChanges();
+    const card = id && $('messages').querySelector(`.changes-card[data-id="${CSS.escape(id)}"]`); if (!card) return;
+    const buttons = [...card.querySelectorAll('button[data-worktree]:not(:disabled)')];
+    buttons.forEach(b => { b.disabled = true; }); card.focus({ preventScroll: true });
+    changesHold = { buttons, timer: setTimeout(releaseChanges, 8000) };
+  }
+  function releaseChanges() { if (!changesHold) return; clearTimeout(changesHold.timer); changesHold.buttons.forEach(b => { b.disabled = false; }); changesHold = undefined; }
+  function worktreeAction(action, button) {
+    const id = button.closest('.changes-card')?.dataset.id;
+    if (action === 'review' || action === 'cleanup') send('worktree', { action });
+    else if (action === 'apply') { send('worktree', { action }); holdChanges(id); }
+    else if (action === 'keep') { keepDraft = keepDraft?.id === id ? undefined : { id, name: '' }; rebuildCard(); (keepDraft ? $('keep-name') : $('messages').querySelector('[data-worktree="keep"]'))?.focus(); }
+    else if (action === 'discard') confirmBox('Discard the agents\' changes? Their worktrees and branches are deleted. Your folder is not changed.', 'Discard changes').then(ok => { if (ok) { send('worktree', { action }); holdChanges(id); } });
+  }
+  function submitKeep() {
+    const id = keepDraft?.id, name = ($('keep-name')?.value || '').trim();
+    send('worktree', { action: 'keep', ...(name ? { name } : {}) });
+    keepDraft = undefined; rebuildCard(); holdChanges(id);
+  }
+  function toggleFiles(button) {
+    const id = button.dataset.changesMore, all = !isOpen(id + '-all', false), list = button.closest('.changes-files');
+    openState.set(id + '-all', all);
+    list?.querySelectorAll('.cf').forEach((row, i) => { row.hidden = !all && i >= SHOWN_FILES; });
+    button.textContent = all ? 'Show fewer' : `+${(list?.querySelectorAll('.cf').length || 0) - SHOWN_FILES} more`; button.setAttribute('aria-expanded', String(all));
+  }
+  const WORKTREE_MODES = [['off', 'Off — agents share the folder'], ['auto', 'Auto — isolate agents that edit without asking when others could edit too'], ['always', 'Always — every agent that edits gets its own worktree']];
+  const worktreeMode = () => state.room.worktrees || state.settings?.worktrees || 'off';
+  function worktreesField(id, className, help = '') {
+    const none = !state.settings?.worktreesAvailable, mode = worktreeMode(), title = none ? 'Needs a git repository' : WORKTREE_MODES.find(([v]) => v === mode)?.[1] || '';
+    return `<label${className ? ` class="${className}"` : ''}><span>Worktrees${none ? ' <span class="subtle">Needs a git repository</span>' : ''}</span><select id="${id}"${none || busy() ? ' disabled' : ''} title="${esc(title)}">${WORKTREE_MODES.map(([v, l]) => `<option value="${v}"${mode === v ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${help && !none ? `<small class="field-help">${esc(help)}</small>` : ''}</label>`;
   }
   function fillDiff(pre, text) {
     for (const line of String(text).split('\n').slice(0, 600)) {
@@ -485,6 +561,7 @@
       + `<label class="pop-field">Lead${r.mode === 'orchestrated' ? '' : ' <span class="subtle">for @lead and "Until done" loops</span>'}<select id="lead-select"${dis}>${enabledAgents().map(a => `<option value="${esc(a.id)}" ${lead?.id === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>`
       + `<label class="pop-field">Model routing<select id="preset-select"${dis}>${['planning', 'drafting', 'review'].map(p => `<option value="${p}" ${preset === p ? 'selected' : ''}>${p[0].toUpperCase() + p.slice(1)}</option>`).join('')}</select></label>`
       + `<label class="pop-field">Parallel limit<select id="parallel-limit"${dis}>${[1, 2, 3, 4].map(n => `<option ${n === (r.concurrency || 3) ? 'selected' : ''}>${n}</option>`).join('')}</select></label>`
+      + worktreesField('worktrees-select', 'pop-field')
       + `<p class="fine-print">Start a line with @Name to talk to one agent. Agents hand work to each other the same way.${busy() ? ' Wait for the agents to finish to change these.' : ''}</p>`;
   }
   // Saved teams and templates; the room's own team is listed separately when it matches none of them.
@@ -772,12 +849,18 @@
       + (sup('thinking') ? `<label class="check-row"><input type="checkbox" id="agent-thinking" ${o.thinking !== 'off' ? 'checked' : ''}><span>Extended thinking</span></label>` : '')
       + (sup('summary') ? `<label>Reasoning summary<select id="agent-summary">${['auto', 'concise', 'detailed', 'none'].map(s => `<option value="${s}" ${o.summary === s ? 'selected' : ''}>${s[0].toUpperCase() + s.slice(1)}</option>`).join('')}</select></label>` : '')
       + (native ? `<label>Permissions<select id="agent-permission">${['plan', 'ask', 'auto-edit', 'full'].map(p => `<option value="${p}" ${o.permission === p ? 'selected' : ''}${p === 'full' && !allow ? ' disabled' : ''}>${permLabels[p]} — ${permHelp[p]}</option>`).join('')}</select>${allow ? '' : '<small class="field-help">Full access needs chatroom.allowFullAccess in Settings.</small>'}</label>` : '<p class="field-help">Read-only (Chatroom tools)</p>')
+      + (native ? isolateRow(a) : '')
       + advanced
       + `<label>Focus <span class="subtle">optional role</span><textarea id="agent-role" rows="2" maxlength="1600" placeholder="Optional. Leave empty and the agent is simply itself.">${esc(a.role)}</textarea></label>`
       + (native ? '' : `<div class="section-heading dialog-tools-heading">CHATROOM TOOLS</div>${Object.keys(toolLabels).map(t => `<label class="tool-checkbox"><input type="checkbox" name="tool" value="${t}" ${a.tools.includes(t) ? 'checked' : ''}><span><strong>${toolLabels[t]}</strong><small>${toolDescriptions[t]}</small></span></label>`).join('')}`)
       + `<div id="agent-session" class="session-section">${sessionHtml(a)}</div>`
       + (running ? '<p class="fine-print">Changes apply from this agent\'s next turn.</p>' : '')
       + `<div class="dialog-actions"><button type="button" class="text-button danger" data-remove="${esc(a.id)}"${running ? ' disabled' : ''}>Remove agent</button><button type="submit" class="primary-button">Save agent</button></div></form>`;
+  }
+  function isolateRow(a) {
+    const wt = a.worktree, help = 'Its edits stay on its own branch until you apply them. In Full access the agent can also turn this on itself.'
+      + (wt ? ` Now on ${wt.branch} · ${plural(wt.checkpoints || 0, 'checkpoint')}.` : '') + (state.settings?.worktreesAvailable ? '' : ' Needs a git repository.');
+    return `<label class="check-row with-help"><input type="checkbox" id="agent-isolate" aria-labelledby="agent-isolate-label" aria-describedby="agent-isolate-help" ${a.isolate ? 'checked' : ''}><span><span id="agent-isolate-label">Work in its own worktree</span><small class="field-help" id="agent-isolate-help">${esc(help)}</small></span></label>`;
   }
   function editAgent(id) {
     const a = agentById(id); if (!a) return;
@@ -800,8 +883,10 @@
     if ($('agent-ultra')) options.ultra = $('agent-ultra').checked;
     if ($('agent-dirs')) options.extraDirs = $('agent-dirs').value.split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(0, 10);
     if ($('agent-copilot-runtime')) options.copilotRuntime = value('agent-copilot-runtime');
+    // Sent only when the user changed it, so saving never undoes an agent that isolated itself meanwhile.
+    const isolate = $('agent-isolate'), isolateChanged = !!isolate && isolate.checked !== isolate.defaultChecked;
     send('agent', { id: a.id, name: value('agent-name'), model: value('agent-model'), role: value('agent-role'), enabled: $('agent-enabled').checked,
-      ...(isNative(a) ? {} : { tools: [...document.querySelectorAll('input[name="tool"]:checked')].map(el => el.value) }), options });
+      ...(isNative(a) ? {} : { tools: [...document.querySelectorAll('input[name="tool"]:checked')].map(el => el.value) }), options, ...(isolateChanged ? { isolate: isolate.checked } : {}) });
     closeDialog();
   }
   function setupDialog() {
@@ -812,6 +897,7 @@
       + `<div class="section-heading setup-heading">HOW THEY WORK TOGETHER</div><div class="radio-list">${Object.keys(modeLabels).map(mode => `<label class="radio-row"><input type="radio" name="setup-mode" value="${mode}" ${(r.mode || 'sequential') === mode ? 'checked' : ''}${dis}><span><strong>${modeLabels[mode]}</strong><small>${esc(modeHelp[mode])}</small></span></label>`).join('')}</div>`
       + `<div class="team-setup">${r.team ? `<p class="team-plan"><strong>${esc(r.team.name)}</strong>${r.mode === 'pipeline' ? '' : ' (not in use)'} · ${esc(teamPlan(r.team))}</p>` : ''}<button type="button" class="outline-button inline" data-team-open="edit">${icon('edit')} Edit team…</button></div>`
       + `<label>Model routing<select id="setup-preset"${dis}>${['planning', 'drafting', 'review'].map(p => `<option value="${p}" ${preset === p ? 'selected' : ''}>${p[0].toUpperCase() + p.slice(1)}</option>`).join('')}</select></label>`
+      + worktreesField('setup-worktrees', '', 'Agents in their own git worktree can\'t overwrite each other\'s edits. You review the combined changes, then apply them to your folder or keep them as a branch.')
       + `<p class="fine-print">Type @Name to talk to one agent, or @all for everyone. In Team mode your message goes to the lead first; the lead answers or brings in teammates. The lead also decides when an "Until done" loop is finished.</p>`;
   }
   function modelOptions(provider, selected) {
@@ -994,10 +1080,23 @@
     const needs = { ollama_ocr: state.localModels?.vision ? '' : ' · needs an OCR model', read_document: state.localModels?.vision ? '' : ' · scans need an OCR model', semantic_search: state.localModels?.embedding ? '' : ' · needs an embedding model', search_documents: state.localModels?.embedding ? '' : ' · keyword search until an embedding model is chosen' };
     const glyphs = s => (s.nativeTo || []).map(p => avatar({ provider: p }, 'micro')).join('');
     return `<div class="inspector-section"><div class="section-heading">AGENTS <span class="count">${r.agents.length}</span></div>${r.agents.map(capsCard).join('') || '<p class="muted">No agents in this room.</p>'}</div>`
+      + worktreesSection()
       + `<div class="inspector-section"><div class="section-heading">SHARED WITH THE ROOM</div><label class="switch-row"><span><strong>Share skills between agents</strong><small>Claude Code, Codex and Copilot can use each other's skills.</small></span><span class="switch"><input type="checkbox" id="share-skills" role="switch" aria-label="Share skills between agents" ${r.shareSkills !== false ? 'checked' : ''}${running ? ' disabled' : ''}></span></label>${skills.slice(0, 60).map(s => `<div class="skill-row"><div class="skill-head"><strong>${esc(s.name)}</strong><span class="subtle">${esc(s.source)}</span><span class="native-to" title="Native to ${esc((s.nativeTo || []).map(p => names[p]).join(', '))}">${glyphs(s)}</span></div><p>${esc(s.description)}</p></div>`).join('')}${skills.length > 60 ? `<p class="fine-print">+${skills.length - 60} more skills</p>` : skills.length ? '' : '<p class="fine-print">No skills found in .claude, .agents, .codex, .github or .copilot folders.</p>'}<div class="section-heading sub-heading">ROOM TOOLS</div>${ROOM_TOOLS.map(([name, label, iconName, description]) => `<div class="tool-row"><span class="tool-symbol">${icon(iconName)}</span><div><strong>${label}</strong><small>${esc(description)}</small><small>available to every native agent${needs[name] || ''}</small></div></div>`).join('')}</div>`
       + `<div class="inspector-section"><div class="section-heading">ROOM DOCUMENTS <span class="count">${docs.length}</span></div><p class="muted">Attached files are read automatically, with OCR for images and scanned pages, then split into passages and embedded. Agents get the most relevant passages with each message and can search for more.</p>${docs.map(d => `<div class="doc-row ${esc(d.status)}"><span class="tool-symbol">${icon('file')}</span><div><strong>${esc(d.name)}</strong><small>${esc(d.status === 'ready' ? `${docStatus(d)} · ${d.chars.toLocaleString()} characters · ${d.chunks} passage${d.chunks === 1 ? '' : 's'}` : d.detail || d.status)}</small></div><button class="icon-button small" data-remove-doc="${esc(d.id)}" aria-label="Remove ${esc(d.name)}">${icon('close')}</button></div>`).join('')}<button class="outline-button" data-action="attachDocuments">${icon('attach')} Attach documents</button></div>`
       + `<div class="inspector-section"><div class="section-heading">LOCAL SPECIALISTS <span class="connection-dot ${ollama?.status || 'unchecked'}"></span></div><p class="muted">Local Ollama models read documents and build the search index. Installed models are selected automatically.</p><label class="model-field">Vision / OCR<select id="vision-model"${running ? ' disabled' : ''}>${options('vision')}</select></label><label class="model-field">Embeddings<select id="embedding-model"${running ? ' disabled' : ''}>${options('embedding')}</select></label><p class="fine-print">Models must already be installed in Ollama. Cloud models are excluded. Extracted text, OCR results and embeddings are cached on disk in this workspace's VS Code storage, so the same file is never processed twice.</p></div>`
       + `<div class="inspector-section"><div class="section-heading">CONNECTIONS</div>${state.connections.map(c => `<div class="connection-row"><span class="connection-dot ${c.status}"></span><div><strong>${names[c.id] || esc(c.id)}</strong><small>${esc(c.detail)}</small><small>${esc(c.modelSource || '')}</small>${c.hint ? `<small class="hint">${esc(c.hint.text)}</small>${hintButtons(c.hint.action, c.id)}` : ''}</div></div>`).join('')}<button class="outline-button" data-action="refresh"${state.discovering ? ' disabled' : ''}>${icon('refresh')} ${state.discovering ? 'Discovering…' : 'Refresh connections'}</button></div><p class="fine-print footnote">Native agents use their own tools, skills and MCP servers, governed by each agent's permission level.</p>`;
+  }
+  function worktreesSection() {
+    const r = state.room, list = r.agents.filter(a => a.worktree || a.isolate), c = r.changes, mode = worktreeMode();
+    const how = state.settings?.worktreesAvailable
+      ? `<strong>${esc(WORKTREE_MODES.find(([v]) => v === mode)?.[1].split(' — ')[0] || mode)}</strong> ${r.worktrees ? 'in this room' : 'from the chatroom.worktrees setting'}. Isolated agents edit on their own branch; you review the combined changes and apply them.`
+      : 'Needs a git repository. Agents share the folder.';
+    const rows = list.map(a => `<div class="wt-row">${avatar(a, 'mini')}<div><strong>${esc(a.name)}</strong>${a.worktree ? `<small class="wt-branch" title="${esc(a.worktree.path)}">${esc(a.worktree.branch)}</small><small>${plural(Number(a.worktree.checkpoints) || 0, 'checkpoint')}</small>` : '<small>Gets its own worktree on its next turn</small>'}</div></div>`).join('');
+    return `<div class="inspector-section"><div class="section-heading">WORKTREES <span class="count">${list.length}</span></div><p class="muted">${how}</p>`
+      + (rows || '<p class="fine-print">No agent works in its own worktree right now.</p>')
+      + (c?.base ? `<p class="fine-print wt-base">Base <code title="${esc(c.base)}">${esc(String(c.base).slice(0, 7))}</code> · your folder when the first agent was isolated</p>` : '')
+      + `<button type="button" class="outline-button" data-worktree="cleanup" title="Remove worktrees left over from rooms that no longer exist. Branches with work are kept.">Clean up old worktrees</button>`
+      + '<p class="fine-print">Agents in Full access can isolate themselves with the isolate_workspace tool.</p></div>';
   }
   function activityTab() {
     const r = state.room;
@@ -1077,6 +1176,9 @@
     if (d.session && editing) send('agentSession', { id: editing, action: d.session });
     if (d.compact !== undefined) { const a = agentById(d.compact); send('send', { text: a ? `${quoteName(a.name)} /compact` : '/compact', editor: false, think: false, ultra: false }); closePopover(); }
     if (d.agentRetry) send('agentRetry', { id: d.agentRetry });
+    if (d.worktree) worktreeAction(d.worktree, button);
+    if (d.keepCancel) closeKeep(true);
+    if (d.changesMore !== undefined) toggleFiles(button);
     if (d.teamOpen) { const back = dialogBack(button); if (d.teamOpen === 'new') openTeamBuilder(undefined, back); else editTeam(back); }
     if (d.teamEdit !== undefined) { const t = savedTeams().find(x => x.name === d.teamEdit); if (t) openTeamBuilder(t, dialogBack(button)); }
     if (d.teamDelete !== undefined) { const name = d.teamDelete; confirmBox(`Delete the team "${name}" from your teams? Rooms that use it keep their copy.`, 'Delete team').then(ok => { if (ok) { send('deleteTeam', { name }); $('dialog-layer').querySelector('[data-team-open="new"]')?.focus(); } }); }
@@ -1096,6 +1198,7 @@
     if (id === 'preset-select' || id === 'setup-preset') send('options', { preset: el.value });
     if (id === 'parallel-limit') send('options', { concurrency: Number(el.value) });
     if (id === 'budget') send('options', { tokenBudget: Number(el.value) });
+    if (id === 'worktrees-select' || id === 'setup-worktrees') send('options', { worktrees: el.value });
     if (el.name === 'loop-kind') updateLoopFields();
     if (el.closest?.('#loop-form')) saveLoop(false);
     if (el.dataset.effortAgent) send('agent', { id: el.dataset.effortAgent, options: { effort: el.value } });
@@ -1113,6 +1216,7 @@
   document.addEventListener('input', event => {
     if (dialogKind === 'agent' && event.target.closest?.('#dialog-layer')) dialogDirty = true;
     if (dialogKind === 'team' && teamDraft && event.target.closest?.('#team-form')) teamField(event.target);
+    if (event.target.id === 'keep-name' && keepDraft) keepDraft.name = event.target.value;
   });
   document.addEventListener('submit', event => {
     event.preventDefault();
@@ -1121,6 +1225,7 @@
     if (id === 'loop-form') saveLoop();
     if (id === 'agent-form') saveAgent();
     if (id === 'team-form') useTeam();
+    if (id === 'keep-form') submitKeep();
     if (id === 'defaults-form') {
       const modelDefaults = { planning: {}, drafting: {}, review: {} };
       document.querySelectorAll('[data-default-preset]').forEach(el => { modelDefaults[el.dataset.defaultPreset][el.dataset.defaultProvider] = el.value; });
@@ -1144,6 +1249,7 @@
   document.addEventListener('keydown', event => {
     if (event.key === 'Escape') {
       if (confirmClose) { confirmClose(); return; }
+      if (keepDraft && event.target.closest?.('#keep-form')) { closeKeep(true); return; }
       if (menu.open) { closeMenu(); return; }
       if (pop) { closePopover(true); return; }
       if (!$('dialog-layer').hidden) { closeDialog(); return; }
@@ -1168,6 +1274,7 @@
   window.addEventListener('message', event => {
     const data = event.data; if (!data || typeof data !== 'object') return;
     if (data.type === 'state') { state = data; render(); }
+    if (data.type === 'error' || data.type === 'notice') releaseChanges();
     if (data.type === 'error') {
       if (lastSent && Date.now() - lastSent.at < 10000 && !$('prompt').value.trim()) { $('prompt').value = lastSent.text; autoGrow(); saveDraft(); }
       lastSent = undefined; toast(data.text);

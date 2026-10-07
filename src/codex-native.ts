@@ -42,7 +42,7 @@ interface Server {
   configModel?: string; configEffort?: string;
   skills?: Promise<Skill[]>; extraRoots: string; dead?: ProviderError;
 }
-interface Handle { server: Server; threadId: string; model?: string; effort?: string; configKey: string }
+interface Handle { server: Server; threadId: string; model?: string; effort?: string; configKey: string; cwd: string }
 interface Live {
   server: Server; threadId: string; turnId?: string; agent: Agent; sink: TurnSink; signal: AbortSignal; permission: AgentOptions['permission'];
   messages: Map<string, string>; thinking: string; reasoningKey?: string; reasoned: Set<string>;
@@ -236,6 +236,8 @@ export class CodexDriver implements NativeDriver {
     }
     return effective;
   }
+  /** The agent's folder: its worktree while it is isolated, else the workspace. The app-server itself runs in the workspace. */
+  private cwd(room: Room, agent: Agent): string { return this.host.cwdFor?.(room, agent) ?? this.host.cwd(); }
   private modelFor(server: Server, id: string | undefined): ModelInfo | undefined {
     return id ? server.models.find(m => m.id === id) : server.models.find(m => m.isDefault);
   }
@@ -337,12 +339,13 @@ export class CodexDriver implements NativeDriver {
     const policy = codexPolicy(options, options.extraDirs);
     await server.config;
     const config = threadConfig(options, server.mcpNames, this.host.settings().sharedMcpServers ?? {});
-    const configKey = JSON.stringify(config);
-    const common = { cwd: this.host.cwd(), model: agent.model || null, approvalPolicy: policy.approvalPolicy, sandbox: policy.sandbox, approvalsReviewer: 'user',
+    const configKey = JSON.stringify(config), cwd = this.cwd(room, agent);
+    const common = { cwd, model: agent.model || null, approvalPolicy: policy.approvalPolicy, sandbox: policy.sandbox, approvalsReviewer: 'user',
       developerInstructions: req.framing, config };
     const existing = this.handles.get(key);
     if (existing && existing.server === server && existing.threadId === stored) {
-      if (existing.configKey === configKey) return { handle: existing, lost: false };
+      // A loaded thread keeps the folder it was loaded with: another folder unloads it like a config change.
+      if (existing.configKey === configKey && existing.cwd === cwd) return { handle: existing, lost: false };
       // A loaded thread ignores resume overrides: unload it, then resume it below with the new config.
       await server.rpc.request('thread/unsubscribe', { threadId: existing.threadId }, 10_000).catch(() => undefined);
       if (server.dead) throw server.dead;
@@ -352,7 +355,7 @@ export class CodexDriver implements NativeDriver {
     if (stored) {
       try {
         const result = await server.rpc.request('thread/resume', { threadId: stored, ...common, excludeTurns: true }, 60_000);
-        const handle: Handle = { server, threadId: stored, ...threadState(result), configKey };
+        const handle: Handle = { server, threadId: stored, ...threadState(result), configKey, cwd };
         this.handles.set(key, handle);
         return { handle, lost: false };
       } catch (error) {
@@ -368,7 +371,7 @@ export class CodexDriver implements NativeDriver {
     } catch (error) { throw server.dead ?? rpcFailure('Codex could not start a session', error); }
     const id = result?.thread?.id;
     if (typeof id !== 'string' || !id) throw new ProviderError('Codex did not return a thread id.', 'protocol');
-    const handle: Handle = { server, threadId: id, ...threadState(result), configKey };
+    const handle: Handle = { server, threadId: id, ...threadState(result), configKey, cwd };
     this.handles.set(key, handle);
     sink.session({ id, provider: 'codex', startedAt: Date.now() });
     if (lost) sink.activity({ id: 'resume', kind: 'info', title: 'Previous session could not be resumed · started a new one with recent room history', status: 'done', at: Date.now() });

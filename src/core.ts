@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomDocument, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
+import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomChanges, RoomDocument, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
 
 export const SCHEMA = 5;
 export const TOOL_NAMES: ToolName[] = ['list_files', 'read_file', 'search_files', 'search_documents', 'ollama_ocr', 'semantic_search'];
@@ -45,6 +45,8 @@ function migrateAgent(raw: any, schema: number, permission: PermissionLevel): Ag
   raw.tools = Array.isArray(raw.tools) ? raw.tools.filter((t: unknown) => TOOL_NAMES.includes(t as ToolName)) : [...DEFAULT_TOOLS];
   if (schema < 3 && raw.tools.includes('read_file') && !raw.tools.includes('search_documents')) raw.tools.push('search_documents');
   if (schema < 5 || (raw.session && typeof raw.session !== 'object')) delete raw.session;
+  if (raw.isolate !== undefined && raw.isolate !== true) delete raw.isolate;
+  if (raw.worktree !== undefined && (typeof raw.worktree?.path !== 'string' || typeof raw.worktree?.branch !== 'string')) delete raw.worktree;
   return raw as Agent;
 }
 /** Upgrades a saved room to the current schema. Safe to run more than once. */
@@ -65,6 +67,8 @@ export function migrateRoom(raw: any, defaults: { attachEditor: boolean; shareSk
   delete raw.rounds;
   raw.attachEditor ??= defaults.attachEditor; raw.shareSkills ??= defaults.shareSkills;
   if (raw.loopState && typeof raw.loopState === 'object') delete raw.loopState.nextAt; else delete raw.loopState;
+  if (raw.worktrees !== undefined && !['off', 'auto', 'always'].includes(raw.worktrees)) delete raw.worktrees;
+  if (raw.changes !== undefined && (typeof raw.changes?.base !== 'string' || typeof raw.changes?.branch !== 'string' || !Array.isArray(raw.changes?.files))) delete raw.changes;
   for (const m of raw.messages as Message[]) {
     if (m.status === 'streaming') m.status = 'cancelled';
     if (m.approval?.status === 'pending') m.approval.status = 'expired';
@@ -91,6 +95,39 @@ export function patchLoop(current: LoopConfig, patch: Partial<LoopConfig>): Loop
 }
 export function message(kind: Message['kind'], text: string, author = 'You', agentId?: string): Message {
   return { id: randomUUID(), kind, text, author, agentId, createdAt: Date.now(), status: 'complete' };
+}
+
+// ── The changes card (agents' worktrees) ─────────────────────────────────────
+const files = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
+/** The card's text; the webview renders the card from `changes`, this is what exports and plain views show. */
+export function changesText(c: RoomChanges): string {
+  const totals = `(+${c.added} −${c.removed})`;
+  switch (c.status) {
+    case 'applied': return `Applied ${files(c.files.length)} ${totals} to your folder. They are not committed.`;
+    case 'kept': return `Kept the agents' changes as branch ${c.kept ?? c.branch}.`;
+    case 'discarded': return 'Discarded the agents\' changes.';
+    default: return `Agents changed ${files(c.files.length)} in their worktrees ${totals}. Review them, then apply them to your folder or keep them as a branch.`;
+  }
+}
+const copyChanges = (c: RoomChanges): RoomChanges => ({ ...c, files: c.files.map(f => ({ ...f })), ...(c.conflicts ? { conflicts: c.conflicts.map(x => ({ ...x, files: [...x.files] })) } : {}) });
+/**
+ * Keeps one live card for the room's changes: the latest card is updated in place while it is for the same base and still open
+ * (ready or conflict); otherwise a new card is posted (when `push`). Returns the card.
+ */
+export function upsertChangesCard(room: Room, now: number, push = true): Message | undefined {
+  const changes = room.changes;
+  if (!changes) return;
+  const last = [...room.messages].reverse().find(m => m.kind === 'notice' && m.changes);
+  const copy = copyChanges(changes);
+  if (last?.changes && last.changes.base === changes.base && (last.changes.status === 'ready' || last.changes.status === 'conflict')) {
+    last.changes = copy; last.text = changesText(copy);
+    return last;
+  }
+  if (!push) return;
+  const card = message('notice', changesText(copy), 'Chatroom');
+  card.createdAt = now; card.changes = copy;
+  room.messages.push(card);
+  return card;
 }
 export const estimateTokens = (text: string) => Math.ceil(text.length / 3);
 export const usageTotal = (usage: Usage) => usage.input + usage.output;
@@ -239,6 +276,7 @@ export function roomFraming(agent: Agent, room: Room, ctx: FramingContext): stri
       : lead ? (lead.id === agent.id ? 'You lead this room: the user\'s requests come to you first, and you decide whether to answer yourself or bring in teammates.' : `${lead.name} leads this room and may ask you for help.`) : '',
     away.length ? `Unavailable right now: ${away.join(', ')}.` : '',
     agent.role.trim() ? `Your focus in this room: ${agent.role.trim()}` : '',
+    !ctx.legacy && agent.worktree ? `You work in your own git worktree (branch ${agent.worktree.branch}); your edits reach the user's folder only after the room combines and reviews them. Other agents' changes reach you when the room combines the work.` : '',
     !ctx.legacy && room.shareSkills && ctx.skillsIndex ? `Skills from the other agents are listed in ${ctx.skillsIndex}; open a SKILL.md from there when one fits the task.` : ''
   ].filter(Boolean).join('\n');
 }
@@ -255,6 +293,8 @@ export interface TurnSpec {
   stage?: { index: number; total: number; name: string; lead?: boolean; task?: string; others: string[]; plan: string; standIn?: string[] };
   /** The wrap-up synthesis after a team's stages: teamPlan(). */
   teamPlan?: string;
+  /** A merge turn: the files whose conflict markers the agent resolves in its own worktree. */
+  merge?: { files: string[] };
 }
 const OMITTED = 'omitted:';
 const attr = (value: string) => value.replace(/"/g, '\'');
@@ -360,6 +400,11 @@ export function turnAsk(agent: Agent, room: Room, spec: TurnSpec): string {
       break;
     }
     case 'handoff': ask = spec.handoff ? `${spec.handoff.from} mentioned you: "${spec.handoff.line}"` : ''; break;
+    case 'merge': {
+      const files = spec.merge?.files ?? [], shown = files.length > 20 ? `${files.slice(0, 20).join(', ')} and ${files.length - 20} more` : files.join(', ');
+      ask = `Your changes conflict with the team's combined work in: ${shown}. The conflict markers are in your files now. Resolve them so both changes' intent is kept, then reply with one line saying what you kept.`;
+      break;
+    }
     case 'stage': {
       const s = spec.stage, task = s?.task?.trim().replace(/[\s.!?]+$/, '');
       if (!s) break;

@@ -114,6 +114,16 @@ const teamRun = room({ title: 'Add a CSV export to the report page', mode: 'pipe
     say('lead', 'a2', 'Claude', 'Drafting: add `exportCsv(rows)` in src/report.ts with a header row and proper quoting. Review: check commas, quotes and newlines in values.', { turn: 'stage', stage: { index: 0, total: 3, name: 'Leads', lead: true } }),
     { id: 'skip', kind: 'notice', author: 'Chatroom', status: 'complete', createdAt: now, text: `Drafting: Codex can't run right now (out of usage until ${backText}) · Claude takes this stage.` },
     say('draft', 'a2', 'Claude', 'Drafting `exportCsv` now: a header from the first row, values quoted when they contain a comma, quote or newline.', { turn: 'stage', status: 'streaming', stage: { index: 1, total: 3, name: 'Drafting' } })] });
+// Two agents worked in their own git worktrees; the room combined their branches and waits for the user.
+const wt = (key, n) => ({ path: `/storage/wt/d17cb5/demo-${key}`, branch: `chatroom/demo/${key}`, createdAt: now, checkpoints: n });
+const combined = { base: '4f2a9c1e7b3d', branch: 'chatroom/demo/integration', path: '/storage/wt/d17cb5/demo-integration', status: 'ready', updatedAt: now, added: 141, removed: 9,
+  files: [{ path: 'src/report/export.ts', added: 58, removed: 0, status: 'A' }, { path: 'src/report/page.tsx', added: 14, removed: 6, status: 'M' }, { path: 'tests/report/export.test.ts', added: 66, removed: 0, status: 'A' }, { path: 'src/report/index.ts', added: 3, removed: 3, status: 'M' }] };
+const isolated = room({ title: 'CSV export with tests', mode: 'parallel', worktrees: 'auto', completedTurns: 2,
+  agents: agents.map(a => a.id === 'a1' ? { ...a, worktree: wt('codex', 2) } : a.id === 'a2' ? { ...a, worktree: wt('claude', 1) } : a), changes: combined,
+  messages: [{ ...user, text: 'Add a CSV export to the report page, with tests. Codex writes the exporter, Claude the tests.' },
+    say('c1', 'a1', 'Codex', 'Added `exportCsv()` in src/report/export.ts with RFC 4180 quoting, and a Download CSV button on the report page.'),
+    say('c2', 'a2', 'Claude', 'Wrote tests for quoting, empty reports and a 50,000-row report. All pass in my worktree.'),
+    { id: 'card', kind: 'notice', author: 'Chatroom', status: 'complete', createdAt: now, changes: combined, text: 'Agents changed 4 files in their worktrees (+141 −9). Review them, then apply them to your folder or keep them as a branch.' }] });
 const done = room({ documents: documents(false), messages: [user, plan(['complete', 'complete', 'complete']), tool, s1, s2, s3, final] });
 
 const server = createServer(async (req, res) => {
@@ -160,6 +170,7 @@ try {
   await shoot('approvals.png', state(fixing), { width: 420, height: 1000 });
   await shoot('commands.png', state(done), { width: 420, height: 1000, slash: '/' });
   await shoot('team-run.png', state(teamRun), { width: 420, height: 1000 });
+  await shoot('changes.png', { ...state(isolated), settings: { ...state(isolated).settings, worktrees: 'auto', worktreesAvailable: true } }, { width: 420, height: 1000 });
   await shoot('team.png', state(room({ ...done, mode: 'pipeline', team: ownTeam })), { width: 1100, height: 1300, openTeam: true });
   await shoot('agent-settings.png', state(done), { width: 1100, height: 1300, click: '[data-agent="a2"]' });
   await shoot('unavailable.png', state(teamRun), { width: 1100, height: 1000, click: '[data-agent="a1"]' });

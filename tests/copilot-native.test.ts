@@ -378,3 +378,26 @@ test('shared MCP servers are passed to the session; release closes the agent pro
     assert.ok(children[0]!.stdinEnded || children[0]!.killed);
   } finally { await driver.dispose(); }
 });
+test('the process, session/new and Auto-edit\'s own-folder rule use the agent\'s folder from host.cwdFor; another folder respawns', async () => {
+  let folder = join(tmpdir(), 'wt', 'roomaa-copilot');
+  const edits: object[] = [];
+  const { driver, agent, room, children, peers, host } = setup(peer => ({
+    'session/prompt': async (params: any) => {
+      for (const path of [join(folder, 'src', 'a.ts'), join(tmpdir(), 'shared.ts')])
+        edits.push((await peer.rpc.request('session/request_permission', { sessionId: params.sessionId, toolCall: { toolCallId: path, kind: 'edit', title: 'Edit', locations: [{ path }] }, options: PERMISSION_OPTIONS })).outcome);
+      return { stopReason: 'end_turn' };
+    }
+  }), { host: { cwdFor: () => folder }, agent: { options: { permission: 'auto-edit' } as any } });
+  try {
+    const sink = recordingSink(() => ({ decision: 'deny' }));
+    await driver.turn(request(room, agent, sink));
+    assert.equal(children[0]!.cwd, folder); assert.equal(method(peers[0]!, 'session/new')[0]!.params.cwd, folder);
+    assert.deepEqual(edits, [{ outcome: 'selected', optionId: 'opt-allow' }, { outcome: 'selected', optionId: 'opt-deny' }], 'inside its worktree it edits freely; the shared folder asks');
+    assert.equal(sink.approvals.length, 1);
+    adopt(agent, sink);
+    folder = host.cwd();
+    await driver.turn(request(room, agent, recordingSink(() => ({ decision: 'allow' }))));
+    assert.equal(children.length, 2); assert.equal(children[1]!.cwd, host.cwd());
+    assert.equal(method(peers[1]!, 'session/load')[0]!.params.cwd, host.cwd());
+  } finally { await driver.dispose(); }
+});
