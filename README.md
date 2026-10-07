@@ -9,6 +9,8 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 - **The CLIs themselves.** Claude Code runs as `claude` in stream-json mode, Codex as one `codex app-server` per window, and Copilot as `copilot --acp` (when the Copilot CLI is installed). Each keeps its own tools, skills, `CLAUDE.md`/`AGENTS.md`, hooks, MCP servers and native session, and resumes that session after a reload.
 - **One room, shared context.** Every message reaches every agent once. An agent's own replies are already in its session, so each turn sends only what is new. A new or lost session gets a bounded copy of the room history.
 - **Teamwork.** A line that starts with `@Name` hands the next turn to that agent. In **Team** mode a lead answers or brings in teammates (with mention lines or a step plan), independent steps run in parallel, and the lead writes the final answer. **Relay** and **Parallel** modes and `@Agent` messages are there too.
+- **Your own team.** Set up stages that run in order, such as **Leads → Drafting → Review → Testing → Coding**, with one or more agents per stage, an optional task and model routing. Use the team builder, the `chatroom.teams` setting or `/team`.
+- **Keeps going when an agent can't.** An agent that is out of usage, not installed, signed out, on a model that isn't available, or offline (Ollama) is shown as such and skipped. The others continue, and another agent takes its step or stage.
 - **Permissions and approvals.** Per agent: **Plan**, **Ask** (the default), **Auto-edit** or **Full access**, mapped to each CLI's own modes. In Ask, edits, commands and network access show up as approval cards in the room. Unanswered requests are denied after 5 minutes.
 - **Composer like Claude Code.** `@` to mention, `/` for room commands and each agent's own slash commands, chips for team mode, loops, permissions and effort, ✦ to think harder and ⚡ Ultra for one message, and a context ring per agent.
 - **Loops.** Repeat for N rounds, until everyone agrees, until the lead says done, or every few minutes. Iteration, time and token caps always apply.
@@ -38,6 +40,14 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
     <td align="center">Shared skills and documents</td>
     <td align="center">Usage</td>
   </tr>
+  <tr>
+    <td><img src="docs/images/team-run.png" width="260" alt="A custom team run: Codex is out of usage and skipped, Claude takes its stage, and stage chips show progress"></td>
+    <td colspan="2"><img src="docs/images/team.png" width="530" alt="The team builder: stages with agents, lead, run mode, models and an optional task"></td>
+  </tr>
+  <tr>
+    <td align="center">A team run that skips an agent</td>
+    <td align="center" colspan="2">The team builder</td>
+  </tr>
 </table>
 
 ## Requirements
@@ -58,7 +68,7 @@ git clone https://github.com/GhoshSrinjoy/ChatRoom.git
 cd ChatRoom
 npm ci
 npm run package
-code --install-extension artifacts/chatroom-0.4.0.vsix
+code --install-extension artifacts/chatroom-0.5.0.vsix
 ```
 
 Then run **Developer: Reload Window** in VS Code. You can also install the file with **Extensions: Install from VSIX…** from the Command Palette.
@@ -77,6 +87,9 @@ The grid button beside the room title opens **Usage**, **Tools** and **Activity*
 ## How agents collaborate
 
 - **Team** (default). The lead reads your message. It answers simple ones itself. Otherwise it ends its reply with one `@Name task` line per teammate (they work in parallel), or with a `<chatroom-plan>` step graph when some steps depend on others. A step receives only the outputs it builds on. When the steps finish, the lead writes the final answer. With `/loop N`, the lead may delegate again up to N waves.
+- **Custom team.** Your own stages, in order. Each stage has one or more agents that answer together or one after another, an optional task, and optional model routing (Planning, Drafting or Review models). A **lead** stage sets up the work for the stages after it, or answers directly with `[DONE]` and ends the run; the lead can also write the final answer. Set a team up in the **team builder** (Team chip → Edit team…, Room setup, or Models and defaults), in the `chatroom.teams` setting, or with `/team`:
+  - `/team Lead: Claude > Draft: Codex > Review: Claude, Copilot > Test: Codex (write and run the tests)` uses that team in this room.
+  - `/team save <name>` keeps it, `/team <name>` uses a saved team or a template (**Lead, draft, review**, **Build and test**, **Draft and review**), `/team edit` opens the builder, and `/team off` returns to Team mode.
 - **Relay.** Agents reply in turn, each building on the replies before it.
 - **Parallel.** Agents answer the same snapshot at the same time; the next round sees every reply.
 - **@mentions.** A message that starts with `@Agent` goes only to the mentioned agents, in order, whatever the mode. When an agent starts a line with `@Name`, that agent gets the next turn with the request. Hand-offs per message are capped (`chatroom.maxHandoffs`, default 6). In Team mode only the lead hands out work.
@@ -85,6 +98,22 @@ The grid button beside the room title opens **Usage**, **Tools** and **Activity*
 ![The lead's final answer combines the team's steps](docs/images/final-answer.png)
 
 Each agent gets a short room framing appended to its CLI's own system prompt: who is in the room, how messages arrive, how to hand off, and who leads. Agents have no default persona; an optional focus can be set per agent.
+
+## When an agent can't run
+
+Chatroom shows why an agent can't run and continues with the others:
+
+| Reason | Shown as | Tried again |
+| --- | --- | --- |
+| Out of usage (tokens or quota) | `Out of usage · back Thu 23:23` | When the CLI's reset time passes (15 minutes if it gives none) |
+| Model not available | `Model … unavailable` | After you pick another model (or Default) |
+| CLI not installed, or signed out | `Not installed`, `Signed out` | After Refresh finds it ready |
+| Ollama not running | `Not running` | Before your next message (checked at most every 30 seconds) |
+
+- The agent's pill dims and says why. The room posts one notice, for example *Skipping Codex (out of usage until Thu 23:23) · continuing with Claude and Copilot.*
+- In Team mode, a lead that can't run hands the message to the next agent, and a step for an agent that can't run goes to another agent. In a custom team, a stage whose agents can't run is taken by the lead (or the next available agent), which is told it is standing in. Hand-offs to an agent that can't run are skipped with a notice. Loops keep going.
+- **Try again now** in the agent's settings clears the mark at once.
+- When Ollama isn't running, Ollama agents are skipped and documents fall back to keyword search; scanned pages can't be read until it starts.
 
 ## Permissions, approvals and safety
 
@@ -115,7 +144,8 @@ Each agent gets a short room framing appended to its CLI's own system prompt: wh
 | `/compact [instructions]` | Summarizes each agent's native session to free context |
 | `/new`, `/export`, `/stop` | New room, Markdown export, stop all agents |
 | `/loop …` | See loops above |
-| `/mode team \| relay \| parallel`, `/lead <agent>` | How agents collaborate and who leads |
+| `/mode team \| relay \| parallel \| custom`, `/lead <agent>` | How agents collaborate and who leads |
+| `/team …` | Your own team: `/team Lead: Claude > Draft: Codex > Review: Claude`, `/team <name>`, `/team save <name>`, `/team edit`, `/team off` |
 | `@Agent /model <model>`, `/effort <level>`, `/permissions plan \| ask \| auto \| full` | Model, reasoning effort and permission level |
 | `/status` | Sessions, models, effort, permissions and context use per agent |
 
@@ -151,6 +181,7 @@ Chatroom selects installed local models automatically, preferring a vision model
 | `chatroom.attachOpenFile` | `true` | Share the open file and selection with agents |
 | `chatroom.shareSkills` | `true` | Share skills between the CLIs in new rooms |
 | `chatroom.sharedMcpServers` | `{}` | MCP servers for every native agent, in `.mcp.json` format (user settings only; names starting with `chatroom` are reserved) |
+| `chatroom.teams` | `[]` | Your saved teams: named lists of stages (`name`, `agents`, `run`, `lead`, `task`, `preset`) |
 | `chatroom.maxHandoffs` | `6` | Agent-to-agent hand-offs per message |
 | `chatroom.copilotUseEnvToken` | `false` | Pass `GH_TOKEN`/`GITHUB_TOKEN` to the Copilot CLI (user settings only) |
 | `chatroom.contextTokens` | `12000` | Room history budget for new sessions and chat-model agents |

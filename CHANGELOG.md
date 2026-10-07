@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0
+
+- **Your own team.** A new **Custom team** mode runs the stages you set up, in order, for example Leads → Drafting → Review → Testing → Coding:
+  - Each stage has one or more agents, who answer together or one after another, plus an optional task and optional model routing (Planning, Drafting or Review models). The agent's own model setting does not change.
+  - A lead stage sets up the work for the later stages, or answers directly with `[DONE]`. The lead can write the final answer.
+  - Set teams up in the new team builder (Team chip, Room setup, Models and defaults), in the `chatroom.teams` setting, or with `/team`: an inline team, a saved name, `save`, `edit`, `off`.
+  - Three templates: Lead, draft, review · Build and test · Draft and review.
+  - Messages show their stage (`Review · 3/4`) and the footer shows the current stage.
+- **Agents that can't run are shown and skipped.**
+  - Out of usage (until the reset time the CLI reports), a model that isn't available, a CLI that isn't installed or is signed out, and Ollama not running are recognized.
+  - The agent's pill says why; the room posts one notice and continues with the others.
+  - Team-mode leads, plan steps and custom-team stages move to an available agent, which is told it is standing in. Hand-offs to such an agent are skipped. Loops keep going.
+  - **Try again now** in the agent's settings clears the mark.
+- `/mode custom`, `/status` shows unavailable agents, and the `executionMode` setting accepts `pipeline`.
+
 ## 0.4.0
 
 The agents are now the real CLIs, working together in one room.

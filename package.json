@@ -2,7 +2,7 @@
   "name": "chatroom",
   "displayName": "Chatroom",
   "description": "One room where Claude Code, Codex and the GitHub Copilot CLI work together with their own tools, skills and sessions, plus Ollama. Agents discuss, hand off with @mentions and work as a team.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "publisher": "chatroom-local",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/GhoshSrinjoy/ChatRoom.git" },
@@ -42,7 +42,19 @@
           "review": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } }
         } },
         "chatroom.defaultPreset": { "type": "string", "enum": ["planning", "drafting", "review"], "default": "planning", "description": "Task preset for new rooms. Planning also covers orchestration. Switching a room's preset applies its models to all agents." },
-        "chatroom.executionMode": { "type": "string", "enum": ["orchestrated", "sequential", "parallel"], "enumDescriptions": ["Team: the lead answers or brings in teammates with @mentions or a step plan; independent steps run in parallel and the lead writes the final answer.", "Relay: agents reply one after another, each building on the replies before it.", "Parallel: agents answer independently with the same context; the next round sees all replies."], "default": "orchestrated", "description": "How agents collaborate in new rooms. @mentioning agents in a message always sends it to just those agents." },
+        "chatroom.executionMode": { "type": "string", "enum": ["orchestrated", "sequential", "parallel", "pipeline"], "enumDescriptions": ["Team: the lead answers or brings in teammates with @mentions or a step plan; independent steps run in parallel and the lead writes the final answer.", "Relay: agents reply one after another, each building on the replies before it.", "Parallel: agents answer independently with the same context; the next round sees all replies.", "Your own team: the stages you set up, in order."], "default": "orchestrated", "description": "How agents collaborate in new rooms. @mentioning agents in a message always sends it to just those agents." },
+        "chatroom.teams": { "type": "array", "default": [], "description": "Your own teams: stages that run in order, for example Leads → Drafting → Review → Testing. Edit them in Chatroom's team builder or with /team.", "items": { "type": "object", "required": ["name", "stages"], "properties": {
+          "name": { "type": "string", "maxLength": 40 },
+          "wrapUp": { "type": "boolean", "description": "After the last stage, the first lead writes the final answer." },
+          "stages": { "type": "array", "maxItems": 8, "items": { "type": "object", "required": ["agents"], "properties": {
+            "name": { "type": "string", "maxLength": 40 },
+            "agents": { "type": "array", "maxItems": 8, "items": { "type": "string" }, "description": "Agent names, or provider names such as codex." },
+            "run": { "type": "string", "enum": ["parallel", "relay"], "enumDescriptions": ["The stage's agents answer together.", "The stage's agents answer one after another."] },
+            "lead": { "type": "boolean", "description": "A lead stage sets up the work for the stages after it, or answers directly." },
+            "task": { "type": "string", "maxLength": 500 },
+            "preset": { "type": "string", "enum": ["planning", "drafting", "review"], "description": "Model preset for this stage; leave it out to use each agent's own model." }
+          } } }
+        } } },
         "chatroom.maxParallelAgents": { "type": "integer", "minimum": 1, "maximum": 4, "default": 3, "description": "Maximum agents (or Team steps) running at once. Agents with Auto-edit or Full access still edit one at a time." },
         "chatroom.defaultPermission": { "type": "string", "scope": "machine", "enum": ["plan", "ask", "auto-edit", "full"], "enumDescriptions": ["Plan: read and plan only.", "Ask: agents ask before edits and commands, with approval cards in the room.", "Auto-edit: agents edit files freely and ask for everything else.", "Full access: no approvals. Only used when chatroom.allowFullAccess is on."], "default": "ask", "description": "Permission level for new agents. `full` is only used when `chatroom.allowFullAccess` is on. User settings only: a workspace cannot set it." },
         "chatroom.allowFullAccess": { "type": "boolean", "scope": "machine", "default": false, "description": "Allow choosing Full access (no approvals) for agents. User settings only: a workspace cannot set it." },
@@ -64,7 +76,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.4.0.vsix",
+    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.5.0.vsix",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {
