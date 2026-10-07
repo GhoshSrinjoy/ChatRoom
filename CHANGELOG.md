@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+- **Sandbox (optional, on by default; every run asks you first).** Agents (the `sandbox_run` room tool) and you (`/sandbox`, or **Run in sandbox** on bash, Python and JavaScript code blocks) can run code, tests or security checks in a throwaway Docker container.
+  - Each run shows an approval card first: purpose, exact command or code, image, profile, network and limits. Nothing runs without **Allow**, whatever the agent's permission level.
+  - The container works on a copy of the agent's folder (or the workspace): tracked and untracked files only, never credentials. Your real folder is never mounted.
+  - No network unless allowed; CPU, memory, process and time limits; all capabilities dropped; read-only system files. The Security profile adds an unprivileged user and a read-only copy.
+  - Results appear as a card (exit code, output, created files) that every agent receives. Cancel and Run again.
+  - Turn it off per room (`/sandbox off`, Room setup, Tools) or everywhere (`chatroom.sandbox.enabled`). Settings for images and limits. **Start Docker Desktop** when Docker isn't running; leftover containers are cleaned up.
+  - Verified live: a Claude Code agent called `sandbox_run`, the run was approved, Python ran in a container without network, and the agent reported its output.
+
 ## 0.6.0
 
 - **Worktrees (optional, off by default).** Agents that edit at the same time can each work in their own git worktree and branch, so they can't overwrite each other.

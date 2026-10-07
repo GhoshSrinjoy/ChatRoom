@@ -10,6 +10,7 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 - **One room, shared context.** Every message reaches every agent once. An agent's own replies are already in its session, so each turn sends only what is new. A new or lost session gets a bounded copy of the room history.
 - **Teamwork.** A line that starts with `@Name` hands the next turn to that agent. In **Team** mode a lead answers or brings in teammates (with mention lines or a step plan), independent steps run in parallel, and the lead writes the final answer. **Relay** and **Parallel** modes and `@Agent` messages are there too.
 - **Your own team.** Set up stages that run in order, such as **Leads → Drafting → Review → Testing → Coding**, with one or more agents per stage, an optional task and model routing. Use the team builder, the `chatroom.teams` setting or `/team`.
+- **Sandbox (optional).** Agents or you can run code, tests or security checks in a throwaway Docker container on a copy of the folder, with no network unless you allow it. Every run asks you first.
 - **Worktrees (optional).** Agents that edit at the same time each get their own git worktree and branch; the room combines their work and you review, apply, keep or discard it.
 - **Keeps going when an agent can't.** An agent that is out of usage, not installed, signed out, on a model that isn't available, or offline (Ollama) is shown as such and skipped. The others continue, and another agent takes its step or stage.
 - **Permissions and approvals.** Per agent: **Plan**, **Ask** (the default), **Auto-edit** or **Full access**, mapped to each CLI's own modes. In Ask, edits, commands and network access show up as approval cards in the room. Unanswered requests are denied after 5 minutes.
@@ -39,7 +40,7 @@ git clone https://github.com/GhoshSrinjoy/ChatRoom.git
 cd ChatRoom
 npm ci
 npm run package
-code --install-extension artifacts/chatroom-0.6.0.vsix
+code --install-extension artifacts/chatroom-0.7.0.vsix
 ```
 
 Then run **Developer: Reload Window** in VS Code. You can also install the file with **Extensions: Install from VSIX…** from the Command Palette.
@@ -150,7 +151,7 @@ All agents work in the same folder, so Chatroom keeps them from overwriting each
 - **Stale edits are refused, not merged:** Claude Code won't write a file that changed since it read it ("File has been modified since read"), and Codex applies patches against the exact lines it saw, so a patch to a changed file fails instead of overwriting. The agent reads the file again and retries.
 - **Worktrees (optional):** turn them on and agents that edit at the same time each get their own copy of the repository, so they can't overwrite each other at all. See [Worktrees](#worktrees-optional) below.
 
-Where commands run depends on the CLI. Chatroom does not add a container of its own:
+Where an agent's own commands run depends on its CLI. For runs you want isolated, the optional [Sandbox](#sandbox-optional) runs code in a throwaway container instead:
 
 | CLI | Commands run | In Plan / Ask / Auto-edit / Full access |
 | --- | --- | --- |
@@ -158,7 +159,7 @@ Where commands run depends on the CLI. Chatroom does not add a container of its 
 | Claude Code | On your machine as you | Plan: read-only. Ask: a card for every edit and command. Auto-edit: edits allowed, commands still ask. Full access: nothing asks |
 | Copilot CLI | On your machine as you (its own sandbox is experimental and off on Windows) | Plan: read-only. Ask: a card for every request. Auto-edit: reads and edits inside the workspace allowed, the rest asks. Full access: nothing asks |
 
-For code you don't trust, keep agents in Plan or Ask, or open the folder in a dev container or WSL so every CLI runs inside it.
+For code you don't trust, keep agents in Plan or Ask and have them use the sandbox's Security profile, or open the folder in a dev container or WSL so every CLI runs inside it.
 
 ## Worktrees (optional)
 
@@ -206,6 +207,42 @@ Set it in **Room setup**, the **Team** chip, the `chatroom.worktrees` setting, o
 - **Codex** trusts the project folder in `~/.codex/config.toml`, as it does when you use it directly. Entries for Chatroom's own worktree folders are removed again during cleanup.
 - **Windows path limit:** git refuses worktrees whose internal path under `.git\worktrees` exceeds about 220 characters. Chatroom then logs it and that agent works in your folder.
 
+## Sandbox (optional)
+
+The sandbox runs a command or a script in a **throwaway Docker container**, for isolated test runs, trying out code, or security checks. Agents ask for a run with the `sandbox_run` room tool; you start one with `/sandbox`, or with **Run in sandbox** on any bash, Python or JavaScript code block in the room.
+
+**Every run asks you first.** The approval card shows why the run is needed, the exact command or code, the image, the profile, whether it has network, and its limits. Nothing runs until you press **Allow**, whoever asked and whatever their permission level, Full access included.
+
+<p align="center"><img src="docs/images/sandbox.png" width="340" alt="A sandbox approval card for a pytest run, the run card with 12 passed tests and a junit.xml file, a Run in sandbox button on a Python code block, and a pending approval for that code"><br><em>Claude asks to run the parser tests in the sandbox. After you allow it, the run card shows the result and the files it wrote, and every agent sees it. A Python block in the reply has its own <b>Run in sandbox</b> button, which asks you too.</em></p>
+
+**What a run gets**
+
+- **A copy of the folder** at `/work`: the agent's folder (its worktree when it has one) or your workspace. Only tracked and untracked files are copied, never ignored files and never credentials (`.env*`, `.ssh`, keys and similar). Your real folder is never mounted, so a run can't change it.
+- **No network**, unless the request asks for it and you allow it on the card.
+- **Limits:** CPUs, memory (no swap), 512 processes, and a time limit after which the container is killed. All capabilities are dropped, privilege escalation is blocked, the system files are read-only and `/tmp` is a small scratch space.
+- **Profiles:** **Test** gets a writable copy. **Security** also runs as an unprivileged user with a read-only copy, for checking code you don't trust.
+- **Images:** Debian for shell commands, Python 3.12, Node 22 (`chatroom.sandbox.images`). An image is downloaded the first time it is used.
+
+**Results** appear as a card in the room: exit code, duration, the output, and the files the run created or changed (with their text when the run asked for it). Every agent receives the result, so the team can act on it. **Cancel** stops a run; **Run again** repeats it (and asks again).
+
+**Using it**
+
+- **Agents:** `sandbox_run` with a command, or code and a language (`bash`, `python`, `node`), plus an optional purpose, profile, network, time limit, and output files to return.
+- **You:** `/sandbox <command>`, or `/sandbox python|node|bash <code>`. Options go before the command: `--network`, `--security`, `--no-files`, `--timeout <seconds>`.
+- **Turn it off:** `/sandbox off` for a room, the switch in **Room setup** or the **Tools** tab, or `chatroom.sandbox.enabled: false` everywhere. When it's off, nothing calls Docker and the run buttons are hidden.
+
+**Requirements:** Docker Desktop (Windows, macOS) or Docker Engine (Linux). If Docker isn't running, the room offers **Start Docker Desktop**.
+
+**What it protects, and what it doesn't**
+
+| Protects | Doesn't protect |
+| --- | --- |
+| Your files: the run works on a copy. | Code you allow with **network on** can send whatever is in the copy to the internet. Credentials are never copied, but your source code is. |
+| Your machine's processes, settings and the other agents. | A container shares the Docker VM's kernel. It is not a microVM; for truly hostile code, use a dedicated VM. |
+| Runaway code: time, CPU, memory and process limits. | The images are public Docker images; you trust their publishers, as with any `docker pull`. |
+
+**Costs:** Docker Desktop's VM memory while it runs, about 50–150 MB per image on first use, the time to copy large folders (capped by `chatroom.sandbox.maxCopyMb`), and about a second to start each run.
+
 ## Commands
 
 | Command | What it does |
@@ -216,6 +253,7 @@ Set it in **Room setup**, the **Team** chip, the `chatroom.worktrees` setting, o
 | `/new`, `/export`, `/stop` | New room, Markdown export, stop all agents |
 | `/loop …` | See loops above |
 | `/mode team \| relay \| parallel \| custom`, `/lead <agent>` | How agents collaborate and who leads |
+| `/sandbox <command>`, `/sandbox python\|node\|bash <code>`, `/sandbox on \| off \| status` | Run something in a throwaway container (it asks you first), or turn the sandbox on or off for this room |
 | `/worktrees off \| auto \| always \| status \| apply \| keep [name] \| discard \| cleanup` | Give agents their own git worktrees, and decide what happens to their combined changes |
 | `/team …` | Your own team: `/team Lead: Claude > Draft: Codex > Review: Claude`, `/team <name>`, `/team save <name>`, `/team edit`, `/team off` |
 | `@Agent /model <model>`, `/effort <level>`, `/permissions plan \| ask \| auto \| full` | Model, reasoning effort and permission level |
@@ -255,6 +293,8 @@ Chatroom selects installed local models automatically, preferring a vision model
 | `chatroom.attachOpenFile` | `true` | Share the open file and selection with agents |
 | `chatroom.shareSkills` | `true` | Share skills between the CLIs in new rooms |
 | `chatroom.sharedMcpServers` | `{}` | MCP servers for every native agent, in `.mcp.json` format (user settings only; names starting with `chatroom` are reserved) |
+| `chatroom.sandbox.enabled` | `true` | Allow sandbox runs (each run still asks you first) |
+| `chatroom.sandbox.images`, `.cpus`, `.memoryMb`, `.timeoutSeconds`, `.maxCopyMb` | Debian, Python 3.12, Node 22 · 2 · 2048 · 120 · 200 | Images per language, and the limits of a run |
 | `chatroom.worktrees` | `off` | `off`, `auto` or `always` (see [Worktrees](#worktrees-optional)) |
 | `chatroom.worktreeCopy`, `chatroom.worktreeLinks` | `[]` | Ignored files copied into each worktree (e.g. `.env`), and folders linked into it (e.g. `node_modules`, shared by every agent) |
 | `chatroom.worktreeAutoApply` | `false` | Apply combined changes automatically when they merge cleanly |
