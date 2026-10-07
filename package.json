@@ -2,7 +2,7 @@
   "name": "chatroom",
   "displayName": "Chatroom",
   "description": "One room where Claude Code, Codex and the GitHub Copilot CLI work together with their own tools, skills and sessions, plus Ollama. Agents discuss, hand off with @mentions and work as a team.",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "publisher": "chatroom-local",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/GhoshSrinjoy/ChatRoom.git" },
@@ -55,7 +55,11 @@
             "preset": { "type": "string", "enum": ["planning", "drafting", "review"], "description": "Model preset for this stage; leave it out to use each agent's own model." }
           } } }
         } } },
-        "chatroom.maxParallelAgents": { "type": "integer", "minimum": 1, "maximum": 4, "default": 3, "description": "Maximum agents (or Team steps) running at once. Agents with Auto-edit or Full access still edit one at a time." },
+        "chatroom.worktrees": { "type": "string", "enum": ["off", "auto", "always"], "enumDescriptions": ["Off: agents share the folder.", "Auto: an agent that edits without asking (Auto-edit or Full access) gets its own git worktree when another agent could edit at the same time.", "Always: every agent that can edit gets its own git worktree."], "default": "off", "description": "Give agents their own git worktree and branch so edits made at the same time can't overwrite each other. Chatroom combines the branches; you review the changes and apply them to your folder or keep them as a branch. Needs a git repository. Each room can override it." },
+        "chatroom.worktreeCopy": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Ignored files copied into each new worktree, for example .env" },
+        "chatroom.worktreeLinks": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Folders linked into each worktree instead of copied, for example node_modules. Linked folders are shared by every agent." },
+        "chatroom.worktreeAutoApply": { "type": "boolean", "default": false, "description": "Apply combined changes automatically when they merge cleanly. Otherwise you review and apply them." },
+        "chatroom.maxParallelAgents":{ "type": "integer", "minimum": 1, "maximum": 4, "default": 3, "description": "Maximum agents (or Team steps) running at once. Agents with Auto-edit or Full access still edit one at a time." },
         "chatroom.defaultPermission": { "type": "string", "scope": "machine", "enum": ["plan", "ask", "auto-edit", "full"], "enumDescriptions": ["Plan: read and plan only.", "Ask: agents ask before edits and commands, with approval cards in the room.", "Auto-edit: agents edit files freely and ask for everything else.", "Full access: no approvals. Only used when chatroom.allowFullAccess is on."], "default": "ask", "description": "Permission level for new agents. `full` is only used when `chatroom.allowFullAccess` is on. User settings only: a workspace cannot set it." },
         "chatroom.allowFullAccess": { "type": "boolean", "scope": "machine", "default": false, "description": "Allow choosing Full access (no approvals) for agents. User settings only: a workspace cannot set it." },
         "chatroom.approvalTimeoutSeconds": { "type": "number", "default": 300, "minimum": 30, "maximum": 3600, "description": "Unanswered approval requests are denied after this time." },
@@ -76,7 +80,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.5.1.vsix",
+    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.6.0.vsix",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {

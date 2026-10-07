@@ -10,6 +10,7 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 - **One room, shared context.** Every message reaches every agent once. An agent's own replies are already in its session, so each turn sends only what is new. A new or lost session gets a bounded copy of the room history.
 - **Teamwork.** A line that starts with `@Name` hands the next turn to that agent. In **Team** mode a lead answers or brings in teammates (with mention lines or a step plan), independent steps run in parallel, and the lead writes the final answer. **Relay** and **Parallel** modes and `@Agent` messages are there too.
 - **Your own team.** Set up stages that run in order, such as **Leads → Drafting → Review → Testing → Coding**, with one or more agents per stage, an optional task and model routing. Use the team builder, the `chatroom.teams` setting or `/team`.
+- **Worktrees (optional).** Agents that edit at the same time each get their own git worktree and branch; the room combines their work and you review, apply, keep or discard it.
 - **Keeps going when an agent can't.** An agent that is out of usage, not installed, signed out, on a model that isn't available, or offline (Ollama) is shown as such and skipped. The others continue, and another agent takes its step or stage.
 - **Permissions and approvals.** Per agent: **Plan**, **Ask** (the default), **Auto-edit** or **Full access**, mapped to each CLI's own modes. In Ask, edits, commands and network access show up as approval cards in the room. Unanswered requests are denied after 5 minutes.
 - **Composer like Claude Code.** `@` to mention, `/` for room commands and each agent's own slash commands, chips for team mode, loops, permissions and effort, ✦ to think harder and ⚡ Ultra for one message, and a context ring per agent.
@@ -38,7 +39,7 @@ git clone https://github.com/GhoshSrinjoy/ChatRoom.git
 cd ChatRoom
 npm ci
 npm run package
-code --install-extension artifacts/chatroom-0.5.1.vsix
+code --install-extension artifacts/chatroom-0.6.0.vsix
 ```
 
 Then run **Developer: Reload Window** in VS Code. You can also install the file with **Extensions: Install from VSIX…** from the Command Palette.
@@ -147,7 +148,7 @@ All agents work in the same folder, so Chatroom keeps them from overwriting each
 - **Auto-edit and Full access:** agents that edit without asking take turns. Only one of them runs at a time; Plan and Ask agents keep running in parallel.
 - **Team runs:** in Team mode the lead gives each agent a different part. In a custom team the stages run in order, so a later stage works on the files an earlier stage changed; only agents in the same stage work at the same time.
 - **Stale edits are refused, not merged:** Claude Code won't write a file that changed since it read it ("File has been modified since read"), and Codex applies patches against the exact lines it saw, so a patch to a changed file fails instead of overwriting. The agent reads the file again and retries.
-- There are no separate copies (git worktrees) per agent yet. Commit before a big run so you can review or undo the agents' changes with git.
+- **Worktrees (optional):** turn them on and agents that edit at the same time each get their own copy of the repository, so they can't overwrite each other at all. See [Worktrees](#worktrees-optional) below.
 
 Where commands run depends on the CLI. Chatroom does not add a container of its own:
 
@@ -159,6 +160,52 @@ Where commands run depends on the CLI. Chatroom does not add a container of its 
 
 For code you don't trust, keep agents in Plan or Ask, or open the folder in a dev container or WSL so every CLI runs inside it.
 
+## Worktrees (optional)
+
+With worktrees on, an agent works in its own **git worktree** on its own branch instead of in your folder. Agents editing at the same time can't collide, and nothing reaches your files until you say so.
+
+| Mode | Who gets a worktree |
+| --- | --- |
+| **Off** (default) | Nobody. Agents share your folder, protected by approvals and one-editor-at-a-time. |
+| **Auto** | Agents that edit without asking (Auto-edit or Full access), when another agent could edit at the same time (Parallel, Team or a custom team). Relay and @mentions run one agent at a time, so they stay in your folder. |
+| **Always** | Every agent that can edit. |
+| **Per agent** | *Work in its own worktree* in the agent's settings. In Full access the agent can also turn this on itself with the `isolate_workspace` room tool. |
+
+Set it in **Room setup**, the **Team** chip, the `chatroom.worktrees` setting, or with `/worktrees off | auto | always`. Worktrees need the folder to be a git repository.
+
+**How it works**
+
+1. **Starting point.** The first isolated turn snapshots your folder, *including your uncommitted and untracked files*, without touching your files or git index. Every worktree starts from that snapshot.
+2. **Own branch.** Each isolated agent works in `chatroom/<room>/<agent>`, in a folder under VS Code's storage (outside your repository). Its CLI runs there, so its session restarts once, with the room history, when it moves.
+3. **Checkpoints.** After every turn its work is committed to its branch, so each turn has a diff and nothing is lost if VS Code closes.
+4. **Combining.** After every stage (custom team), before the lead's final answer (Team), after every round (Parallel) and at the end of each message, Chatroom merges the agents' branches. If two agents changed the same lines, the agent whose branch conflicts gets one **merge turn** in its own worktree to resolve it. If that still fails, you decide.
+5. **Your decision.** A **Changes** card shows every file and line count:
+   - **Review diff** opens the combined diff.
+   - **Apply to my folder** writes the changes into your files without committing or staging them, and keeps any edits you made in the meantime. Parts that clash with your edits are skipped and listed.
+   - **Keep as branch** saves the result as `chatroom/kept/<name>`.
+   - **Discard** deletes it.
+
+   After applying, keeping or discarding, the worktrees and branches are removed. With `chatroom.worktreeAutoApply`, clean results are applied automatically.
+
+<p align="center"><img src="docs/images/changes.png" width="340" alt="Two agents with branch icons on their pills, and the Changes card with four files, Review diff, Apply to my folder, Keep as branch and Discard"><br><em>Codex and Claude worked in their own worktrees (the branch icon on their pills). The room combined their branches; you review the four files, then apply them, keep them as a branch, or discard them.</em></p>
+
+**Costs and benefits**
+
+| Benefit | Cost |
+| --- | --- |
+| Parallel edits can never overwrite each other, so agents that edit don't have to take turns. | Each worktree is a full checkout of the tracked files: disk space, and a few seconds on large repositories. |
+| The approval gate moves from every edit to one decision: agents edit freely in their copy, and nothing reaches your folder unreviewed. | Ignored files aren't there. Dependencies (`node_modules`, `.venv`, build output) must be installed per worktree, or shared through `chatroom.worktreeLinks`, which every agent then shares. Files such as `.env` are copied only if listed in `chatroom.worktreeCopy`. |
+| Every turn is a checkpoint commit: per-turn diffs, undo, and an audit trail. | Agents don't see each other's files until the room combines them; they learn about the changes from the room messages. |
+| Undo is cheap: discard, or keep the result as a branch and decide later. | More moving parts: merge turns on conflicts, and dev servers that each need their own port. |
+
+**Good to know**
+
+- **Your git hooks** (husky and others) don't run on Chatroom's internal checkpoints and merges. Applying writes plain changes into your folder, so your hooks run when *you* commit.
+- **Shared folders are unlinked before a worktree is removed.** On Windows, removing a worktree can otherwise follow a link and delete the shared folder's contents.
+- **Leftovers:** worktrees of rooms that no longer exist are swept on startup and with **Clean up old worktrees** (Tools tab) or `/worktrees cleanup`. A leftover that holds unapplied work is kept as `chatroom/orphaned/<room>-<date>`.
+- **Codex** trusts the project folder in `~/.codex/config.toml`, as it does when you use it directly. Entries for Chatroom's own worktree folders are removed again during cleanup.
+- **Windows path limit:** git refuses worktrees whose internal path under `.git\worktrees` exceeds about 220 characters. Chatroom then logs it and that agent works in your folder.
+
 ## Commands
 
 | Command | What it does |
@@ -169,6 +216,7 @@ For code you don't trust, keep agents in Plan or Ask, or open the folder in a de
 | `/new`, `/export`, `/stop` | New room, Markdown export, stop all agents |
 | `/loop …` | See loops above |
 | `/mode team \| relay \| parallel \| custom`, `/lead <agent>` | How agents collaborate and who leads |
+| `/worktrees off \| auto \| always \| status \| apply \| keep [name] \| discard \| cleanup` | Give agents their own git worktrees, and decide what happens to their combined changes |
 | `/team …` | Your own team: `/team Lead: Claude > Draft: Codex > Review: Claude`, `/team <name>`, `/team save <name>`, `/team edit`, `/team off` |
 | `@Agent /model <model>`, `/effort <level>`, `/permissions plan \| ask \| auto \| full` | Model, reasoning effort and permission level |
 | `/status` | Sessions, models, effort, permissions and context use per agent |
@@ -207,6 +255,9 @@ Chatroom selects installed local models automatically, preferring a vision model
 | `chatroom.attachOpenFile` | `true` | Share the open file and selection with agents |
 | `chatroom.shareSkills` | `true` | Share skills between the CLIs in new rooms |
 | `chatroom.sharedMcpServers` | `{}` | MCP servers for every native agent, in `.mcp.json` format (user settings only; names starting with `chatroom` are reserved) |
+| `chatroom.worktrees` | `off` | `off`, `auto` or `always` (see [Worktrees](#worktrees-optional)) |
+| `chatroom.worktreeCopy`, `chatroom.worktreeLinks` | `[]` | Ignored files copied into each worktree (e.g. `.env`), and folders linked into it (e.g. `node_modules`, shared by every agent) |
+| `chatroom.worktreeAutoApply` | `false` | Apply combined changes automatically when they merge cleanly |
 | `chatroom.teams` | `[]` | Your saved teams: named lists of stages (`name`, `agents`, `run`, `lead`, `task`, `preset`) |
 | `chatroom.maxHandoffs` | `6` | Agent-to-agent hand-offs per message |
 | `chatroom.copilotUseEnvToken` | `false` | Pass `GH_TOKEN`/`GITHUB_TOKEN` to the Copilot CLI (user settings only) |
