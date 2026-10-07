@@ -2,7 +2,7 @@
 
 A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs work in one chat room with you, plus local Ollama models. Each agent is the CLI itself, with its own tools, skills, slash commands, MCP servers, sessions, effort levels and permission modes. The agents see each other's messages, hand work to each other with `@mentions`, and can work as a team under a lead. Attach PDFs, Word files or images, and every agent can read and search them using local OCR and embeddings.
 
-![A lead agent's plan: two steps run in parallel, and a third builds on both](docs/images/lead-team.png)
+<p align="center"><img src="docs/images/lead-team.png" width="860" alt="Team mode: the lead's plan, with two steps in parallel and a third that builds on both"><br><em>Team mode. Claude leads: Codex and Copilot take two steps in parallel, Claude checks both against the code, then writes the final answer.</em></p>
 
 ## Features
 
@@ -19,36 +19,6 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 - **Documents.** PDFs (text layer, plus OCR for scanned pages), images, Word and text files are read automatically, split into passages and embedded locally. The relevant passages go to every agent with each message.
 - **Your accounts, your machine.** Chatroom uses the CLIs you are already signed in to. It has no API-key form, no backend and no telemetry.
 
-<table>
-  <tr>
-    <td><img src="docs/images/sidebar.png" width="260" alt="Chatroom in the Secondary Side Bar: the team strip with the lead's star, a plan in progress and the composer chips"></td>
-    <td><img src="docs/images/approvals.png" width="260" alt="Approval cards for a command and a file edit, with Allow, Allow for session and Deny"></td>
-    <td><img src="docs/images/commands.png" width="260" alt="The slash command menu above the composer, with the open file as a context chip"></td>
-  </tr>
-  <tr>
-    <td align="center">In the side bar</td>
-    <td align="center">Approvals in the room</td>
-    <td align="center">Commands and the open file</td>
-  </tr>
-  <tr>
-    <td><img src="docs/images/tools.png" width="260" alt="Tools tab listing each agent's own tools, skills, MCP servers and commands"></td>
-    <td><img src="docs/images/documents.png" width="260" alt="Tools tab with shared skills, room tools and the room's documents"></td>
-    <td><img src="docs/images/usage.png" width="260" alt="Usage tab with tokens by agent"></td>
-  </tr>
-  <tr>
-    <td align="center">Each agent's own tools</td>
-    <td align="center">Shared skills and documents</td>
-    <td align="center">Usage</td>
-  </tr>
-  <tr>
-    <td><img src="docs/images/team-run.png" width="260" alt="A custom team run: Codex is out of usage and skipped, Claude takes its stage, and stage chips show progress"></td>
-    <td colspan="2"><img src="docs/images/team.png" width="530" alt="The team builder: stages with agents, lead, run mode, models and an optional task"></td>
-  </tr>
-  <tr>
-    <td align="center">A team run that skips an agent</td>
-    <td align="center" colspan="2">The team builder</td>
-  </tr>
-</table>
 
 ## Requirements
 
@@ -68,7 +38,7 @@ git clone https://github.com/GhoshSrinjoy/ChatRoom.git
 cd ChatRoom
 npm ci
 npm run package
-code --install-extension artifacts/chatroom-0.5.0.vsix
+code --install-extension artifacts/chatroom-0.5.1.vsix
 ```
 
 Then run **Developer: Reload Window** in VS Code. You can also install the file with **Extensions: Install from VSIX…** from the Command Palette.
@@ -84,6 +54,22 @@ Then run **Developer: Reload Window** in VS Code. You can also install the file 
 
 The grid button beside the room title opens **Usage**, **Tools** and **Activity**. **Chatroom: Open in Editor** opens the room in an editor tab beside your current one.
 
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="docs/images/sidebar.png" width="320" alt="Chatroom in the side bar with the team strip, a plan in progress and the composer chips"><br><em>The room in the side bar. Each agent is a pill in the team strip (★ marks the lead). The composer's chips set the team, loop, permissions and effort.</em></td>
+    <td align="center" width="50%"><img src="docs/images/commands.png" width="320" alt="The slash command menu above the composer, with the open file as a context chip"><br><em>Type <code>/</code> for Chatroom's commands and each agent's own commands and skills. The open file and your selection go along as a chip; the eye turns it off.</em></td>
+  </tr>
+</table>
+
+<p align="center"><img src="docs/images/agent-settings.png" width="760" alt="Agent settings for Claude Code: model, effort, extended thinking, permissions, focus and session"><br><em>Click an agent's pill for its settings: model, effort, extended thinking, permissions, an optional focus, and its native session (new session, resume command, capabilities).</em></p>
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="docs/images/tools.png" width="320" alt="Tools tab listing each agent's own tools, skills, MCP servers and commands"><br><em><b>Tools</b>: each agent's own tools, skills, MCP servers and commands, as its CLI reports them.</em></td>
+    <td align="center" width="50%"><img src="docs/images/usage.png" width="320" alt="Usage tab with tokens by agent"><br><em><b>Usage</b>: tokens per agent, cached re-reads, cost when the CLI reports it, and the optional token limit per message.</em></td>
+  </tr>
+</table>
+
 ## How agents collaborate
 
 - **Team** (default). The lead reads your message. It answers simple ones itself. Otherwise it ends its reply with one `@Name task` line per teammate (they work in parallel), or with a `<chatroom-plan>` step graph when some steps depend on others. A step receives only the outputs it builds on. When the steps finish, the lead writes the final answer. With `/loop N`, the lead may delegate again up to N waves.
@@ -95,7 +81,16 @@ The grid button beside the room title opens **Usage**, **Tools** and **Activity*
 - **@mentions.** A message that starts with `@Agent` goes only to the mentioned agents, in order, whatever the mode. When an agent starts a line with `@Name`, that agent gets the next turn with the request. Hand-offs per message are capped (`chatroom.maxHandoffs`, default 6). In Team mode only the lead hands out work.
 - **Loops** (`/loop` or the loop chip): `/loop 3` (three rounds), `/loop consensus` (until every agent ends with `[AGREE]`), `/loop done` (until the lead ends with `[DONE]`), `/loop every 10m <prompt>` (repeat on a timer while the room is idle) and `/loop off`. Every loop stops at its iteration cap and, if set, its time and new-token caps. `/loop every …` drops the default time cap when that cap would end the loop before its iteration cap. Stop ends any loop. Interval loops do not survive a reload.
 
-![The lead's final answer combines the team's steps](docs/images/final-answer.png)
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="docs/images/team-popover.png" width="320" alt="The Team chip popover with the modes, your team and the lead"><br><em>The <b>Team</b> chip: how the agents work together, which of your teams to use, and the lead.</em></td>
+    <td align="center" width="50%"><img src="docs/images/loop.png" width="320" alt="The Loop chip popover with loop kinds and caps"><br><em>The <b>Loop</b> chip: once, a number of rounds, until everyone agrees, until the lead is done, or every few minutes. Caps always apply.</em></td>
+  </tr>
+</table>
+
+<p align="center"><img src="docs/images/team.png" width="760" alt="The team builder with three stages: Leads, Drafting and Review"><br><em>The team builder. Stages run in order; each has its agents, whether they work together or in turn, a model routing, an optional task, and whether it is a lead stage. Save it to your teams or use it in this room.</em></p>
+
+<p align="center"><img src="docs/images/final-answer.png" width="760" alt="The lead's final answer after the team's steps"><br><em>The end of a Team run: every step is done, and the lead combines the results into one answer, crediting who found what.</em></p>
 
 Each agent gets a short room framing appended to its CLI's own system prompt: who is in the room, how messages arrive, how to hand off, and who leads. Agents have no default persona; an optional focus can be set per agent.
 
@@ -115,6 +110,13 @@ Chatroom shows why an agent can't run and continues with the others:
 - **Try again now** in the agent's settings clears the mark at once.
 - When Ollama isn't running, Ollama agents are skipped and documents fall back to keyword search; scanned pages can't be read until it starts.
 
+<table>
+  <tr>
+    <td align="center" width="40%"><img src="docs/images/team-run.png" width="300" alt="A custom team run where Codex is out of usage and Claude takes its stage"><br><em>Codex is out of usage: its pill dims and shows when it is back, the room says so once, and Claude takes the Drafting stage.</em></td>
+    <td align="center" width="60%"><img src="docs/images/unavailable.png" width="460" alt="Agent settings for Codex with an out-of-usage banner and a Try again now button"><br><em>The agent's settings say why it is skipped and what Chatroom does about it. <b>Try again now</b> clears the mark.</em></td>
+  </tr>
+</table>
+
 ## Permissions, approvals and safety
 
 | Level | Claude Code | Codex | Copilot CLI |
@@ -123,6 +125,8 @@ Chatroom shows why an agent can't run and continues with the others:
 | Ask (default) | `default` mode, approvals in the room | `on-request` approvals, read-only sandbox | every permission request becomes a card |
 | Auto-edit | `acceptEdits` | `on-request`, workspace-write sandbox | reads and edits inside the workspace and extra folders allowed; network and the rest ask |
 | Full access | `bypassPermissions` | no approvals, full access | allow all |
+
+<p align="center"><img src="docs/images/approvals.png" width="340" alt="Approval cards for a command and a file edit, with Allow, Allow for session and Deny"><br><em>In Ask, every edit and command is a card in the room: the exact command or diff, <b>Allow</b>, <b>Allow for session</b> or <b>Deny</b>, and the time left before it is denied.</em></p>
 
 - **Full access** is never a default. It needs `chatroom.allowFullAccess` and a confirmation in the room. Turning the setting off moves every Full-access agent back to Ask.
 - Approval requests that nobody answers are denied after `chatroom.approvalTimeoutSeconds` (default 300). Stop and per-agent stop cancel pending requests.
@@ -134,6 +138,26 @@ Chatroom shows why an agent can't run and continues with the others:
 - Codex note: when a Codex thread can write in a git repository, Codex may add a trust entry for the folder to `~/.codex/config.toml`, as the official Codex extension does.
 - Chatroom removes nested-session variables (`CLAUDECODE`, `CLAUDE_CODE_*` session variables and similar) from the environment of the CLIs it starts, so a Chatroom launched from inside another agent does not confuse them. `GH_TOKEN`/`GITHUB_TOKEN` are not passed to the Copilot CLI unless `chatroom.copilotUseEnvToken` is on.
 - Room messages, documents and tool output are data, not instructions that change an agent's permissions. Inspect what you attach.
+
+## Editing the same files, and where code runs
+
+All agents work in the same folder, so Chatroom keeps them from overwriting each other:
+
+- **Ask (the default):** every edit and command is an approval card, so you see each change before it happens, including two agents touching the same file.
+- **Auto-edit and Full access:** agents that edit without asking take turns. Only one of them runs at a time; Plan and Ask agents keep running in parallel.
+- **Team runs:** in Team mode the lead gives each agent a different part. In a custom team the stages run in order, so a later stage works on the files an earlier stage changed; only agents in the same stage work at the same time.
+- **Stale edits are refused, not merged:** Claude Code won't write a file that changed since it read it ("File has been modified since read"), and Codex applies patches against the exact lines it saw, so a patch to a changed file fails instead of overwriting. The agent reads the file again and retries.
+- There are no separate copies (git worktrees) per agent yet. Commit before a big run so you can review or undo the agents' changes with git.
+
+Where commands run depends on the CLI. Chatroom does not add a container of its own:
+
+| CLI | Commands run | In Plan / Ask / Auto-edit / Full access |
+| --- | --- | --- |
+| Codex | Inside **Codex's own sandbox** | Plan: read-only. Ask: read-only sandbox; anything more asks you. Auto-edit: writes inside the workspace (and extra folders), no network. Full access: no sandbox |
+| Claude Code | On your machine as you | Plan: read-only. Ask: a card for every edit and command. Auto-edit: edits allowed, commands still ask. Full access: nothing asks |
+| Copilot CLI | On your machine as you (its own sandbox is experimental and off on Windows) | Plan: read-only. Ask: a card for every request. Auto-edit: reads and edits inside the workspace allowed, the rest asks. Full access: nothing asks |
+
+For code you don't trust, keep agents in Plan or Ask, or open the folder in a dev container or WSL so every CLI runs inside it.
 
 ## Commands
 
@@ -167,6 +191,8 @@ Click **+** in the composer, or **Attach documents** in the **Tools** tab, and c
 4. **Use.** For every new message, Chatroom retrieves the most relevant passages once and gives them to every agent. Native agents can look up more with the `search_documents` room tool, and attach a workspace PDF, Word file or image with `read_document`.
 
 Chatroom selects installed local models automatically, preferring a vision model whose name contains `ocr` and an embedding model. Change them in **Tools**. It does not download models. Documents up to 40 MB are accepted, and up to 40 scanned pages are read per PDF.
+
+<p align="center"><img src="docs/images/documents.png" width="420" alt="Tools tab with shared skills, room tools and the room's documents"><br><em><b>Tools</b> → shared skills, the four room tools every native agent gets, and the room's documents with their pages, OCR and index status.</em></p>
 
 ## Settings
 

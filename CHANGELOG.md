@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- Copilot CLI: a model that the CLI lists twice (1.0.92 lists "Auto" twice on accounts that only have Auto) now appears once. Verified live: signing in, a native session that remembers across turns, and usage reporting.
+- README: every screenshot now sits in the section it shows, with a caption. New screenshots of agent settings, the Team and Loop chips, and an agent that can't run. New section on several agents editing the same files and where each CLI runs commands (sandboxes).
+
 ## 0.5.0
 
 - **Your own team.** A new **Custom team** mode runs the stages you set up, in order, for example Leads → Drafting → Review → Testing → Coding:

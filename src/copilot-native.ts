@@ -537,9 +537,11 @@ export class CopilotDriver implements NativeDriver {
     const raw = (live?.commands ?? []).filter(c => typeof c?.name === 'string');
     const commands = filterNativeCommands('copilot', raw.map(c => ({ name: c.name, description: str(c.description), argumentHint: str(c.input?.hint), source: skillNames.has(c.name.toLowerCase()) ? 'skill' as const : 'builtin' as const })));
     const modelOption = findOption(live, 'model', 'model');
-    const models: ModelInfo[] = modelOption ? optionChoices(modelOption).map(o => ({ id: o.value, name: o.name, ...(o.description ? { description: o.description } : {}), ...(o.value === live?.defaultModel ? { isDefault: true } : {}) }))
+    const listed: ModelInfo[] = modelOption ? optionChoices(modelOption).map(o => ({ id: o.value, name: o.name, ...(o.description ? { description: o.description } : {}), ...(o.value === live?.defaultModel ? { isDefault: true } : {}) }))
       : (Array.isArray(live?.models?.availableModels) ? live!.models!.availableModels! : []).filter(m => typeof m?.modelId === 'string')
         .map(m => ({ id: m.modelId, name: str(m.name) || m.modelId, ...(str(m.description) ? { description: m.description } : {}), ...(m.modelId === live?.defaultModel ? { isDefault: true } : {}) }));
+    // The CLI can list the same model twice (e.g. "auto" as a placeholder and as the enabled entry); keep the first.
+    const models = listed.filter((m, i) => listed.findIndex(o => o.id === m.id) === i);
     const agents = optionValues(findOption(live, 'agent'));
     return { provider: 'copilot', runtime: 'cli', status: 'ready', ...(live?.version ? { version: live.version } : {}),
       models, efforts, ...(str(effort?.currentValue) ? { defaultEffort: effort.currentValue } : {}), tools: [],

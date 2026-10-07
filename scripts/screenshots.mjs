@@ -128,7 +128,8 @@ try {
   // scrollTo: a message to bring to the top (default: the end). tab: capture only that inspector panel.
   // slash: type this into the composer to open its menu. section: inspector heading text to scroll to the top.
   // openTeam: open the team builder as /team edit does.
-  const shoot = async (file, data, { width, height, tab, scrollTo, collapseAgents, slash, section, openTeam }) => {
+  // click: a selector to click before the screenshot (an agent pill opens its settings, a chip opens its popover).
+  const shoot = async (file, data, { width, height, tab, scrollTo, collapseAgents, slash, section, openTeam, click }) => {
     const page = await browser.newPage({ viewport: { width, height }, deviceScaleFactor: 2 });
     await page.addInitScript(() => { window.acquireVsCodeApi = () => ({ postMessage: () => {}, getState: () => ({}), setState: () => {} }); });
     await page.goto(`http://127.0.0.1:${server.address().port}`);
@@ -142,6 +143,7 @@ try {
       const list = document.getElementById('messages'), target = selector && list.querySelector(selector);
       list.scrollTop = target ? target.offsetTop - list.offsetTop - 8 : list.scrollHeight;
     }, scrollTo);
+    if (click) { await page.locator(click).first().click(); await page.waitForTimeout(250); }
     if (openTeam) { await page.evaluate(() => window.postMessage({ type: 'openTeam' }, '*')); await page.locator('.dialog').waitFor(); }
     if (slash) { await page.locator('#prompt').click(); await page.locator('#prompt').pressSequentially(slash); await page.locator('#menu:not([hidden])').waitFor(); }
     await page.waitForTimeout(150);
@@ -159,4 +161,8 @@ try {
   await shoot('commands.png', state(done), { width: 420, height: 1000, slash: '/' });
   await shoot('team-run.png', state(teamRun), { width: 420, height: 1000 });
   await shoot('team.png', state(room({ ...done, mode: 'pipeline', team: ownTeam })), { width: 1100, height: 1300, openTeam: true });
+  await shoot('agent-settings.png', state(done), { width: 1100, height: 1300, click: '[data-agent="a2"]' });
+  await shoot('unavailable.png', state(teamRun), { width: 1100, height: 1000, click: '[data-agent="a1"]' });
+  await shoot('loop.png', state(done), { width: 420, height: 1000, click: '#chip-loop' });
+  await shoot('team-popover.png', state(room({ ...done, mode: 'pipeline', team: ownTeam })), { width: 420, height: 1000, click: '#chip-team' });
 } finally { await browser.close(); await new Promise(r => server.close(r)); }

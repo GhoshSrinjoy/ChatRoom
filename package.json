@@ -2,7 +2,7 @@
   "name": "chatroom",
   "displayName": "Chatroom",
   "description": "One room where Claude Code, Codex and the GitHub Copilot CLI work together with their own tools, skills and sessions, plus Ollama. Agents discuss, hand off with @mentions and work as a team.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "chatroom-local",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/GhoshSrinjoy/ChatRoom.git" },
@@ -76,7 +76,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.5.0.vsix",
+    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.5.1.vsix",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {

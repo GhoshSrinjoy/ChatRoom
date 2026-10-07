@@ -147,6 +147,17 @@ test('available commands become filtered capabilities; capabilities() reports mo
   } finally { await driver.dispose(); }
 });
 
+test('a model the CLI lists twice (as 1.0.92 does for "auto") appears once', async () => {
+  // Shape captured from the real Copilot CLI 1.0.92 session/new on an account that only has Auto.
+  const model = { id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'auto', options: [
+    { value: 'auto', name: 'Auto', description: 'Let Copilot pick the best model', _meta: null },
+    { value: 'auto', name: 'Auto', description: 'Auto', _meta: { copilotUsage: '1x', copilotEnablement: 'enabled' } }] };
+  const { driver, agent, room } = setup(() => ({ 'session/new': () => ({ sessionId: 'sess-0', modes: MODES(), configOptions: [model] }) }));
+  try {
+    const caps = await driver.capabilities(room, agent);
+    assert.deepEqual(caps.models.map(m => [m.id, m.name]), [['auto', 'Auto']]);
+  } finally { await driver.dispose(); }
+});
 test('signed out: turns throw signed-out with a login action; capabilities report it without throwing; a missing CLI reports missing', async () => {
   const { driver, agent, room, children } = setup(() => ({ 'session/new': () => { throw { code: -32000, message: 'Authentication required' }; } }));
   try {
