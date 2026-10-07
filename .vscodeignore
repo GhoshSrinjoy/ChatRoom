@@ -17,3 +17,5 @@ media/preview.html
 media/preview.png
 **/*.log
 docs/**
+dist/**/*.map
+.github/**
