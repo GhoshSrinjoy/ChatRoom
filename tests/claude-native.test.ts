@@ -482,3 +482,16 @@ test('release closes the processes of a room; the next turn resumes the stored s
   assert.equal(argAfter(fake.children[1]!.args, '--resume'), agent.session!.id);
   await driver.dispose();
 });
+test('the process starts in the agent\'s folder from host.cwdFor; another folder never reuses the live process', async () => {
+  let folder = '/work/wt/roomaa-claude';
+  const fake = claudeFake({ onUser: answer('ok') }), host = fakeHost({ cwdFor: () => folder }), driver = new ClaudeDriver(host, fake.spawn);
+  const agent = testAgent('claude'), room = testRoom([agent]);
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  assert.equal(fake.children.length, 1); assert.equal(fake.children[0]!.cwd, '/work/wt/roomaa-claude');
+  folder = host.cwd();
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  assert.equal(fake.children.length, 2, 'a new folder means a new process'); assert.equal(fake.children[1]!.cwd, host.cwd());
+  assert.equal(fake.children[0]!.stdinEnded, true);
+  await driver.dispose();
+});

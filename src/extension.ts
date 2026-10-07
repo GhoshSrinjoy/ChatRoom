@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, addUsage, emptyUsage } from './types';
+import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, WorktreeMode, addUsage, emptyUsage } from './types';
 import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, leadAgent, message, migrateRoom, normalizeTeam, overLimit, patchLoop, roomFraming, teamPlan, unavailableText } from './core';
 import { RoomEngine } from './engine';
 import { OllamaClient } from './ollama';
@@ -12,10 +12,11 @@ import { RoomToolHost } from './room-tools';
 import { discoverSkills, prepareSkillWiring } from './skills';
 import { EditorTracker } from './editor-tracker';
 import { EFFORT_ORDER } from './codex-native';
-import { ROOM_COMMANDS, parseComposer, parseLoop, parseTeam, resolveMention } from './commands';
+import { ROOM_COMMANDS, parseComposer, parseLoop, parseTeam, parseWorktrees, resolveMention } from './commands';
 import { DocumentService, LocalModels } from './documents';
 import { KnowledgeStore, sha256 } from './knowledge';
 import { MAX_DOCUMENT_BYTES } from './extract';
+import { RoomWorktrees, WorktreeManager, cleanCodexTrust, worktreeRoot } from './worktrees';
 
 const MODES: RoomMode[] = ['orchestrated', 'sequential', 'parallel', 'pipeline'];
 const PRESETS: TaskPreset[] = ['planning', 'drafting', 'review'];
@@ -28,6 +29,11 @@ const BUSY = 'Wait for the agents to finish or press Stop.';
 const FULL_ACCESS = 'Enable "chatroom.allowFullAccess" in Settings to use Full access.';
 const NO_TEAM = 'Set up a team first: /team edit or /team Lead: Claude > Review: Codex';
 const BAD_TEAM = 'That team has no stage with an agent.';
+const WORKTREE_MODES: WorktreeMode[] = ['off', 'auto', 'always'];
+const WORKTREE_ACTIONS = ['review', 'apply', 'keep', 'discard', 'cleanup'];
+const NO_REPO = 'Worktrees need a git repository · agents share the folder.';
+const MODE_TEXT: Record<WorktreeMode, string> = { off: 'off · agents share the folder', auto: 'auto · agents that edit without asking get their own worktree when others could edit at the same time',
+  always: 'always · every agent that can edit gets its own worktree' };
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 let app: ChatroomApp | undefined;
@@ -82,6 +88,12 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   private ollamaNoticed = false;
   private ollamaChecked = 0;
   private persistence: Promise<unknown> = Promise.resolve();
+  /** Per-agent worktrees: the repository's manager (undefined when the workspace is not a git repository) and the room logic over it. */
+  private worktreeManager?: WorktreeManager;
+  private worktrees: RoomWorktrees;
+  private worktreesAvailable = false;
+  private worktreesSwept = false;
+  private worktreeNoticed = false;
   constructor(private readonly context: vscode.ExtensionContext) {
     const saved = context.workspaceState.get<unknown[]>('chatroom.rooms.v1', []);
     this.rooms = (Array.isArray(saved) ? saved : []).filter((r: any) => r && typeof r.id === 'string' && Array.isArray(r.agents) && Array.isArray(r.messages)).slice(0, 20).map(r => this.restore(r));
@@ -95,9 +107,22 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     this.tools = new ToolService(() => this.root(), this.documents, () => this.engine.room, text => this.engine.log(text, 'tool'));
     this.roomTools = new RoomToolHost((agentId, name, args, signal) => this.roomTool(agentId, name, args, signal));
     this.tracker = new EditorTracker(() => this.changed());
+    this.worktrees = new RoomWorktrees({
+      manager: () => this.worktreeManager,
+      mode: room => room.worktrees ?? this.worktreeSetting(),
+      native: agent => !!this.native(agent),
+      copy: () => this.stringList('worktreeCopy'),
+      links: () => this.stringList('worktreeLinks'),
+      autoApply: () => this.config<boolean>('worktreeAutoApply', false) === true,
+      log: (text, kind) => this.engine.log(text, kind ?? 'info'),
+      toast: (type, text) => this.toast(type, text),
+      release: roomId => this.release(roomId),
+      changed: () => this.changed()
+    });
     this.host = {
       version: String(context.extension?.packageJSON?.version ?? '0.4.0'),
       cwd: () => this.root(),
+      cwdFor: (room, agent) => this.worktrees.cwdFor(room, agent) ?? this.root(),
       storageDir: () => context.globalStorageUri.fsPath,
       runtime: provider => providerRuntime(provider),
       settings: () => this.settings(),
@@ -114,10 +139,11 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         if (!event.affectsConfiguration('chatroom')) return;
         if (event.affectsConfiguration('chatroom.allowFullAccess')) this.enforceFullAccess();
         if (event.affectsConfiguration('chatroom.sharedMcpServers')) this.caps.clear();
+        if (event.affectsConfiguration('chatroom.worktrees')) this.worktreeNotice();
         this.changed();
       }),
-      vscode.workspace.onDidChangeWorkspaceFolders(() => void this.refreshSkills()),
-      vscode.workspace.onDidGrantWorkspaceTrust(() => { this.changed(); void this.refreshCapabilities(undefined, true); }));
+      vscode.workspace.onDidChangeWorkspaceFolders(() => { void this.refreshSkills(); void this.detectWorktrees(); }),
+      vscode.workspace.onDidGrantWorkspaceTrust(() => { this.changed(); void this.detectWorktrees(); void this.refreshCapabilities(undefined, true); }));
     void vscode.workspace.fs.createDirectory(context.globalStorageUri).then(() => this.refreshSkills(), () => this.refreshSkills());
     void this.refresh(false);
   }
@@ -296,8 +322,43 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       maxHandoffs: () => boundedNumber(this.config('maxHandoffs', 6), 0, 20, 6),
       changed: () => this.changed(),
       availability: agent => this.liveAvailability(agent),
-      presetModel: (agent, preset) => this.defaults()[preset][agent.provider] ?? ''
+      presetModel: (agent, preset) => this.defaults()[preset][agent.provider] ?? '',
+      isolation: this.worktrees
     });
+  }
+  private worktreeSetting(): WorktreeMode {
+    const value = this.config<string>('worktrees', 'off') as WorktreeMode;
+    return WORKTREE_MODES.includes(value) ? value : 'off';
+  }
+  private stringList(key: string): string[] {
+    const value = this.config<unknown>(key, []);
+    return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string').slice(0, 50) : [];
+  }
+  /** Worktrees are available when the workspace is a git repository; checked at startup, on refresh and when folders or trust change. The first detection sweeps orphans. */
+  private async detectWorktrees(): Promise<void> {
+    const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const repo = folder && vscode.workspace.isTrusted ? await WorktreeManager.detect(folder) : undefined;
+    if (!repo || !folder) this.worktreeManager = undefined;
+    else if (this.worktreeManager?.repo !== repo) this.worktreeManager = new WorktreeManager({ repo, root: worktreeRoot(this.host.storageDir(), repo), owner: folder });
+    this.worktreesAvailable = !!this.worktreeManager;
+    this.worktreeNotice(); this.changed();
+    const manager = this.worktreeManager;
+    if (!manager || this.worktreesSwept) return;
+    this.worktreesSwept = true;
+    // Chatroom never made a worktree for this repository: nothing to sweep, and git is not run.
+    if (!existsSync(manager.root)) return;
+    // Orphans of rooms that no longer exist, in the background; nothing is removed on deactivate.
+    void manager.sweep(new Set(this.rooms.map(r => r.id))).then(async result => {
+      await cleanCodexTrust(manager.root).catch(() => false);
+      if (result.removed.length) this.engine.log(`Removed ${result.removed.length} old worktree${result.removed.length === 1 ? '' : 's'}${result.keptBranches.length ? ` · kept branches with work: ${result.keptBranches.join(', ')}` : ''}`);
+    }, error => this.engine.log(`Worktree cleanup skipped · ${errorText(error)}`, 'error'));
+  }
+  /** Logs once when a room or setting asks for worktrees but the workspace is not a git repository. */
+  private worktreeNotice(): void {
+    if (this.worktreesAvailable || this.worktreeNoticed || !vscode.workspace.workspaceFolders?.length) return;
+    if (this.worktreeSetting() === 'off' && !this.rooms.some(r => (r.worktrees ?? 'off') !== 'off' || r.agents.some(a => a.isolate))) return;
+    this.worktreeNoticed = true;
+    this.engine.log(NO_REPO);
   }
   private copilotModels(models: vscode.LanguageModelChat[]): void {
     const previous = this.connections.find(c => c.id === 'copilot');
@@ -311,7 +372,37 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     if (!vscode.workspace.isTrusted) throw new Error('Room tools require a trusted workspace.');
     const agent = this.rooms.flatMap(r => r.agents).find(a => a.id === agentId);
     this.engine.log(`${agent?.name ?? 'An agent'} → chatroom.${name}`, 'tool');
+    if (name === 'isolate_workspace') return this.isolateTool(agentId);
     return this.tools.executeRoomTool(name, args, signal);
+  }
+  /** isolate_workspace: an agent in Full access asks for its own worktree from its next turn. */
+  private isolateTool(agentId: string): string {
+    const room = this.rooms.find(r => r.agents.some(a => a.id === agentId)), agent = room?.agents.find(a => a.id === agentId);
+    if (!room || !agent) throw new Error('This agent is not in a Chatroom room.');
+    if (agent.options.permission !== 'full' || !this.userConfig('allowFullAccess', false)) throw new Error('isolate_workspace is available in Full access; ask the user to isolate you in your settings.');
+    if (!this.worktreeManager) throw new Error('Worktrees need a git repository, and this workspace is not one.');
+    agent.isolate = true; this.changed();
+    return `From your next turn you work in your own worktree (branch ${this.worktrees.branchFor(room, agent)}); the room combines and reviews the changes.`;
+  }
+  /** The changes card's buttons and /worktrees: review opens the diff; the others need the room to be idle. */
+  private async worktreeAction(room: Room, action: unknown, name?: string): Promise<void> {
+    if (typeof action !== 'string' || !WORKTREE_ACTIONS.includes(action)) return;
+    this.requireTrust();
+    if (!this.worktreeManager) throw new Error(NO_REPO);
+    if (action === 'review') {
+      const text = await this.worktrees.review(room, !this.engine.busy);
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({ content: text, language: 'diff' }), { preview: true });
+      return;
+    }
+    if (this.engine.busy) throw new Error(BUSY);
+    if (action === 'apply') await this.worktrees.apply(room);
+    else if (action === 'keep') await this.worktrees.keep(room, name?.trim().slice(0, 80) || undefined);
+    else if (action === 'discard') { await this.worktrees.discard(room); this.toast('notice', 'Discarded the agents\' changes and removed their worktrees.'); }
+    else {
+      const result = await this.worktrees.cleanup(this.rooms);
+      this.notice(`${result.removed ? `Removed ${result.removed} old worktree${result.removed === 1 ? '' : 's'}.` : 'No old worktrees to clean up.'}${result.kept.length ? ` Kept branches with work: ${result.kept.join(', ')}.` : ''}`);
+    }
+    this.changed();
   }
   private release(roomId: string, agentId?: string): Promise<void> {
     return Promise.allSettled(Object.values(this.drivers).map(driver => driver.release(roomId, agentId))).then(() => {});
@@ -366,7 +457,8 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       capabilities: this.capsRecord(room), editor: attachOpenFile ? this.tracker.snapshot() ?? null : null, sharedSkills: this.sharedSkills, roomCommands: ROOM_COMMANDS, teams: this.teams(),
       localModels: this.models, discovering: this.discovering, modelDefaults: this.defaults(),
       defaultPreset: this.config<TaskPreset>('defaultPreset', 'planning'), executionMode: this.config<RoomMode>('executionMode', 'orchestrated'), maxParallelAgents: this.config('maxParallelAgents', 3),
-      settings: { allowFullAccess: this.userConfig('allowFullAccess', false), attachOpenFile, approvalTimeoutSeconds: boundedNumber(this.config('approvalTimeoutSeconds', 300), 30, 3600, 300) },
+      settings: { allowFullAccess: this.userConfig('allowFullAccess', false), attachOpenFile, approvalTimeoutSeconds: boundedNumber(this.config('approvalTimeoutSeconds', 300), 30, 3600, 300),
+        worktrees: this.worktreeSetting(), worktreesAvailable: this.worktreesAvailable },
       workspace: vscode.workspace.workspaceFolders?.[0]?.name ?? 'No folder open', trusted: vscode.workspace.isTrusted };
     const started = Date.now();
     for (const view of this.views) void view.postMessage(state);
@@ -379,7 +471,9 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     if (this.discovering) { this.pendingCopilot ||= copilot; return; }
     this.discovering = true; this.changed();
     try {
+      const worktrees = this.detectWorktrees().catch(error => this.engine.log(`Worktrees: ${errorText(error)}`, 'error'));
       this.connections = await detectConnections(this.ollama, copilot, this.connections);
+      await worktrees;
       this.pickLocalModels();
       for (const room of this.rooms) for (const agent of room.agents) if (!agent.model && room.status !== 'running') this.selectModel(agent, this.defaults()[room.preset ?? 'planning'][agent.provider] ?? '');
       for (const room of this.rooms) if (room.status !== 'running') this.availableLead(room);
@@ -652,14 +746,19 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         void (this.native(agent) ? this.refreshCapabilities(agent.id) : this.refresh(agent.provider === 'copilot')).then(() => this.changed());
         break;
       }
+      case 'worktree': await this.worktreeAction(room, data.action, typeof data.name === 'string' ? data.name : undefined); break;
     }
   }
   /** Room settings from the composer chips (§9.1). Only the editor toggle is accepted while agents work. */
   private updateRoom(room: Room, data: any): void {
     if (typeof data.attachEditor === 'boolean') room.attachEditor = data.attachEditor;
-    const keys = ['mode', 'leadId', 'concurrency', 'tokenBudget', 'preset', 'loop', 'shareSkills', 'permission', 'rounds'].filter(key => data[key] !== undefined);
+    const keys = ['mode', 'leadId', 'concurrency', 'tokenBudget', 'preset', 'loop', 'shareSkills', 'permission', 'rounds', 'worktrees'].filter(key => data[key] !== undefined);
     if (keys.length && this.engine.busy) throw new Error('Pause or stop the run before changing room settings.');
     if (data.mode === 'pipeline' && !room.team) throw new Error(NO_TEAM);
+    if (data.worktrees !== undefined) {
+      if (!WORKTREE_MODES.includes(data.worktrees)) throw new Error('Choose off, auto or always for worktrees.');
+      room.worktrees = data.worktrees; this.worktreeNotice();
+    }
     if (data.permission !== undefined) this.setPermission(room.agents, data.permission, FULL_ACCESS);
     if (data.tokenBudget !== undefined) { const limit = boundedNumber(data.tokenBudget, 0, 10_000_000, room.tokenBudget); room.tokenBudget = limit && Math.max(1000, limit); }
     if (MODES.includes(data.mode)) room.mode = data.mode;
@@ -695,6 +794,8 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       else if (data.enabled) agent.enabled = true;
     }
     if (typeof data.name === 'string') agent.name = data.name.trim().slice(0, 40) || agent.name;
+    // The user's own choice: from the agent's next turn (false also clears what the agent set itself).
+    if (data.isolate === true) { agent.isolate = true; this.worktreeNotice(); } else if (data.isolate === false) delete agent.isolate;
     if (typeof data.role === 'string') agent.role = data.role.trim().slice(0, 1600);
     if (Array.isArray(data.tools)) agent.tools = TOOL_NAMES.filter(t => data.tools.includes(t));
     if (typeof data.model === 'string') {
@@ -840,6 +941,18 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
           return;
         }
         if (parsed.team) this.applyTeam(room, parsed.team, true);
+        return;
+      }
+      case 'worktrees': {
+        const parsed = parseWorktrees(args);
+        if (parsed.error) throw new Error(parsed.error);
+        if (parsed.mode) {
+          idle(); room.worktrees = parsed.mode; this.worktreeNotice();
+          this.notice(`Worktrees for this room: ${MODE_TEXT[parsed.mode]}.${parsed.mode !== 'off' && !this.worktreesAvailable ? ' This folder is not a git repository, so agents share it.' : ''}`);
+          return;
+        }
+        if (parsed.action === 'status') { this.notice(this.worktrees.describe(room, this.worktreesAvailable)); return; }
+        await this.worktreeAction(room, parsed.action, parsed.name);
         return;
       }
       case 'model': {

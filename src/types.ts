@@ -3,12 +3,14 @@ export type NativeProviderId = 'codex' | 'claude' | 'copilot';
 /** Chatroom's read-only tools for agents without native tools (Ollama, Copilot through vscode.lm). */
 export type ToolName = 'list_files' | 'read_file' | 'search_files' | 'search_documents' | 'ollama_ocr' | 'semantic_search';
 /** Room tools offered to native CLIs through MCP or Codex dynamic tools. */
-export type RoomToolName = 'search_documents' | 'read_document' | 'semantic_search' | 'ollama_ocr';
+export type RoomToolName = 'search_documents' | 'read_document' | 'semantic_search' | 'ollama_ocr' | 'isolate_workspace';
 export type TaskPreset = 'planning' | 'drafting' | 'review';
 export type ModelDefaults = Record<TaskPreset, Partial<Record<ProviderId, string>>>;
 /** orchestrated: a lead plans for the team; sequential: relay; parallel: independent rounds; pipeline: the user's own team stages. */
 export type RoomMode = 'orchestrated' | 'sequential' | 'parallel' | 'pipeline';
-export type TurnKind = 'discussion' | 'direct' | 'plan' | 'step' | 'synthesis' | 'handoff' | 'command' | 'stage';
+export type TurnKind = 'discussion' | 'direct' | 'plan' | 'step' | 'synthesis' | 'handoff' | 'command' | 'stage' | 'merge';
+/** off: agents share the workspace folder; auto: agents that edit without asking get their own git worktree when another agent could edit at the same time; always: every agent that can edit gets one. */
+export type WorktreeMode = 'off' | 'auto' | 'always';
 export type PermissionLevel = 'plan' | 'ask' | 'auto-edit' | 'full';
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none';
@@ -49,6 +51,25 @@ export interface AgentSession {
   quota?: Usage['quota'];
   startedAt?: number;
   lastUsedAt?: number;
+  /** The folder the native session was started in; a different folder (a worktree) means a new session. */
+  cwd?: string;
+}
+/** An agent's own git worktree while it is isolated. */
+export interface AgentWorktree { path: string; branch: string; createdAt: number; checkpoints: number }
+/** The combined work of a room's isolated agents, waiting for the user. */
+export interface RoomChanges {
+  /** The snapshot the worktrees started from: HEAD plus the user's uncommitted and untracked files at that time. */
+  base: string;
+  /** The integration branch and worktree that combine every agent's branch. */
+  branch: string; path: string;
+  files: { path: string; added: number; removed: number; status: 'A' | 'M' | 'D' | 'R' }[];
+  added: number; removed: number;
+  status: 'ready' | 'conflict' | 'applied' | 'discarded' | 'kept';
+  /** status 'conflict': agents whose branch could not be merged, and the files. */
+  conflicts?: { agentId: string; files: string[] }[];
+  /** status 'kept': the branch name the user kept. */
+  kept?: string;
+  updatedAt: number;
 }
 /** Why an agent is skipped: out of usage, CLI not installed, signed out, its model is not available, or its local server is not running. */
 export type UnavailableReason = 'usage-limit' | 'missing' | 'signed-out' | 'model' | 'offline';
@@ -87,6 +108,10 @@ export interface Agent {
   enabled: boolean;
   /** Set when the agent cannot run (usage limit, missing CLI, model not available…); the room skips it until then. */
   unavailable?: Unavailable;
+  /** Always work in an own git worktree (set by the user, or by the agent itself in Full access). */
+  isolate?: boolean;
+  /** The agent's worktree while it is isolated. */
+  worktree?: AgentWorktree;
   /** Legacy Chatroom tools (Ollama, Copilot via vscode.lm). */
   tools: ToolName[];
   options: AgentOptions;
@@ -149,6 +174,8 @@ export interface Message {
   marker?: 'agree' | 'done';
   /** Agent message: a turn in a stage of the room's own team. index is 0-based. */
   stage?: { index: number; total: number; name: string; lead?: boolean };
+  /** Notice: the room's combined worktree changes (kept up to date while it is the latest one). */
+  changes?: RoomChanges;
 }
 export interface RoomDocument {
   id: string; name: string; hash: string; kind: 'text' | 'pdf' | 'image' | 'docx'; source: 'attached' | 'workspace';
@@ -192,6 +219,10 @@ export interface Room {
   team?: TeamConfig;
   /** While a team run is in progress: the current stage (1-based). */
   progress?: { stage: number; total: number; name: string };
+  /** Per-room worktree mode; undefined = the chatroom.worktrees setting. */
+  worktrees?: WorktreeMode;
+  /** Combined changes from isolated agents that the user has not applied or discarded yet. */
+  changes?: RoomChanges;
 }
 export interface ModelInfo {
   id: string; name: string; capabilities?: string[]; remote?: boolean; error?: string;
@@ -312,6 +343,8 @@ export interface DriverHost {
   skillWiring(): SkillWiring | undefined;
   /** The room framing the agent's next turn will use, so a capabilities process can be reused by that turn. */
   framing?(room: Room, agent: Agent): string;
+  /** The folder this agent works in: its worktree while isolated, else cwd(). */
+  cwdFor?(room: Room, agent: Agent): string;
   log(text: string, kind?: 'info' | 'tool' | 'error'): void;
 }
 export interface RoomCommandInfo { name: string; args?: string; description: string; agentScoped: boolean }
@@ -328,7 +361,7 @@ export interface StatePayload {
   teams: TeamConfig[];
   localModels: { vision: string; embedding: string };
   discovering: boolean; modelDefaults: ModelDefaults; defaultPreset: TaskPreset; executionMode: RoomMode; maxParallelAgents: number;
-  settings: { allowFullAccess: boolean; attachOpenFile: boolean; approvalTimeoutSeconds: number };
+  settings: { allowFullAccess: boolean; attachOpenFile: boolean; approvalTimeoutSeconds: number; worktrees: WorktreeMode; worktreesAvailable: boolean };
   workspace: string; trusted: boolean;
 }
 /** Webview → host messages (validated by the host). */
@@ -336,9 +369,9 @@ export type WebviewMessage =
   | { type: 'ready' | 'open' | 'refresh' | 'settings' | 'new' | 'export' | 'pause' | 'stop' | 'start' | 'attachDocuments' }
   | { type: 'switch' | 'stopAgent' | 'removeAgent' | 'removeDocument'; id: string }
   | { type: 'send'; text: string; editor: boolean; think: boolean; ultra: boolean }
-  | { type: 'options'; mode?: RoomMode; leadId?: string; concurrency?: number; tokenBudget?: number; preset?: TaskPreset; loop?: Partial<LoopConfig>; attachEditor?: boolean; shareSkills?: boolean; permission?: PermissionLevel }
+  | { type: 'options'; mode?: RoomMode; leadId?: string; concurrency?: number; tokenBudget?: number; preset?: TaskPreset; loop?: Partial<LoopConfig>; attachEditor?: boolean; shareSkills?: boolean; permission?: PermissionLevel; worktrees?: WorktreeMode }
   | { type: 'saveDefaults'; modelDefaults: ModelDefaults; defaultPreset: TaskPreset; executionMode: RoomMode; maxParallelAgents: number }
-  | { type: 'agent'; id: string; name?: string; model?: string; role?: string; enabled?: boolean; tools?: ToolName[]; options?: Partial<AgentOptions> }
+  | { type: 'agent'; id: string; name?: string; model?: string; role?: string; enabled?: boolean; tools?: ToolName[]; options?: Partial<AgentOptions>; isolate?: boolean }
   | { type: 'addAgent'; provider: ProviderId }
   | { type: 'localModels'; vision?: string; embedding?: string }
   | { type: 'approval'; id: string; decision: ApprovalDecision['decision']; message?: string }
@@ -352,7 +385,9 @@ export type WebviewMessage =
   | { type: 'saveTeam'; team: TeamConfig }
   | { type: 'deleteTeam'; name: string }
   /** Clear an agent's unavailable mark and check it again. */
-  | { type: 'agentRetry'; id: string };
+  | { type: 'agentRetry'; id: string }
+  /** The room's combined worktree changes: open the diff, apply them to the workspace, keep them as a branch, discard them, or remove leftover worktrees. */
+  | { type: 'worktree'; action: 'review' | 'apply' | 'keep' | 'discard' | 'cleanup'; name?: string };
 /** Host → webview messages other than state. */
 export type HostMessage = { type: 'error' | 'notice'; text: string } | { type: 'openTeam' };
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cached: 0, cacheWrite: 0, requests: 0, estimated: false });

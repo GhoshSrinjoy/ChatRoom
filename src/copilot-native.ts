@@ -18,6 +18,8 @@ const ROOM_TOOL_TITLE = /^chatroom[-_/.]{1,2}(search_documents|read_document|sem
 interface TurnState { req: NativeTurnRequest; text: string; thinking: string; breakPending: boolean; items: Map<string, ActivityItem>; command: boolean }
 interface Live {
   key: string; roomId: string; agentId: string; spawnKey: string; proc: JsonlProcess; rpc: RpcConnection; ready: Promise<void>; version?: string;
+  /** The agent's folder this process (and its sessions) started in. */
+  cwd: string;
   sessionId?: string; unprompted: boolean; loading: boolean; retired: Set<string>;
   modes?: { currentModeId?: string; availableModes?: any[] }; models?: { currentModelId?: string; availableModels?: any[] }; configOptions: any[]; defaultModel?: string; defaultEffort?: string;
   commands?: any[]; commandWaiters: (() => void)[]; mcpNames: string[]; context?: { percent: number; tokens: number; window: number };
@@ -236,22 +238,25 @@ export class CopilotDriver implements NativeDriver {
     }
   }
 
+  /** The agent's folder: its worktree while it is isolated, else the workspace. */
+  private cwd(room: Room, agent: Agent): string { return this.host.cwdFor?.(room, agent) ?? this.host.cwd(); }
+
   private async live(room: Room, agent: Agent, runtime: Runtime): Promise<Live> {
-    const key = keyOf(room.id, agent.id), settings = this.host.settings();
+    const key = keyOf(room.id, agent.id), settings = this.host.settings(), cwd = this.cwd(room, agent);
     const args = copilotArgs(agent, room.shareSkills ? this.host.skillWiring() : undefined, settings, this.allowAllFlag.has(key));
-    const spawnKey = JSON.stringify([runtime.executable, args, settings.copilotUseEnvToken]);
+    const spawnKey = JSON.stringify([runtime.executable, args, settings.copilotUseEnvToken, cwd]);
     let live = this.lives.get(key);
-    // A spawn-time change applies at the next turn; a running turn keeps its process.
+    // A spawn-time change (the folder included) applies at the next turn; a running turn keeps its process.
     if (live && !live.closed && live.spawnKey !== spawnKey && !live.turn) { await this.close(live); live = undefined; }
-    if (!live || live.closed) live = this.spawn(room.id, agent.id, key, spawnKey, runtime, args, settings);
+    if (!live || live.closed) live = this.spawn(room.id, agent.id, key, spawnKey, runtime, args, settings, cwd);
     clearTimeout(live.idle);
     try { await live.ready; } catch (error) { await this.close(live); throw error; }
     return live;
   }
 
-  private spawn(roomId: string, agentId: string, key: string, spawnKey: string, runtime: Runtime, args: string[], settings: DriverSettings): Live {
+  private spawn(roomId: string, agentId: string, key: string, spawnKey: string, runtime: Runtime, args: string[], settings: DriverSettings, cwd: string): Live {
     let live!: Live;
-    const proc = spawnJsonl(runtime.executable, args, { cwd: this.host.cwd(), env: childEnv(runtime.executable, 'copilot', { keepGithubTokens: settings.copilotUseEnvToken }),
+    const proc = spawnJsonl(runtime.executable, args, { cwd, env: childEnv(runtime.executable, 'copilot', { keepGithubTokens: settings.copilotUseEnvToken }),
       onMessage: m => live?.rpc.receive(m), onExit: code => this.exited(live, code), spawnProcess: this.spawnProcess });
     const rpc = new RpcConnection(m => proc.send(m), { dialect: 'jsonrpc2',
       onNotification: (method, params) => { if (method === 'session/update') this.update(live, params); },
@@ -259,7 +264,7 @@ export class CopilotDriver implements NativeDriver {
         if (method === 'session/request_permission') return this.permission(live, params);
         throw new RpcError(-32601, `Chatroom does not support ${method}.`);
       } });
-    live = { key, roomId, agentId, spawnKey, proc, rpc, ready: Promise.resolve(), unprompted: false, loading: false, retired: new Set(), configOptions: [], commandWaiters: [], mcpNames: [], applied: {}, closed: false };
+    live = { key, roomId, agentId, spawnKey, cwd, proc, rpc, ready: Promise.resolve(), unprompted: false, loading: false, retired: new Set(), configOptions: [], commandWaiters: [], mcpNames: [], applied: {}, closed: false };
     live.ready = this.initialize(live);
     live.ready.catch(() => undefined);
     this.lives.set(key, live);
@@ -327,7 +332,7 @@ export class CopilotDriver implements NativeDriver {
   /** Reuses, loads or creates the session. `onLoadFailure`: create a new one (turns), throw (commands) or leave it (capabilities). */
   private async session(live: Live, agent: Agent, stored: string | undefined, onLoadFailure: 'create' | 'throw' | 'skip'): Promise<{ fresh: boolean; resumeFailed: boolean }> {
     if (live.sessionId && (live.sessionId === stored || (!stored && live.unprompted))) return { fresh: live.unprompted, resumeFailed: false };
-    const servers = await this.mcpServers(agent), cwd = this.host.cwd();
+    const servers = await this.mcpServers(agent), cwd = live.cwd;
     live.mcpNames = servers.map(s => (s as { name: string }).name);
     if (stored) {
       live.loading = true;
@@ -517,7 +522,7 @@ export class CopilotDriver implements NativeDriver {
     const permission = effectivePermission(turn.req.agent, this.host.settings());
     if (permission === 'full') return select(pick('allow_once'));
     if (permission === 'plan' && ['edit', 'delete', 'move', 'execute'].includes(kind)) return select(pick('reject_once'));
-    if (permission === 'auto-edit' && (kind === 'think' || (['read', 'edit', 'search'].includes(kind) && insideRoots(call, [this.host.cwd(), ...(turn.req.agent.options.extraDirs ?? [])].map(r => resolve(r))))))
+    if (permission === 'auto-edit' && (kind === 'think' || (['read', 'edit', 'search'].includes(kind) && insideRoots(call, [live!.cwd, ...(turn.req.agent.options.extraDirs ?? [])].map(r => resolve(r))))))
       return select(pick('allow_once'));
     let detail: string | undefined;
     try { detail = call.rawInput === undefined ? undefined : JSON.stringify(call.rawInput, null, 2)?.slice(0, 4000); } catch { detail = undefined; }

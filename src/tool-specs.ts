@@ -13,6 +13,7 @@ export const roomToolSpecs: Record<RoomToolName, RoomToolDefinition> = {
   search_documents: { name: 'search_documents', description: 'Search the documents attached to this Chatroom (PDFs, Word files, images, text) by meaning and return the most relevant passages with page numbers.', inputSchema: object({ query: { type: 'string' } }, ['query']) },
   read_document: { name: 'read_document', description: 'Read a PDF, Word (.docx) or image file from the workspace as text, using local OCR for scans and images. It also attaches the file to the room so every agent can search it. Use your own tools for plain text files.', inputSchema: object({ path: { type: 'string', description: 'Workspace-relative path' } }, ['path']) },
   semantic_search: { name: 'semantic_search', description: 'Find relevant workspace code or text snippets with the local embedding model.', inputSchema: object({ query: { type: 'string' }, glob: { type: 'string' } }, ['query']) },
-  ollama_ocr: { name: 'ollama_ocr', description: 'Extract text from a workspace image with the local vision model.', inputSchema: object({ path: { type: 'string' } }, ['path']) }
+  ollama_ocr: { name: 'ollama_ocr', description: 'Extract text from a workspace image with the local vision model.', inputSchema: object({ path: { type: 'string' } }, ['path']) },
+  isolate_workspace: { name: 'isolate_workspace', description: 'Work in your own git worktree from your next turn, so your edits can\'t collide with other agents\'. Your changes reach the user\'s folder only after review. Available in Full access.', inputSchema: object({}, []) }
 };
 export const ROOM_TOOL_NAMES = Object.keys(roomToolSpecs) as RoomToolName[];

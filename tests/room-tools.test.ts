@@ -20,9 +20,11 @@ function post(url: string, body: string, headers: Record<string, string> = {}, m
   });
 }
 
-test('room tool definitions are the four fixed tools in a stable order', () => {
+test('room tool definitions are the five fixed tools in a stable order', () => {
   const defs = host().definitions();
-  assert.deepEqual(defs.map(d => d.name), ['search_documents', 'read_document', 'semantic_search', 'ollama_ocr']);
+  assert.deepEqual(defs.map(d => d.name), ['search_documents', 'read_document', 'semantic_search', 'ollama_ocr', 'isolate_workspace']);
+  assert.match(defs[4]!.description, /^Work in your own git worktree from your next turn, so your edits can't collide with other agents'\. .* Available in Full access\.$/);
+  assert.deepEqual(defs[4]!.inputSchema, { type: 'object', properties: {}, required: [], additionalProperties: false });
   assert.match(defs[1]!.description, /^Read a PDF, Word \(\.docx\) or image file/);
   assert.deepEqual((defs[2]!.inputSchema as any).required, ['query']);
 });
@@ -44,7 +46,7 @@ test('MCP handler answers initialize, tools/list, tools/call and rejects unknown
   assert.equal((await tools.mcp('a', { jsonrpc: '2.0', id: 'x', method: 'initialize' })).result.protocolVersion, '2025-06-18');
   assert.equal(await tools.mcp('a', { jsonrpc: '2.0', method: 'notifications/initialized' }), undefined);
   assert.deepEqual(await tools.mcp('a', { jsonrpc: '2.0', id: 2, method: 'ping' }), { jsonrpc: '2.0', id: 2, result: {} });
-  assert.equal((await tools.mcp('a', { jsonrpc: '2.0', id: 3, method: 'tools/list' })).result.tools.length, 4);
+  assert.equal((await tools.mcp('a', { jsonrpc: '2.0', id: 3, method: 'tools/list' })).result.tools.length, 5);
   assert.deepEqual(await tools.mcp('a', { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'read_document', arguments: { path: 'a.pdf' } } }),
     { jsonrpc: '2.0', id: 4, result: { content: [{ type: 'text', text: 'ran read_document' }], isError: false } });
   const failed = await tools.mcp('a', { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'ollama_ocr', arguments: { fail: true } } });
@@ -63,7 +65,7 @@ test('HTTP endpoint is loopback only, token protected and maps each token to its
     assert.equal((await post(a.url, list)).status, 401);
     assert.equal((await post(a.url, list, { Authorization: 'Bearer wrong' })).status, 401);
     const ok = await post(a.url, list, a.headers);
-    assert.equal(ok.status, 200); assert.equal(JSON.parse(ok.body).result.tools.length, 4);
+    assert.equal(ok.status, 200); assert.equal(JSON.parse(ok.body).result.tools.length, 5);
     assert.equal((await post(a.url, JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }), a.headers)).status, 202);
     const call = (id: number) => ({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'read_document', arguments: { path: 'x.pdf' } } });
     await post(b.url, JSON.stringify(call(2)), b.headers);

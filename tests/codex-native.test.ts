@@ -612,3 +612,20 @@ test('capabilities report signed-out and missing runtimes without throwing; full
   assert.deepEqual(allowed.sent('turn/start')[0].params.sandboxPolicy, { type: 'dangerFullAccess' });
   await allowed.driver.dispose();
 });
+test('threads start and resume in the agent\'s folder from host.cwdFor; the app-server stays in the workspace; a loaded thread never moves folders', async () => {
+  let folder = join(tmpdir(), 'wt', 'roomaa-codex');
+  const { driver, host, children, sent } = setup({}, { cwdFor: () => folder });
+  const agent = testAgent('codex'), room = testRoom([agent]);
+  try {
+    await driver.turn(request(agent, room, sinkFor(agent)));
+    assert.equal(children[0]!.cwd, host.cwd(), 'process-wide calls keep the workspace');
+    assert.equal(sent('config/read')[0].params.cwd, host.cwd());
+    assert.equal(sent('thread/start')[0].params.cwd, folder);
+    await driver.turn(request(agent, room, sinkFor(agent)));
+    assert.equal(sent('thread/resume').length, 0, 'the same folder reuses the loaded thread');
+    folder = join(tmpdir(), 'wt', 'roomaa-codex-2');
+    await driver.turn(request(agent, room, sinkFor(agent)));
+    assert.equal(sent('thread/unsubscribe').length, 1);
+    assert.equal(sent('thread/resume')[0].params.cwd, folder);
+  } finally { await driver.dispose(); }
+});
