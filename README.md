@@ -1,5 +1,7 @@
 # Chatroom
 
+[![Latest release](https://img.shields.io/github/v/release/GhoshSrinjoy/ChatRoom?label=release)](https://github.com/GhoshSrinjoy/ChatRoom/releases/latest) [![Release build](https://github.com/GhoshSrinjoy/ChatRoom/actions/workflows/release.yml/badge.svg)](https://github.com/GhoshSrinjoy/ChatRoom/actions/workflows/release.yml) [![License: Apache 2.0](https://img.shields.io/github/license/GhoshSrinjoy/ChatRoom)](LICENSE)
+
 A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs work in one chat room with you, plus local Ollama models. Each agent is the CLI itself, with its own tools, skills, slash commands, MCP servers, sessions, effort levels and permission modes. The agents see each other's messages, hand work to each other with `@mentions`, and can work as a team under a lead. Attach PDFs, Word files or images, and every agent can read and search them using local OCR and embeddings.
 
 <p align="center"><img src="docs/images/lead-team.png" width="860" alt="Team mode: the lead's plan, with two steps in parallel and a third that builds on both"><br><em>Team mode. Claude leads: Codex and Copilot take two steps in parallel, Claude checks both against the code, then writes the final answer.</em></p>
@@ -31,19 +33,30 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
   - **GitHub Copilot CLI** (recommended for Copilot): `npm i -g @github/copilot`, then `copilot login` (or run **Chatroom: Sign in to Copilot CLI**). Without it, Copilot runs through VS Code's chat models as a chat-only agent.
   - **Ollama**: local models.
 - For documents (optional): [Ollama](https://ollama.com) with a vision/OCR model and an embedding model, for example `ollama pull glm-ocr` and `ollama pull embeddinggemma`.
-- To build: Node.js 20 or newer.
+- For the [sandbox](#sandbox-optional) (optional): Docker Desktop (Windows, macOS) or Docker Engine (Linux).
+- For [worktrees](#worktrees-optional) (optional): a git repository; git 2.38 or newer applies changes most reliably.
+- To build from source: Node.js 20 or newer.
 
 ## Install
+
+**From a release (recommended)**
+
+1. Download `chatroom-<version>.vsix` from the [latest release](https://github.com/GhoshSrinjoy/ChatRoom/releases/latest).
+2. In VS Code, open the Command Palette and run **Extensions: Install from VSIX…**, then pick the file. From a terminal: `code --install-extension chatroom-<version>.vsix`.
+3. Run **Developer: Reload Window**, then **Chatroom: Open Room**.
+
+To update, install the newer `.vsix` the same way and reload. Your rooms and settings are kept.
+
+**From source**
 
 ```powershell
 git clone https://github.com/GhoshSrinjoy/ChatRoom.git
 cd ChatRoom
 npm ci
 npm run package
-code --install-extension artifacts/chatroom-0.7.0.vsix
 ```
 
-Then run **Developer: Reload Window** in VS Code. You can also install the file with **Extensions: Install from VSIX…** from the Command Palette.
+`npm run package` type-checks, builds and writes `artifacts/chatroom-<version>.vsix`. Install it as above, or with `code --install-extension artifacts/chatroom-<version>.vsix`.
 
 ## Getting started
 
@@ -340,7 +353,24 @@ In the Conda setup, use `scripts/bootstrap.ps1` to install or update packages in
 
 Press **F5** with the project open to launch the **Run Chatroom** development configuration. Unit tests never start a real CLI: drivers are tested against fake processes and JSON-RPC peers (`tests/helpers.ts`).
 
-Additional validation:
+### Releasing
+
+Releases are built by the **Release** workflow (`.github/workflows/release.yml`):
+
+1. Bump `version` in `package.json` and add a `## <version>` section to `CHANGELOG.md`.
+2. Commit and push.
+3. Tag and push the tag: `git tag v<version>` and `git push origin v<version>`.
+
+The workflow:
+- refuses a tag that doesn't match `package.json`;
+- installs with `npm ci`, then type-checks, runs the tests and builds;
+- packages the `.vsix` (without source maps);
+- publishes a GitHub Release with the file attached and that changelog section as its notes.
+
+It can also be re-run for an existing tag from the **Actions** tab (**Run workflow**). Because it installs from the committed `package-lock.json`, commit lockfile changes together with dependency changes. In the Conda setup, `scripts/bootstrap.ps1` updates the lockfile for you.
+
+### Additional validation
+
 
 ```powershell
 # Uses an existing Google Chrome installation; saves UI previews.
