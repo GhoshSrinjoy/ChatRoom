@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RoomEngine, EngineOptions, Clock, Isolation } from '../src/engine';
-import { createRoom, roomFraming, DEFAULT_LOOP, patchLoop, defaultOptions, normalizeTeam, unavailableText } from '../src/core';
+import { createRoom, message, roomFraming, DEFAULT_LOOP, patchLoop, defaultOptions, normalizeTeam, unavailableText } from '../src/core';
 import { parseLoop } from '../src/commands';
-import { Agent, AgentCapabilities, ApprovalDecision, LoopConfig, NativeDriver, NativeTurnRequest, NativeTurnResult, Provider, ProviderError, ProviderRequest, Room, TurnKind, Unavailable, emptyUsage } from '../src/types';
+import { Agent, AgentCapabilities, ApprovalDecision, LoopConfig, NativeDriver, NativeTurnRequest, NativeTurnResult, Provider, ProviderError, ProviderRequest, Room, SandboxResult, TurnKind, Unavailable, emptyUsage } from '../src/types';
 import { waitFor } from './helpers';
 
 const usage = { ...emptyUsage(), input: 30, output: 10, requests: 1 };
@@ -1026,4 +1026,99 @@ test('worktrees: with isolation available but nobody isolated, turns keep the wr
   await engine.start('Edit');
   assert.equal(peak, 1); assert.deepEqual(iso.calls, []); assert.equal(engine.room.changes, undefined); assert.equal(cards(engine.room).length, 0);
   assert.ok(agents.every(a => a.session && !('cwd' in a.session)));
+});
+
+// ── Sandbox runs: approvals outside a CLI, held turns, late delivery ─────────
+const sandboxCard = (patch: Partial<SandboxResult> = {}) => {
+  const result: SandboxResult = { id: 'sbx1', status: 'running', image: 'debian:bookworm-slim', profile: 'test', network: false, command: 'npm test', limits: { cpus: 2, memoryMb: 2048, timeoutSeconds: 120 },
+    stdout: '', stderr: '', requestedBy: 'You', createdAt: 1, ...patch };
+  const card = message('notice', 'Sandbox', 'Sandbox'); card.sandbox = result; delete card.agentId;
+  return card;
+};
+const sandboxAsk = { kind: 'sandbox' as const, tool: 'sandbox', title: 'npm test', detail: 'Image: debian:bookworm-slim', canAllowSession: false };
+test('sandbox approvals: the user\'s own card is from You with no agent; Allow resolves it, it expires to deny, Stop and its signal cancel it', async () => {
+  const clock = fakeClock();
+  const { engine } = nativeEngine(() => 'x', { clock, approvalTimeoutMs: () => 60000 });
+  const first = engine.requestApproval(undefined, sandboxAsk);
+  const card = engine.room.messages.at(-1)!;
+  assert.equal(card.kind, 'approval'); assert.equal(card.author, 'You'); assert.equal('agentId' in card, false); assert.equal(card.text, 'npm test');
+  assert.equal('agentId' in card.approval!, false); assert.equal('provider' in card.approval!, false);
+  assert.equal(card.approval!.kind, 'sandbox'); assert.equal(card.approval!.canAllowSession, false); assert.equal(card.approval!.status, 'pending');
+  assert.equal(card.approval!.expiresAt - card.approval!.createdAt, 60000);
+  assert.deepEqual(engine.room.agentStates ?? {}, {}, 'no agent waits');
+  assert.equal(engine.decide(card.approval!.id, { decision: 'allow' }), true);
+  assert.deepEqual(await first, { decision: 'allow' }); assert.equal(card.approval!.status, 'allowed');
+  assert.ok(engine.room.activity.some(a => a.text === 'You: npm test → Allowed'));
+  const second = engine.requestApproval(undefined, sandboxAsk);
+  clock.advance(60000);
+  assert.deepEqual(await second, { decision: 'deny', message: 'No response from the user in time.' });
+  assert.equal(engine.room.messages.at(-1)!.approval!.status, 'expired');
+  const third = engine.requestApproval(undefined, sandboxAsk);
+  engine.stop();
+  assert.deepEqual(await third, { decision: 'deny', message: 'Stopped by you.' }); assert.equal(engine.room.messages.at(-1)!.approval!.status, 'cancelled');
+  const controller = new AbortController(), fourth = engine.requestApproval(undefined, sandboxAsk, controller.signal);
+  controller.abort();
+  assert.equal((await fourth).decision, 'deny'); assert.equal(engine.room.messages.at(-1)!.approval!.status, 'cancelled');
+  assert.deepEqual(await engine.requestApproval('nobody', sandboxAsk), { decision: 'deny', message: 'That agent is not in this room.' });
+});
+test('sandbox approvals in an agent\'s turn: the card is the agent\'s, and neither the card nor the held run counts as inactivity', async () => {
+  const clock = fakeClock();
+  let decision: ApprovalDecision | undefined, finishRun!: () => void;
+  const ran = new Promise<void>(resolve => finishRun = resolve);
+  const { engine, agents } = nativeEngine(async req => {
+    const hold = engine.holdTurn(req.agent.id);
+    decision = await engine.requestApproval(req.agent.id, sandboxAsk, req.signal);
+    hold.detail('Sandbox: running');
+    await ran; hold.release(); hold.release();
+    return 'Ran it';
+  }, { clock, timeoutMs: () => 5000, approvalTimeoutMs: () => 600000 });
+  agents[1].enabled = false; agents[2].enabled = false;
+  const run = engine.start('Test it');
+  const card = await waitFor(() => engine.room.messages.find(m => m.kind === 'approval'));
+  assert.equal(card.author, 'Codex'); assert.equal(card.agentId, agents[0].id); assert.equal(card.approval!.agentId, agents[0].id); assert.equal(card.approval!.provider, 'codex');
+  assert.equal(engine.room.agentStates![agents[0].id]!.status, 'approval');
+  const answer = engine.room.messages.find(m => m.kind === 'agent')!;
+  clock.advance(60000);
+  assert.equal(answer.status, 'streaming', 'waiting for the card is not inactivity');
+  engine.decide(card.approval!.id, { decision: 'allow' });
+  await waitFor(() => engine.room.agentStates![agents[0].id]!.status === 'tool');
+  assert.equal(engine.room.agentStates![agents[0].id]!.detail, 'Sandbox: running');
+  clock.advance(60000);
+  assert.equal(answer.status, 'streaming', 'nor is the run');
+  finishRun(); await run;
+  assert.deepEqual(decision, { decision: 'allow' }); assert.equal(answer.status, 'complete'); assert.equal(answer.text, 'Ran it');
+  // Outside a turn a hold does nothing.
+  const idle = engine.holdTurn(agents[0].id);
+  assert.equal(idle.signal, undefined); idle.detail('x'); idle.release();
+  assert.equal(engine.room.agentStates![agents[0].id]!.status, 'complete');
+});
+test('a sandbox card waiting in a turn is cancelled when the turn stops, even without a signal of its own', async () => {
+  let decision: ApprovalDecision | undefined;
+  const { engine, agents } = nativeEngine(async req => {
+    decision = await engine.requestApproval(req.agent.id, sandboxAsk);
+    return { text: '', status: 'interrupted' };
+  });
+  agents[1].enabled = false; agents[2].enabled = false;
+  const run = engine.start('Test it');
+  const card = await waitFor(() => engine.room.messages.find(m => m.kind === 'approval'));
+  engine.stopAgent(agents[0].id); await run;
+  assert.equal(card.approval!.status, 'cancelled'); assert.equal(decision!.decision, 'deny');
+});
+test('sandbox cards: a run still going when a delta is taken reaches that agent with its next delta once it ends; the agent that asked never gets it', async () => {
+  const { engine, driver, agents } = nativeEngine((req, n) => `${req.agent.name} reply ${n}`);
+  agents[2].enabled = false;
+  await engine.start('First');
+  const user = sandboxCard({ id: 'u1', command: 'npm test' }), own = sandboxCard({ id: 'c1', command: 'make lint', requestedBy: 'Codex', agentId: agents[0].id });
+  engine.room.messages.push(user, own);
+  await engine.start('Second');
+  for (const call of driver.calls.slice(2)) assert.doesNotMatch(seenBy(call), /Sandbox run/, 'a running card is not delivered');
+  Object.assign(user.sandbox!, { status: 'done', exitCode: 0, durationMs: 1200, stdout: 'all 12 tests passed' });
+  Object.assign(own.sandbox!, { status: 'done', exitCode: 2, durationMs: 800, stderr: 'lint: 3 problems' });
+  await engine.start('Third');
+  const [codex3, claude3] = driver.calls.slice(4);
+  assert.equal(count(seenBy(codex3!), 'all 12 tests passed'), 1); assert.doesNotMatch(seenBy(codex3!), /lint: 3 problems/, 'Codex asked for the lint run itself');
+  assert.equal(count(seenBy(claude3!), 'all 12 tests passed'), 1); assert.equal(count(seenBy(claude3!), 'lint: 3 problems'), 1);
+  assert.match(claude3!.context, /^<room from="Sandbox">\nSandbox run requested by You · debian:bookworm-slim · test profile · network off/);
+  await engine.start('Fourth');
+  for (const call of driver.calls.slice(6)) assert.doesNotMatch(seenBy(call), /Sandbox run/, 'delivered once');
 });

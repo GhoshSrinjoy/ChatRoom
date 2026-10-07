@@ -1,5 +1,5 @@
-import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo, TeamConfig, WorktreeMode } from './types';
-import { normalizeTeam } from './core';
+import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo, SandboxLanguage, SandboxProfile, TeamConfig, WorktreeMode } from './types';
+import { normalizeTeam, sandboxLanguage } from './core';
 
 export const ROOM_COMMANDS: RoomCommandInfo[] = [
   { name: 'help', description: 'Show Chatroom commands', agentScoped: false },
@@ -12,6 +12,7 @@ export const ROOM_COMMANDS: RoomCommandInfo[] = [
   { name: 'lead', args: '<agent>', description: 'Choose the lead for Team mode', agentScoped: false },
   { name: 'team', args: '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', description: 'Set up your own team: stages such as lead, drafting, review, testing', agentScoped: false },
   { name: 'worktrees', args: 'off | auto | always | status | apply | keep [name] | discard | cleanup', description: 'Give agents their own git worktrees so parallel edits never collide', agentScoped: false },
+  { name: 'sandbox', args: '<command> | python|node|bash <code> | on | off | status', description: 'Run a command or code in a throwaway Docker container on a copy of the folder (you approve each run)', agentScoped: false },
   { name: 'model', args: '<model>', description: 'Set the model of the mentioned agent', agentScoped: true },
   { name: 'effort', args: '<level>', description: 'Set reasoning effort for the mentioned agents (or all)', agentScoped: true },
   { name: 'permissions', args: 'plan | ask | auto | full', description: 'Set what agents may do without asking', agentScoped: true },
@@ -240,6 +241,56 @@ export function parseWorktrees(args: string): ParsedWorktrees {
   if (word === 'off' || word === 'auto' || word === 'always') return { mode: word };
   if (word === 'apply' || word === 'discard' || word === 'cleanup') return { action: word };
   return { error: WORKTREES_USAGE };
+}
+export const SANDBOX_USAGE = 'Usage: /sandbox <command> · /sandbox python|node|bash <code> · /sandbox on | off | status. Options before the command: --network, --security, --no-files, --timeout <seconds>.';
+export interface ParsedSandbox {
+  /** /sandbox on | off. */
+  toggle?: boolean;
+  status?: true;
+  command?: string; code?: string; language?: SandboxLanguage;
+  profile?: SandboxProfile; network?: boolean; copyFiles?: boolean; timeoutSeconds?: number;
+  error?: string;
+}
+const FENCE = /^```[ \t]*([\w+#.-]*)[^\n]*\n([\s\S]*?)\n?[ \t]*```\s*$/;
+/**
+ * /sandbox arguments: on, off, status (or nothing); otherwise a run. `python|node|bash <code>` (or a ``` fence with its language) is
+ * code; `python -m pytest` or `node test.js` (flags or a script file after the interpreter) is a command run in that image; anything
+ * else is a shell command. Leading --network, --security, --no-files and --timeout <s> set the run's options.
+ */
+export function parseSandbox(args: string): ParsedSandbox {
+  let text = (args ?? '').trim();
+  if (!text || /^status$/i.test(text)) return { status: true };
+  if (/^(on|off)$/i.test(text)) return { toggle: text.toLowerCase() === 'on' };
+  const options: ParsedSandbox = {};
+  for (;;) {
+    const m = /^--(network|net|security|no-files|timeout)(?:[= ](\d+))?(?=\s|$)\s*/i.exec(text);
+    if (!m) break;
+    const flag = m[1]!.toLowerCase();
+    if (flag === 'timeout') { if (!m[2]) return { error: SANDBOX_USAGE }; options.timeoutSeconds = Math.max(1, Math.min(1800, Number(m[2]))); }
+    else if (m[2]) return { error: SANDBOX_USAGE };
+    else if (flag === 'security') options.profile = 'security';
+    else if (flag === 'no-files') options.copyFiles = false;
+    else options.network = true;
+    text = text.slice(m[0].length);
+  }
+  if (!text) return { error: SANDBOX_USAGE };
+  const fence = FENCE.exec(text);
+  if (fence) {
+    const language = fence[1] ? sandboxLanguage(fence[1]) : 'bash';
+    if (!language) return { error: `The sandbox runs bash, python and node code, not ${fence[1]}.` };
+    return fence[2]!.trim() ? { ...options, code: fence[2]!, language } : { error: SANDBOX_USAGE };
+  }
+  const head = /^(\S+)(?:[ \t]+|\n|$)([\s\S]*)$/.exec(text), language = head ? sandboxLanguage(head[1]!) : undefined;
+  if (head && language && ['python', 'python3', 'py', 'node', 'nodejs', 'js', 'javascript', 'bash', 'sh'].includes(head[1]!.toLowerCase())) {
+    const rest = head[2]!.trim();
+    if (!rest) return { error: SANDBOX_USAGE };
+    const inner = FENCE.exec(rest);
+    if (inner) return { ...options, code: inner[2]!, language };
+    // An interpreter with flags or a script file runs as a command in that language's image.
+    if (/^(-|\S+\.(py|js|mjs|cjs|sh)(\s|$))/.test(rest)) return { ...options, command: text, ...(language !== 'bash' ? { language } : {}) };
+    return { ...options, code: rest, language };
+  }
+  return { ...options, command: text };
 }
 const TEAM_USAGE ='Usage: /team · /team <saved name> · /team Lead: Claude > Draft: Codex > Review: Claude, Copilot · /team save <name> · /team edit · /team off';
 export interface ParsedTeam { show?: true; off?: true; edit?: true; save?: string; remove?: string; use?: string; team?: TeamConfig; error?: string }

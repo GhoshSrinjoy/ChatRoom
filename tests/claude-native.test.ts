@@ -225,6 +225,13 @@ test('can_use_tool: room tools are allowed and AskUserQuestion denied without as
   await room.run();
   assert.equal(reply(room.fake.children[0]!).response.behavior, 'allow'); assert.equal(room.sink.approvals.length, 0);
   await room.driver.dispose();
+  // sandbox_run reaches Chatroom without a CLI card: Chatroom's own approval card is the gate, in every permission level.
+  for (const permission of ['plan', 'ask', 'full']) {
+    const sandbox = permissionTurn({ tool_name: 'mcp__chatroom__sandbox_run', input: { command: 'npm test' } }, () => { throw new Error('should not ask'); }, { options: { permission } as any });
+    await sandbox.run();
+    assert.equal(reply(sandbox.fake.children[0]!).response.behavior, 'allow', permission); assert.equal(sandbox.sink.approvals.length, 0);
+    await sandbox.driver.dispose();
+  }
   // Another server whose name starts with "chatroom__" is not the room server, in any mode.
   const other = permissionTurn({ tool_name: 'mcp__chatroom__ops__delete_branch', input: { branch: 'main' } }, () => ({ decision: 'deny' }), { options: { permission: 'plan' } as any });
   await other.run();

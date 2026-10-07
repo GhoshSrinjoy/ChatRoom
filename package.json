@@ -2,7 +2,7 @@
   "name": "chatroom",
   "displayName": "Chatroom",
   "description": "One room where Claude Code, Codex and the GitHub Copilot CLI work together with their own tools, skills and sessions, plus Ollama. Agents discuss, hand off with @mentions and work as a team.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "chatroom-local",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/GhoshSrinjoy/ChatRoom.git" },
@@ -59,6 +59,16 @@
         "chatroom.worktreeCopy": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Ignored files copied into each new worktree, for example .env" },
         "chatroom.worktreeLinks": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Folders linked into each worktree instead of copied, for example node_modules. Linked folders are shared by every agent." },
         "chatroom.worktreeAutoApply": { "type": "boolean", "default": false, "description": "Apply combined changes automatically when they merge cleanly. Otherwise you review and apply them." },
+        "chatroom.sandbox.enabled": { "type": "boolean", "default": true, "description": "Let agents (the sandbox_run room tool) and you (/sandbox, Run in sandbox) run commands and scripts in a throwaway Docker container on a copy of the folder. Every run asks you first. Needs Docker Desktop. Each room can turn it off with /sandbox off. When this is off, Chatroom never runs Docker." },
+        "chatroom.sandbox.images": { "type": "object", "default": { "bash": "debian:bookworm-slim", "python": "python:3.12-slim", "node": "node:22-bookworm-slim" }, "additionalProperties": false, "properties": {
+          "bash": { "type": "string", "description": "Image for shell commands and bash scripts." },
+          "python": { "type": "string", "description": "Image for Python scripts." },
+          "node": { "type": "string", "description": "Image for Node.js scripts." }
+        }, "description": "Docker images for sandbox runs, by language. A missing image is downloaded on first use." },
+        "chatroom.sandbox.cpus": { "type": "number", "default": 2, "minimum": 0.5, "maximum": 16, "description": "CPUs a sandbox run may use." },
+        "chatroom.sandbox.memoryMb": { "type": "integer", "default": 2048, "minimum": 256, "maximum": 65536, "description": "Memory a sandbox run may use, in MB (no swap)." },
+        "chatroom.sandbox.timeoutSeconds": { "type": "integer", "default": 120, "minimum": 5, "maximum": 1800, "description": "Default time limit of a sandbox run; the container is killed after it. A run can ask for up to 1800 s, shown on its approval card." },
+        "chatroom.sandbox.maxCopyMb": { "type": "integer", "default": 200, "minimum": 1, "maximum": 10000, "description": "Largest folder copied into a sandbox run, in MB. In a git repository only tracked and untracked (not ignored) files are copied." },
         "chatroom.maxParallelAgents":{ "type": "integer", "minimum": 1, "maximum": 4, "default": 3, "description": "Maximum agents (or Team steps) running at once. Agents with Auto-edit or Full access still edit one at a time." },
         "chatroom.defaultPermission": { "type": "string", "scope": "machine", "enum": ["plan", "ask", "auto-edit", "full"], "enumDescriptions": ["Plan: read and plan only.", "Ask: agents ask before edits and commands, with approval cards in the room.", "Auto-edit: agents edit files freely and ask for everything else.", "Full access: no approvals. Only used when chatroom.allowFullAccess is on."], "default": "ask", "description": "Permission level for new agents. `full` is only used when `chatroom.allowFullAccess` is on. User settings only: a workspace cannot set it." },
         "chatroom.allowFullAccess": { "type": "boolean", "scope": "machine", "default": false, "description": "Allow choosing Full access (no approvals) for agents. User settings only: a workspace cannot set it." },
@@ -80,7 +90,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.6.0.vsix",
+    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.7.0.vsix",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {

@@ -523,6 +523,96 @@ details.advanced summary { cursor: pointer; font-size: 12px; color: var(--muted)
 .wt-row small { display: block; color: var(--muted); font-size: 10px; margin-top: 3px; line-height: 1.4; }
 .wt-row .wt-branch { color: var(--foreground); font-family: var(--vscode-editor-font-family, monospace); overflow-wrap: anywhere; }
 .wt-base { margin: 8px 0 10px; }
+
+/* Sandbox: the run card, Run in sandbox on code blocks, sandbox approvals, the switch and the Tools section */
+.sandbox-card { --ok: var(--passed); --bad: var(--vscode-inputValidation-errorBorder, var(--error)); --wait: var(--vscode-inputValidation-warningBorder, var(--warning)); max-width: 720px; margin: 14px 0 18px; padding: 8px 10px; border: 1px solid var(--border); border-left: 3px solid var(--muted); border-radius: 6px; font-size: 12px; min-width: 0; }
+.sandbox-card:focus { outline: none; }
+.sandbox-card:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.sandbox-card.tone-ok { border-left-color: var(--ok); }
+.sandbox-card.tone-bad { border-left-color: var(--bad); }
+.sandbox-card.tone-run { border-left-color: var(--progress); }
+.sandbox-card.tone-wait { border-left-color: var(--wait); }
+.sbx-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.sbx-head > svg { width: 14px; height: 14px; color: var(--muted); }
+.sbx-head strong { font-weight: 600; }
+.sbx-by { color: var(--muted); font-size: 11px; min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sbx-chip { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; font-size: 10px; line-height: 1.6; padding: 0 6px; border: 1px solid var(--border); border-radius: 3px; color: var(--foreground); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sbx-chip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.sbx-chip.ok { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.sbx-chip.ok::before { background: var(--ok); }
+.sbx-chip.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+.sbx-chip.bad::before { background: var(--bad); }
+.sbx-chip.run { border-color: var(--progress); }
+.sbx-chip.run::before { background: var(--progress); animation: pulse 1.1s infinite; }
+.sbx-chip.wait { border-color: var(--wait); background: color-mix(in srgb, var(--warning) 14%, transparent); }
+.sbx-chip.wait::before { background: var(--wait); }
+.sbx-chip.off { color: var(--muted); }
+.sbx-elapsed { color: var(--muted); }
+.sbx-purpose { margin: 6px 0 0; line-height: 1.5; overflow-wrap: anywhere; }
+.approval-card .sbx-purpose { margin: 4px 0; }
+.sbx-pre { margin: 6px 0 0; padding: 6px 8px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; }
+.sbx-pre:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.sbx-badges { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 0; min-width: 0; }
+.approval-card .sbx-badges { margin: 4px 0 2px; }
+.sbx-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; min-width: 0; font-size: 10px; line-height: 1.6; padding: 0 6px; border: 1px solid var(--border); border-radius: 3px; color: var(--muted); }
+.sbx-badge > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sbx-badge svg { width: 11px; height: 11px; }
+.sbx-badge.image > span { font-family: var(--vscode-editor-font-family, monospace); color: var(--foreground); }
+.sbx-badge.net-on { color: var(--foreground); border-color: var(--vscode-inputValidation-warningBorder, var(--warning)); background: color-mix(in srgb, var(--warning) 12%, transparent); }
+.sbx-section { margin-top: 6px; min-width: 0; }
+.sbx-section > summary { cursor: pointer; color: var(--muted); font-size: 11px; padding: 2px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sbx-section > summary code { font-size: 10px; }
+.sbx-section.stderr > summary { color: var(--foreground); }
+.tone-ok .sbx-section.stderr > summary { color: var(--muted); }
+.sbx-error { display: flex; align-items: flex-start; gap: 6px; margin: 6px 0 0; color: var(--error); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.sbx-error svg { width: 13px; height: 13px; margin-top: 1px; }
+.sbx-error span { min-width: 0; }
+.sbx-file-list { list-style: none; margin: 4px 0 0; padding: 0 0 0 2px; }
+.sbx-file-list li { font-size: 11px; padding: 1px 0; min-width: 0; overflow-wrap: anywhere; }
+.sbx-file-list li.sbx-file-plain { padding-left: 14px; }
+.sbx-file > summary { cursor: pointer; }
+.sbx-file-path { font-family: var(--vscode-editor-font-family, monospace); }
+.sbx-file-size { color: var(--muted); font-size: 10px; white-space: nowrap; }
+.sbx-file-size::before { content: ' · '; }
+.sbx-empty { margin: 6px 0 0; }
+.sbx-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.sbx-actions .outline-button { width: auto; padding: 4px 10px; font-size: 12px; }
+.sbx-actions .outline-button svg { width: 12px; height: 12px; }
+.sbx-meta { margin-left: auto; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.message-content .code-block { margin: 1em 0; border-radius: 4px; background: var(--vscode-textCodeBlock-background, var(--input)); min-width: 0; }
+.code-head { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 2px 4px 2px 10px; border-bottom: 1px solid var(--border); font-size: 10px; line-height: 1.5; }
+.code-lang { margin-right: auto; color: var(--muted); font-family: var(--vscode-editor-font-family, monospace); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-run { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; padding: 2px 6px; font-size: 11px; color: var(--vscode-textLink-foreground, var(--foreground)); }
+.code-run svg { width: 11px; height: 11px; }
+.code-block pre { margin: 0; background: transparent; border-radius: 0 0 4px 4px; }
+.sbx-setting { margin: 12px 0; }
+.sbx-setting .switch-row { margin: 0; }
+.sbx-setting .switch-row strong { font-weight: 600; }
+.sbx-setting .switch-row small { overflow-wrap: anywhere; }
+.dialog .sbx-setting .switch-row { font-size: 13px; }
+.switch-row small.sbx-problem { display: flex; align-items: flex-start; gap: 4px; color: var(--foreground); }
+.sbx-problem svg { width: 12px; height: 12px; color: var(--warning); margin-top: 1px; }
+.sbx-fix { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 6px; min-width: 0; }
+.sbx-fix a.outline-button { color: var(--foreground); text-decoration: none; }
+.sbx-fix a.outline-button:hover { background: var(--hover); }
+.sbx-fix a.outline-button:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.sbx-fix [aria-disabled="true"] { opacity: .6; cursor: default; }
+.sbx-url { min-width: 0; color: var(--muted); font-size: 10px; font-family: var(--vscode-editor-font-family, monospace); overflow-wrap: anywhere; user-select: all; }
+.sbx-setting > .outline-button.inline { margin-top: 6px; }
+.sbx-runs { list-style: none; margin: 0; padding: 0; }
+.sbx-run { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 11px; min-width: 0; }
+.sbx-run-cmd { flex: 1 1 auto; min-width: 0; padding: 0; background: transparent; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sbx-note { margin: 4px 0 0; overflow-wrap: anywhere; }
+.sbx-label { margin: 6px 0 0; font-size: 10px; color: var(--muted); }
+.sbx-label + .sbx-pre { margin-top: 2px; }
+.sbx-run-status { flex: 0 0 auto; white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+.sbx-run-status.bad { color: var(--error); }
+.sbx-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.sbx-dot.ok { background: var(--passed); }
+.sbx-dot.bad { background: var(--error); }
+.sbx-dot.run { background: var(--progress); animation: pulse 1.1s infinite; }
+.sbx-dot.wait { background: var(--warning); }
+@media (prefers-reduced-motion: reduce) { .sbx-chip.run::before, .sbx-dot.run { animation: none !important; } }
 @media (max-width: 600px) {
   .composer-bar { flex-wrap: wrap; row-gap: 4px; }
   .bar-chips { order: -1; flex-basis: 100%; }

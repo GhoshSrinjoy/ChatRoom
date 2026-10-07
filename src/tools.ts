@@ -50,7 +50,7 @@ export class ToolService {
     if (call.name === 'ollama_ocr') return this.ocr(arg('path'), 'read_file', signal);
     return this.semantic(arg('query'), arg('glob', '**/*'), signal);
   }
-  /** Room tools for native CLIs. There is no per-agent gate: every native agent gets them all (the host answers isolate_workspace itself). */
+  /** Room tools for native CLIs. There is no per-agent gate: every native agent gets them all (the host answers isolate_workspace and sandbox_run itself). */
   async executeRoomTool(name: RoomToolName, args: Record<string, unknown>, signal: AbortSignal): Promise<string> {
     signal.throwIfAborted();
     if (!vscode.workspace.isTrusted) throw new Error('Tools require a trusted workspace.');

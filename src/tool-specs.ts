@@ -14,6 +14,18 @@ export const roomToolSpecs: Record<RoomToolName, RoomToolDefinition> = {
   read_document: { name: 'read_document', description: 'Read a PDF, Word (.docx) or image file from the workspace as text, using local OCR for scans and images. It also attaches the file to the room so every agent can search it. Use your own tools for plain text files.', inputSchema: object({ path: { type: 'string', description: 'Workspace-relative path' } }, ['path']) },
   semantic_search: { name: 'semantic_search', description: 'Find relevant workspace code or text snippets with the local embedding model.', inputSchema: object({ query: { type: 'string' }, glob: { type: 'string' } }, ['query']) },
   ollama_ocr: { name: 'ollama_ocr', description: 'Extract text from a workspace image with the local vision model.', inputSchema: object({ path: { type: 'string' } }, ['path']) },
-  isolate_workspace: { name: 'isolate_workspace', description: 'Work in your own git worktree from your next turn, so your edits can\'t collide with other agents\'. Your changes reach the user\'s folder only after review. Available in Full access.', inputSchema: object({}, []) }
+  isolate_workspace: { name: 'isolate_workspace', description: 'Work in your own git worktree from your next turn, so your edits can\'t collide with other agents\'. Your changes reach the user\'s folder only after review. Available in Full access.', inputSchema: object({}, []) },
+  sandbox_run: { name: 'sandbox_run', description: 'Run a shell command or a script in a throwaway Docker container on a copy of your folder, after the user approves it on a card. Use it to run tests, try code or check risky code without touching the real files. There is no network unless you ask for it and the user approves, and CPU, memory, process and time limits apply. You get the exit code, the output tails and the files the run created or changed; the room sees the result too.',
+    inputSchema: object({
+      command: { type: 'string', description: 'A shell command, run with sh -lc in /work (the copy of your folder). Give command or code.' },
+      code: { type: 'string', description: 'A script to run instead of a command; set language.' },
+      language: { type: 'string', enum: ['bash', 'python', 'node'], description: 'The script\'s language. It also picks the image: bash = Debian slim, python = Python 3.12, node = Node.js 22 (default bash).' },
+      profile: { type: 'string', enum: ['test', 'security'], description: 'test (default): a writable copy. security: a non-root user and a read-only copy, for code you don\'t trust.' },
+      network: { type: 'boolean', description: 'Ask for network access inside the container (default false). Only when the run needs it, for example to install packages.' },
+      timeoutSeconds: { type: 'integer', minimum: 1, maximum: 1800, description: 'Time limit; the container is killed after it (default: the user\'s setting, 120 s).' },
+      outputs: { type: 'array', items: { type: 'string' }, maxItems: 20, description: 'Globs (relative to /work) of files whose text you want back, for example ["report.txt", "out/*.json"]. Files under 64 KB.' },
+      purpose: { type: 'string', description: 'One line telling the user why this run is needed.' },
+      copyFiles: { type: 'boolean', description: 'false runs in an empty /work, for code that needs no files (faster). Default true.' }
+    }, []) }
 };
 export const ROOM_TOOL_NAMES = Object.keys(roomToolSpecs) as RoomToolName[];

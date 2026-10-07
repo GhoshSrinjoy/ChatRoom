@@ -9,6 +9,9 @@
   let teamDraft, teamOrigin = '', teamFrom = '', teamError = '', teamBack;
   // Worktree changes card: the latest card's message id, the open "Keep as branch" form, and buttons held after an action.
   let liveCard, keepDraft, changesHold;
+  // Sandbox: when Start Docker Desktop was pressed, and recent run/cancel clicks (a double click sends once).
+  let dockerStarting = 0;
+  const recentClicks = new Map();
   const ultraConfirmed = saved.ultraConfirmed || {}, openState = new Map(), nodes = new Map(), capsAsked = {};
   const menu = { open: false, kind: '', query: '', start: 0, end: 0, items: [], index: 0 };
   const $ = id => document.getElementById(id);
@@ -54,7 +57,9 @@
     clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
     ban: '<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>',
     up: '<path d="m6 15 6-6 6 6"/>', down: '<path d="m6 9 6 6 6-6"/>',
-    branch: '<circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="7.5" r="2"/><path d="M6.5 7.5v9M17.5 9.5c0 4-3.5 5.5-9.2 7.4"/>'
+    branch: '<circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="7.5" r="2"/><path d="M6.5 7.5v9M17.5 9.5c0 4-3.5 5.5-9.2 7.4"/>',
+    box: '<path d="M12 3 4 7v10l8 4 8-4V7Z"/><path d="m4 7 8 4 8-4M12 11v10"/>',
+    globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.5 3.5 5.3 3.5 8.5s-1.1 6-3.5 8.5c-2.4-2.5-3.5-5.3-3.5-8.5s1.1-6 3.5-8.5Z"/>'
   };
   const icon = name => name === 'logo' ? icons.logo : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.grid}</svg>`;
   // Provider glyphs. Copilot (copilot-16) and Ollama (cpu-16) are Primer Octicons, MIT (see ThirdPartyNotices.txt); Codex and Claude are drawn here.
@@ -83,7 +88,7 @@
   const permLabels = { plan: 'Plan', ask: 'Ask', 'auto-edit': 'Auto-edit', full: 'Full access' };
   const permHelp = { plan: 'Read and plan only', ask: 'Ask before edits and commands (approval cards)', 'auto-edit': 'Edit files freely, ask for the rest', full: 'No approvals. Use with care' };
   const effortLabels = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
-  const verbs = { command: 'run a command', edit: 'edit files', read: 'read files', network: 'use the network', mcp: 'use a tool', plan: 'leave plan mode and start editing' };
+  const verbs = { command: 'run a command', edit: 'edit files', read: 'read files', network: 'use the network', mcp: 'use a tool', plan: 'leave plan mode and start editing', sandbox: 'run this in the sandbox' };
   const decided = { allowed: 'Allowed', 'allowed-session': 'Allowed for session', denied: 'Denied', expired: 'Expired', cancelled: 'Cancelled' };
   const actIcons = { tool: 'tool', command: 'terminal', edit: 'edit', read: 'file', search: 'search', mcp: 'plug', subagent: 'users', plan: 'list', compact: 'compress', info: 'info', error: 'alert' };
   const stepLabels = { pending: 'Waiting', running: 'Working…', complete: 'Done', error: 'Failed', skipped: 'Skipped' };
@@ -337,7 +342,9 @@
   function signature(m) {
     const a = agentById(m.agentId), plan = m.step?.plan ? state.room.messages.find(p => p.id === m.step.plan)?.plan : undefined;
     const people = [...(m.targets || []), ...(m.handoff ? [m.handoff.from, ...m.handoff.to] : []), ...(m.changes?.conflicts || []).map(c => c.agentId)].map(id => agentById(id)?.name);
-    return JSON.stringify([m, a?.name, a?.model, a?.provider, plan, people, m.plan ? state.room.agents.map(x => x.name + x.provider) : 0, m.changes ? liveCard === m.id : 0]);
+    // Run buttons (code blocks, Run again) follow the sandbox switch.
+    const sbx = m.sandbox || /```/.test(m.text || '') ? sandboxReady() : 0;
+    return JSON.stringify([m, a?.name, a?.model, a?.provider, plan, people, m.plan ? state.room.agents.map(x => x.name + x.provider) : 0, m.changes ? liveCard === m.id : 0, sbx]);
   }
   function emptyHtml() {
     return `<div class="empty-state"><span class="empty-icon">${icon('logo')}</span><h2>Chat with your agents</h2><p>Claude Code, Codex and Copilot work here with their own tools, skills and sessions. Type <strong>@</strong> to talk to one agent and <strong>/</strong> for commands. Click an agent above to set its model, effort and permissions; <strong>Room setup</strong> chooses who takes part and who leads the team.</p><div class="suggestions"><button data-prompt="Look through this repository, then explain its architecture and suggest next steps.">Explain this repository ${icon('arrow')}</button><button data-prompt="Review this workspace for reliability issues. Split the review by area, read the relevant files, and challenge each other's findings.">Review the code as a team ${icon('arrow')}</button></div></div>`;
@@ -350,17 +357,19 @@
     const active = document.activeElement, focusKey = active !== container && container.contains(active) ? keyOf(active) : '';
     const caret = focusKey && typeof active.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd] : undefined;
     liveCard = [...messages].reverse().find(m => m.changes)?.id;
-    const oldScroll = container.scrollTop, wanted = [], used = new Set();
+    const oldScroll = container.scrollTop, wanted = [], used = new Set(), fresh = [];
     messages.forEach((m, i) => {
       const key = used.has(m.id) ? `${m.id}#${i}` : m.id, sig = signature(m), cached = nodes.get(key);
       used.add(key);
       let node = cached?.sig === sig ? cached.node : undefined;
-      if (!node) { node = buildMessage(m); nodes.set(key, { sig, node }); }
+      if (!node) { node = buildMessage(m); nodes.set(key, { sig, node }); fresh.push(node); }
       wanted.push(node);
     });
     for (const key of [...nodes.keys()]) if (!used.has(key)) nodes.delete(key);
     wanted.forEach((node, i) => { const at = container.children[i]; if (at !== node) container.insertBefore(node, at || null); });
     while (container.children.length > wanted.length) container.lastElementChild.remove();
+    // Sandbox output is a tail: show its end.
+    for (const node of fresh) node.querySelectorAll('details[open] > pre[data-tail]').forEach(tailEnd);
     container.scrollTop = nearBottom ? container.scrollHeight : oldScroll;
     if (focusKey && !container.contains(document.activeElement)) { const el = container.querySelector(focusKey); el?.focus({ preventScroll: true }); if (el && caret) el.setSelectionRange?.(...caret); }
   }
@@ -371,7 +380,7 @@
       const pre = document.createElement('pre'); pre.textContent = m.text;
       detail.append(summary, pre); return detail;
     }
-    if (m.kind === 'notice') return m.changes ? changesNode(m) : noticeNode(m);
+    if (m.kind === 'notice') return m.changes ? changesNode(m) : m.sandbox ? sandboxNode(m) : noticeNode(m);
     if (m.kind === 'approval') return approvalNode(m);
     return chatNode(m);
   }
@@ -450,6 +459,151 @@
     const none = !state.settings?.worktreesAvailable, mode = worktreeMode(), title = none ? 'Needs a git repository' : WORKTREE_MODES.find(([v]) => v === mode)?.[1] || '';
     return `<label${className ? ` class="${className}"` : ''}><span>Worktrees${none ? ' <span class="subtle">Needs a git repository</span>' : ''}</span><select id="${id}"${none || busy() ? ' disabled' : ''} title="${esc(title)}">${WORKTREE_MODES.map(([v, l]) => `<option value="${v}"${mode === v ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>${help && !none ? `<small class="field-help">${esc(help)}</small>` : ''}</label>`;
   }
+
+  // ---- Sandbox -------------------------------------------------------------------------------
+  // Optional: the chatroom.sandbox.enabled setting and the room's switch. Every run asks the user first (an approval card).
+  const DOCKER_URL = 'https://www.docker.com/products/docker-desktop/';
+  const RUNNABLE = { bash: 'bash', sh: 'bash', shell: 'bash', python: 'python', py: 'python', js: 'node', javascript: 'node', node: 'node' };
+  const SBX_LABELS = { pending: 'Waiting for you', pulling: 'Pulling image…', running: 'Running…', done: 'Done', failed: 'Failed', denied: 'Denied', timeout: 'Timed out', cancelled: 'Cancelled' };
+  const SBX_FINAL = ['done', 'failed', 'denied', 'timeout', 'cancelled'];
+  const sandboxSettings = () => state?.settings?.sandbox;
+  const sandboxOn = () => !!sandboxSettings()?.enabled && state.room.sandbox !== false;
+  const sandboxReady = () => sandboxOn() && !!sandboxSettings().available;
+  const toNumber = value => Number.isFinite(Number(value)) ? Number(value) : 0;
+  const fmtBytes = n => { n = toNumber(n); return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1).replace(/\.0$/, '')} KB` : `${(n / 1048576).toFixed(1).replace(/\.0$/, '')} MB`; };
+  const fmtMs = ms => { ms = toNumber(ms); if (ms < 1000) return `${Math.round(ms)} ms`; const s = ms / 1000; return s < 60 ? `${s.toFixed(1).replace(/\.0$/, '')} s` : `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`; };
+  const fmtSecs = s => { s = toNumber(s); return s >= 60 && s % 60 === 0 ? `${s / 60} min` : `${s} s`; };
+  const fmtMem = mb => { mb = toNumber(mb); return mb >= 1024 ? `${(mb / 1024).toFixed(1).replace(/\.0$/, '')} GB` : `${mb} MB`; };
+  function limitsText(l = {}) { const c = toNumber(l.cpus); return [c ? `${c} CPU${c === 1 ? '' : 's'}` : '', toNumber(l.memoryMb) ? fmtMem(l.memoryMb) : '', toNumber(l.timeoutSeconds) ? fmtSecs(l.timeoutSeconds) : ''].filter(Boolean).join(' · '); }
+  const firstLine = text => { const lines = String(text ?? '').split('\n'), first = lines.find(l => l.trim()) || ''; return first.trim() + (lines.filter(l => l.trim()).length > 1 ? ' …' : ''); };
+  const runStatus = r => SBX_LABELS[r.status] ? r.status : 'failed';
+  // ok: exit 0 · bad: a failure · run: pulling or running · wait: waiting for the user · off: denied or cancelled.
+  function runTone(r) {
+    const s = runStatus(r);
+    if (s === 'done') return r.exitCode === undefined || r.exitCode === null || toNumber(r.exitCode) === 0 ? 'ok' : 'bad';
+    return s === 'pending' ? 'wait' : s === 'pulling' || s === 'running' ? 'run' : s === 'failed' || s === 'timeout' ? 'bad' : 'off';
+  }
+  const runLabel = r => runStatus(r) === 'done' && r.exitCode !== undefined && r.exitCode !== null ? `Exit ${toNumber(r.exitCode)}` : SBX_LABELS[runStatus(r)];
+  const sinceText = at => mmss(Math.max(0, Math.round((Date.now() - toNumber(at)) / 1000)));
+  // A double click (or a key held down) sends a run, Run again or Cancel once.
+  function once(key) {
+    const now = Date.now(), last = recentClicks.get(key);
+    if (last && now - last < 2000) return false;
+    if (recentClicks.size > 50) recentClicks.clear();
+    recentClicks.set(key, now); return true;
+  }
+  const tailEnd = pre => { pre.scrollTop = pre.scrollHeight; };
+  function sbxBadges(r) {
+    const security = r.profile === 'security', limits = r.limitsText ?? limitsText(r.limits);
+    return `<div class="sbx-badges">`
+      + `<span class="sbx-badge image" title="${esc('Image: ' + (r.image || 'default'))}">${icon('box')}<span>${esc(r.image || 'default image')}</span></span>`
+      + `<span class="sbx-badge" title="${security ? 'Security profile: no root user, and the copy of the folder is read-only' : 'Test profile: runs on a writable copy of the folder'}">${icon(security ? 'shield' : 'tool')}<span>${security ? 'Security' : 'Test'}</span></span>`
+      + `<span class="sbx-badge${r.network ? ' net-on' : ''}" title="${r.network ? 'The container can reach the network' : 'The container has no network'}">${icon('globe')}<span>${r.network ? 'Network on' : 'No network'}</span></span>`
+      + (limits ? `<span class="sbx-badge" title="Limits: CPUs · memory · timeout">${icon('gauge')}<span>${esc(limits)}</span></span>` : '')
+      + `</div>`;
+  }
+  function outputBlock(m, key, text, open) {
+    const t = String(text || ''); if (!t) return '';
+    const lines = t.replace(/\n$/, '').split('\n').length, count = t.length >= 16000 ? `last ${(16000).toLocaleString('en')} characters` : plural(lines, 'line');
+    return `<details class="sbx-section sbx-out ${key}" data-id="${esc(m.id)}-${key}"${isOpen(`${m.id}-${key}`, open) ? ' open' : ''}><summary>${key} · ${count}</summary><pre class="sbx-pre" data-tail="1" tabindex="0" aria-label="${key}">${esc(t)}</pre></details>`;
+  }
+  // A sandbox run and its result; the host updates the same message while it pulls, runs and finishes.
+  function sandboxNode(m) {
+    const r = m.sandbox, status = runStatus(r), tone = runTone(r), label = runLabel(r), id = m.id, div = document.createElement('div');
+    const live = status === 'pulling' || status === 'running', final = SBX_FINAL.includes(status), by = r.requestedBy === 'You' ? 'you' : r.requestedBy || 'an agent';
+    div.className = `sandbox-card sbx-${status} tone-${tone}`; div.dataset.id = id; div.tabIndex = -1; div.setAttribute('role', 'group'); div.setAttribute('aria-label', `Sandbox run by ${by}: ${label}`);
+    const since = toNumber(r.startedAt || r.createdAt) || Date.now();
+    const chip = `<span class="sbx-chip ${tone}">${esc(label)}${status === 'running' ? ` <span class="sbx-elapsed" data-since="${since}">${sinceText(since)}</span>` : ''}</span>`;
+    const cmd = String(r.command || ''), lines = cmd.split('\n'), what = r.language ? `${r.language} script` : 'Command';
+    const code = lines.length > 6 || cmd.length > 400
+      ? `<details class="sbx-section sbx-code" data-id="${esc(id)}-cmd"${isOpen(id + '-cmd', false) ? ' open' : ''}><summary><span class="sbx-what">${esc(what)} · ${plural(lines.length, 'line')}</span> <code>${esc(clip(firstLine(cmd), 80))}</code></summary><pre class="sbx-pre" tabindex="0" aria-label="${esc(what)}">${esc(cmd)}</pre></details>`
+      : cmd ? `<pre class="sbx-pre sbx-command" tabindex="0" aria-label="${esc(what)}">${esc(cmd)}</pre>` : '';
+    const files = Array.isArray(r.files) ? r.files : [];
+    const fileRow = (f, i) => {
+      const name = `<span class="sbx-file-path">${esc(f.path)}</span><span class="sbx-file-size">${esc(fmtBytes(f.size))}</span>`;
+      return typeof f.text === 'string'
+        ? `<li><details class="sbx-file" data-id="${esc(id)}-file${i}"${isOpen(`${id}-file${i}`, false) ? ' open' : ''}><summary>${name}</summary><pre class="sbx-pre" tabindex="0" aria-label="${esc(f.path)}">${esc(f.text)}</pre></details></li>`
+        : `<li class="sbx-file-plain">${name}</li>`;
+    };
+    const filesHtml = files.length ? `<details class="sbx-section sbx-files" data-id="${esc(id)}-files"${isOpen(id + '-files', false) ? ' open' : ''}><summary>${plural(files.length, 'file')} created or changed</summary><ul class="sbx-file-list">${files.map(fileRow).join('')}</ul></details>` : '';
+    const failedRun = status === 'failed' || status === 'timeout' || tone === 'bad';
+    const empty = (status === 'done' || status === 'failed' || status === 'timeout') && !r.stdout && !r.stderr && !files.length && !r.error ? '<p class="fine-print sbx-empty">No output.</p>' : '';
+    const buttons = (live ? `<button type="button" class="outline-button danger" data-run-id="${esc(r.id)}" data-sandbox="cancel" title="Stop the container">${icon('stop')} Cancel</button>` : '')
+      + (final && sandboxReady() ? `<button type="button" class="outline-button" data-run-id="${esc(r.id)}" data-sandbox="rerun" title="Run it again with the same settings. You approve it first.">${icon('refresh')} Run again</button>` : '');
+    const meta = [final && r.durationMs !== undefined && r.durationMs !== null ? 'Took ' + fmtMs(r.durationMs) : '', final && r.finishedAt ? clock(r.finishedAt) : ''].filter(Boolean).join(' · ');
+    div.innerHTML = `<div class="sbx-head">${icon('terminal')}<strong>Sandbox run</strong><span class="sbx-by" title="${esc('Requested by ' + by)}">by ${esc(by)}</span>${chip}</div>`
+      + (r.purpose ? `<p class="sbx-purpose">${esc(r.purpose)}</p>` : '') + code + sbxBadges(r)
+      + (r.error ? `<p class="sbx-error">${icon('alert')}<span>${esc(r.error)}</span></p>` : '')
+      + outputBlock(m, 'stdout', r.stdout, status !== 'pending') + outputBlock(m, 'stderr', r.stderr, failedRun || !r.stdout) + filesHtml + empty
+      + (buttons || meta ? `<div class="sbx-actions">${buttons}${meta ? `<span class="sbx-meta">${esc(meta)}</span>` : ''}</div>` : '');
+    return div;
+  }
+  // The host describes a sandbox request in the approval's detail: "Key: value" lines (Why, Image, Profile, Network, Files,
+  // Limits, Returns the text of), a blank line, then "<Language> code:" or "Command:" and the code. Anything else: undefined.
+  const SBX_FIELDS = { why: 'purpose', image: 'image', profile: 'profile', network: 'network', files: 'files', limits: 'limits', 'returns the text of': 'returns' };
+  function sandboxRequestOf(ap) {
+    const text = String(ap.detail || ''), cut = text.indexOf('\n\n'), fields = {};
+    if (cut < 0) return undefined;
+    for (const line of text.slice(0, cut).split('\n')) {
+      const m = line.match(/^([A-Za-z][A-Za-z ]*?):\s*(.*)$/), name = m?.[1].toLowerCase();
+      if (!name || !Object.hasOwn(SBX_FIELDS, name)) return undefined;
+      fields[SBX_FIELDS[name]] = m[2];
+    }
+    if (!fields.image) return undefined;
+    const body = text.slice(cut + 2), label = body.match(/^(.{1,40}? code|Command):\n/);
+    const l = String(fields.limits || '').match(/(\d+(?:\.\d+)?)\s*CPUs?\b.*?(\d+)\s*MB\b.*?(\d+)\s*s\b/);
+    return { ...fields, label: label ? label[1] : 'Command', code: label ? body.slice(label[0].length) : body,
+      run: { image: fields.image, profile: /^security/i.test(fields.profile || '') ? 'security' : 'test', network: /^on\b/i.test(fields.network || ''),
+        limits: l ? { cpus: Number(l[1]), memoryMb: Number(l[2]), timeoutSeconds: Number(l[3]) } : undefined, limitsText: l ? undefined : fields.limits || '' } };
+  }
+  // A sandbox approval: why, what runs, and the badges. Once decided, the run's own card has the details, so the code folds away.
+  function sandboxRequestHtml(m, ap, req) {
+    const lines = req.code.split('\n').length, pending = ap.status === 'pending';
+    const code = pending ? `<div class="sbx-label">${esc(req.label)}</div><pre class="sbx-pre approval-code" tabindex="0" aria-label="${esc(req.label)}">${esc(req.code)}</pre>`
+      : `<details class="sbx-section sbx-code" data-id="${esc(m.id)}-req"${isOpen(m.id + '-req', false) ? ' open' : ''}><summary><span class="sbx-what">${esc(req.label)} · ${plural(lines, 'line')}</span> <code>${esc(clip(firstLine(req.code), 80))}</code></summary><pre class="sbx-pre" tabindex="0" aria-label="${esc(req.label)}">${esc(req.code)}</pre></details>`;
+    return (req.purpose ? `<p class="sbx-purpose">${esc(req.purpose)}</p>` : '') + code + (pending ? sbxBadges(req.run)
+      + (req.files ? `<p class="fine-print sbx-note">Files: ${esc(req.files)}</p>` : '') + (req.returns ? `<p class="fine-print sbx-note">Returns the text of: ${esc(req.returns)}</p>` : '') : '');
+  }
+  // Off in Settings (the whole feature), off in this room, or on (and whether Docker answers).
+  function sandboxStatus() {
+    const s = sandboxSettings(), roomOff = state.room.sandbox === false;
+    if (!s.enabled && !roomOff) return { off: true, setting: true, text: 'Off in Settings (chatroom.sandbox.enabled)' };
+    if (roomOff) return { off: true, text: 'Off in this room. Agents can\'t use it, and code blocks have no Run button.' };
+    if (s.available) return { text: `${/^docker\b/i.test(s.detail || '') ? s.detail : `Docker ${s.detail || ''}`.trim()} · every run asks you first` };
+    return { problem: true, text: s.detail || 'Docker is not available' };
+  }
+  function dockerAction() {
+    const s = sandboxSettings();
+    if (s.action === 'startDocker') {
+      const starting = Date.now() - dockerStarting < 60000;
+      return `<div class="sbx-fix"><button type="button" class="outline-button inline" data-sandbox="startDocker"${starting ? ' aria-disabled="true"' : ''}>${icon('play')} ${starting ? 'Starting Docker Desktop…' : 'Start Docker Desktop'}</button></div>`;
+    }
+    if (s.action === 'installDocker') return `<div class="sbx-fix"><a class="outline-button inline" href="${DOCKER_URL}" title="Opens the Docker Desktop download page in your browser">Install Docker Desktop</a><span class="sbx-url">${DOCKER_URL}</span></div>`;
+    return '';
+  }
+  function sandboxField(id, label = 'Sandbox') {
+    if (!sandboxSettings()) return '';
+    const st = sandboxStatus();
+    return `<div class="sbx-setting"><label class="switch-row"><span><strong>${esc(label)}</strong><small id="${id}-status"${st.problem ? ' class="sbx-problem"' : ''}>${st.problem ? icon('alert') : ''}${esc(st.text)}</small></span><span class="switch"><input type="checkbox" id="${id}" role="switch" aria-label="Sandbox runs in this room" aria-describedby="${id}-status"${st.off ? '' : ' checked'}${st.setting ? ' disabled' : ''}></span></label>`
+      + (st.problem ? dockerAction() : '') + (st.setting ? '<button type="button" class="outline-button inline" data-action="settings">Open Settings</button>' : '') + '</div>';
+  }
+  function sandboxAct(action, button) {
+    const d = button.dataset;
+    if (action === 'startDocker') {
+      if (button.getAttribute('aria-disabled') === 'true') return;
+      dockerStarting = Date.now(); send('sandbox', { action: 'startDocker' }); renderInspector(); refreshDialog();
+    } else if ((action === 'cancel' || action === 'rerun') && d.runId && once(action + ':' + d.runId)) {
+      send('sandbox', { action, id: d.runId });
+      if (action === 'rerun') nearBottom = true;
+    }
+  }
+  function runCodeBlock(button) {
+    const code = button.closest('.code-block')?.querySelector('code')?.textContent || '', language = button.dataset.sandboxRun;
+    if (!code.trim() || !once('run:' + language + ':' + code)) return;
+    send('sandbox', { action: 'run', code, language });
+    // The approval card appears at the end of the conversation.
+    nearBottom = true;
+  }
   function fillDiff(pre, text) {
     for (const line of String(text).split('\n').slice(0, 600)) {
       const span = document.createElement('span');
@@ -460,10 +614,16 @@
   function approvalNode(m) {
     const ap = m.approval || { id: '', kind: 'other', tool: 'tool', title: m.text, status: 'expired', canAllowSession: false, expiresAt: 0 };
     const agent = agentById(m.agentId || ap.agentId), who = agent?.name || m.author, article = document.createElement('article');
-    article.className = `message approval ${ap.status}`; article.dataset.id = m.id;
+    // The user's own requests (sandbox runs from /sandbox or a code block) come from You, with no agent.
+    const mine = !agent && !(m.agentId || ap.agentId) && m.author === 'You';
+    article.className = `message approval ${ap.status}${ap.kind === 'sandbox' ? ' sandbox' : ''}`; article.dataset.id = m.id;
     const pending = ap.status === 'pending', id = esc(ap.id), left = Math.max(0, Math.round((ap.expiresAt - Date.now()) / 1000));
-    article.innerHTML = `<div class="message-avatar">${avatar(agent || { provider: ap.provider })}</div><div class="approval-card" role="group" aria-label="${esc(who)} approval request"><div class="approval-head"><strong>${esc(who)}</strong> wants to ${esc(verbs[ap.kind] || `use ${ap.tool}`)}<span class="approval-tool">${esc(ap.tool)}</span></div><div class="approval-title">${esc(ap.title)}</div>${ap.detail || ap.diff ? '<pre class="approval-detail"></pre>' : ''}${pending
-      ? `<div class="approval-actions"><button type="button" class="primary-button" data-approve="${id}" data-decision="allow" title="Allow once">Allow</button>${ap.canAllowSession ? `<button type="button" class="outline-button" data-approve="${id}" data-decision="allow-session" title="Allow this and similar requests for the rest of the session">Allow for session</button>` : ''}<button type="button" class="outline-button danger" data-approve="${id}" data-decision="deny">Deny</button><span class="approval-expiry" data-expires="${Number(ap.expiresAt) || 0}" title="Denied automatically when the time runs out">${mmss(left)} left</span></div>`
+    // Sandbox runs are approved one at a time: Allow or Deny, never for the session.
+    const sandbox = ap.kind === 'sandbox', req = sandbox ? sandboxRequestOf(ap) : undefined, allowSession = ap.canAllowSession && !sandbox;
+    const face = mine ? '<span class="avatar user-avatar" aria-hidden="true">Y</span>' : avatar(agent || { provider: ap.provider });
+    const body = req ? sandboxRequestHtml(m, ap, req) : `<div class="approval-title">${esc(ap.title)}</div>${ap.detail || ap.diff ? '<pre class="approval-detail"></pre>' : ''}`;
+    article.innerHTML = `<div class="message-avatar">${face}</div><div class="approval-card" role="group" aria-label="${esc(who)} approval request"><div class="approval-head"><strong>${esc(who)}</strong> ${mine ? 'want' : 'wants'} to ${esc(verbs[ap.kind] || `use ${ap.tool}`)}${sandbox ? '' : `<span class="approval-tool">${esc(ap.tool)}</span>`}</div>${body}${pending
+      ? `<div class="approval-actions"><button type="button" class="primary-button" data-approve="${id}" data-decision="allow" title="${sandbox ? 'Run it once' : 'Allow once'}">Allow</button>${allowSession ? `<button type="button" class="outline-button" data-approve="${id}" data-decision="allow-session" title="Allow this and similar requests for the rest of the session">Allow for session</button>` : ''}<button type="button" class="outline-button danger" data-approve="${id}" data-decision="deny">Deny</button><span class="approval-expiry" data-expires="${Number(ap.expiresAt) || 0}" title="Denied automatically when the time runs out">${mmss(left)} left</span></div>`
       : `<div class="approval-result">${esc(decided[ap.status] || ap.status)}${ap.decidedAt ? ' · ' + clock(ap.decidedAt) : ''}</div>`}</div>`;
     const pre = article.querySelector('.approval-detail');
     if (pre) { if (ap.detail) pre.append(document.createTextNode(ap.detail + (ap.diff ? '\n\n' : ''))); if (ap.diff) fillDiff(pre, ap.diff); }
@@ -492,7 +652,7 @@
     article.querySelectorAll('.act-diff').forEach(pre => fillDiff(pre, m.activity[Number(pre.dataset.diff)]?.diff || ''));
     const content = article.querySelector('.message-content');
     if (!text && streaming) content.innerHTML = '<span class="thinking"><i></i><i></i><i></i></span>';
-    else markdown(content, text);
+    else markdown(content, text, sandboxReady());
     const parts = [];
     if (m.usage) parts.push(`${m.usage.estimated ? '~' : ''}${fmt(m.usage.input + m.usage.output)} tokens${m.usage.cached ? ` · ${fmt(m.usage.cached)} cached` : ''}`);
     if (marker === 'agree') parts.push('agrees · nothing to add');
@@ -528,13 +688,21 @@
       return `<div class="plan-step ${esc(s.status)}" role="listitem" title="${esc(s.detail || '')}"><span class="step-dot"></span><span class="step-id">${esc(s.id)}</span>${avatar(a || { provider: 'ollama' }, 'mini')}<div class="step-body"><div class="step-line"><strong>${esc(a?.name || 'Removed agent')}</strong><span class="step-status">${esc(stepLabels[s.status] || s.status)}</span></div><p>${esc(s.task)}</p>${s.after.length ? `<small>builds on ${s.after.map(esc).join(', ')}</small>` : ''}</div></div>`;
     }).join('')}</div>`).join('')}</div>`;
   }
-  function markdown(parent, text) {
+  // runnable: closed bash, python and node blocks get a Run in sandbox button (the sandbox is on and Docker answers).
+  function markdown(parent, text, runnable = false) {
     const sections = text.split(/```/);
     sections.forEach((section, index) => {
       if (index % 2) {
         const newline = section.indexOf('\n'), pre = document.createElement('pre'), code = document.createElement('code');
         code.textContent = newline >= 0 ? section.slice(newline + 1).replace(/\n$/, '') : section;
-        pre.append(code); parent.append(pre);
+        pre.append(code);
+        const lang = newline >= 0 ? (section.slice(0, newline).trim().split(/\s+/)[0] || '').toLowerCase() : '', language = Object.hasOwn(RUNNABLE, lang) ? RUNNABLE[lang] : '';
+        // The last section of an odd number of fences is still being written.
+        if (runnable && language && index < sections.length - 1 && code.textContent.trim()) {
+          const block = document.createElement('div'); block.className = 'code-block';
+          block.innerHTML = `<div class="code-head"><span class="code-lang">${esc(lang)}</span><button type="button" class="code-run" data-sandbox-run="${language}" aria-label="Run in sandbox: ${esc(lang)} code" title="Run in a throwaway Docker container on a copy of the folder, with no network. You approve it first.">${icon('play')}<span>Run in sandbox</span></button></div>`;
+          block.append(pre); parent.append(block);
+        } else parent.append(pre);
       } else {
         for (const block of section.split(/\n\s*\n/)) {
           if (!block.trim()) continue;
@@ -898,6 +1066,7 @@
       + `<div class="team-setup">${r.team ? `<p class="team-plan"><strong>${esc(r.team.name)}</strong>${r.mode === 'pipeline' ? '' : ' (not in use)'} · ${esc(teamPlan(r.team))}</p>` : ''}<button type="button" class="outline-button inline" data-team-open="edit">${icon('edit')} Edit team…</button></div>`
       + `<label>Model routing<select id="setup-preset"${dis}>${['planning', 'drafting', 'review'].map(p => `<option value="${p}" ${preset === p ? 'selected' : ''}>${p[0].toUpperCase() + p.slice(1)}</option>`).join('')}</select></label>`
       + worktreesField('setup-worktrees', '', 'Agents in their own git worktree can\'t overwrite each other\'s edits. You review the combined changes, then apply them to your folder or keep them as a branch.')
+      + sandboxField('setup-sandbox')
       + `<p class="fine-print">Type @Name to talk to one agent, or @all for everyone. In Team mode your message goes to the lead first; the lead answers or brings in teammates. The lead also decides when an "Until done" loop is finished.</p>`;
   }
   function modelOptions(provider, selected) {
@@ -1080,7 +1249,7 @@
     const needs = { ollama_ocr: state.localModels?.vision ? '' : ' · needs an OCR model', read_document: state.localModels?.vision ? '' : ' · scans need an OCR model', semantic_search: state.localModels?.embedding ? '' : ' · needs an embedding model', search_documents: state.localModels?.embedding ? '' : ' · keyword search until an embedding model is chosen' };
     const glyphs = s => (s.nativeTo || []).map(p => avatar({ provider: p }, 'micro')).join('');
     return `<div class="inspector-section"><div class="section-heading">AGENTS <span class="count">${r.agents.length}</span></div>${r.agents.map(capsCard).join('') || '<p class="muted">No agents in this room.</p>'}</div>`
-      + worktreesSection()
+      + worktreesSection() + sandboxSection()
       + `<div class="inspector-section"><div class="section-heading">SHARED WITH THE ROOM</div><label class="switch-row"><span><strong>Share skills between agents</strong><small>Claude Code, Codex and Copilot can use each other's skills.</small></span><span class="switch"><input type="checkbox" id="share-skills" role="switch" aria-label="Share skills between agents" ${r.shareSkills !== false ? 'checked' : ''}${running ? ' disabled' : ''}></span></label>${skills.slice(0, 60).map(s => `<div class="skill-row"><div class="skill-head"><strong>${esc(s.name)}</strong><span class="subtle">${esc(s.source)}</span><span class="native-to" title="Native to ${esc((s.nativeTo || []).map(p => names[p]).join(', '))}">${glyphs(s)}</span></div><p>${esc(s.description)}</p></div>`).join('')}${skills.length > 60 ? `<p class="fine-print">+${skills.length - 60} more skills</p>` : skills.length ? '' : '<p class="fine-print">No skills found in .claude, .agents, .codex, .github or .copilot folders.</p>'}<div class="section-heading sub-heading">ROOM TOOLS</div>${ROOM_TOOLS.map(([name, label, iconName, description]) => `<div class="tool-row"><span class="tool-symbol">${icon(iconName)}</span><div><strong>${label}</strong><small>${esc(description)}</small><small>available to every native agent${needs[name] || ''}</small></div></div>`).join('')}</div>`
       + `<div class="inspector-section"><div class="section-heading">ROOM DOCUMENTS <span class="count">${docs.length}</span></div><p class="muted">Attached files are read automatically, with OCR for images and scanned pages, then split into passages and embedded. Agents get the most relevant passages with each message and can search for more.</p>${docs.map(d => `<div class="doc-row ${esc(d.status)}"><span class="tool-symbol">${icon('file')}</span><div><strong>${esc(d.name)}</strong><small>${esc(d.status === 'ready' ? `${docStatus(d)} · ${d.chars.toLocaleString()} characters · ${d.chunks} passage${d.chunks === 1 ? '' : 's'}` : d.detail || d.status)}</small></div><button class="icon-button small" data-remove-doc="${esc(d.id)}" aria-label="Remove ${esc(d.name)}">${icon('close')}</button></div>`).join('')}<button class="outline-button" data-action="attachDocuments">${icon('attach')} Attach documents</button></div>`
       + `<div class="inspector-section"><div class="section-heading">LOCAL SPECIALISTS <span class="connection-dot ${ollama?.status || 'unchecked'}"></span></div><p class="muted">Local Ollama models read documents and build the search index. Installed models are selected automatically.</p><label class="model-field">Vision / OCR<select id="vision-model"${running ? ' disabled' : ''}>${options('vision')}</select></label><label class="model-field">Embeddings<select id="embedding-model"${running ? ' disabled' : ''}>${options('embedding')}</select></label><p class="fine-print">Models must already be installed in Ollama. Cloud models are excluded. Extracted text, OCR results and embeddings are cached on disk in this workspace's VS Code storage, so the same file is never processed twice.</p></div>`
@@ -1097,6 +1266,16 @@
       + (c?.base ? `<p class="fine-print wt-base">Base <code title="${esc(c.base)}">${esc(String(c.base).slice(0, 7))}</code> · your folder when the first agent was isolated</p>` : '')
       + `<button type="button" class="outline-button" data-worktree="cleanup" title="Remove worktrees left over from rooms that no longer exist. Branches with work are kept.">Clean up old worktrees</button>`
       + '<p class="fine-print">Agents in Full access can isolate themselves with the isolate_workspace tool.</p></div>';
+  }
+  function sandboxSection() {
+    if (!sandboxSettings()) return '';
+    const all = state.room.messages.filter(m => m.sandbox), runs = all.slice(-5).reverse().map(m => m.sandbox);
+    const status = r => runStatus(r) === 'done' ? [runLabel(r), r.durationMs !== undefined && r.durationMs !== null ? fmtMs(r.durationMs) : ''].filter(Boolean).join(' · ') : runLabel(r);
+    const rows = runs.map(r => `<li class="sbx-run"><span class="sbx-dot ${runTone(r)}" aria-hidden="true"></span><code class="sbx-run-cmd" title="${esc(r.command)}">${esc(clip(firstLine(r.command), 120))}</code><span class="sbx-run-status ${runTone(r)}">${esc(status(r))}</span></li>`).join('');
+    return `<div class="inspector-section"><div class="section-heading">SANDBOX <span class="count">${all.length}</span></div>${sandboxField('tools-sandbox', 'Use it in this room')}`
+      + `<p class="muted">Runs a command or script in a throwaway Docker container on a copy of the folder, with no network unless you allow it. Agents use the sandbox_run tool; you can use /sandbox or Run in sandbox on a code block.</p>`
+      + (rows ? `<div class="section-heading sub-heading">RECENT RUNS</div><ul class="sbx-runs">${rows}</ul>` : '<p class="fine-print">No runs in this room yet.</p>')
+      + '<p class="fine-print">Images, limits and the default: <button type="button" class="text-button link" data-action="settings">Settings</button></p></div>';
   }
   function activityTab() {
     const r = state.room;
@@ -1137,6 +1316,8 @@
   document.addEventListener('mousedown', event => { if (event.target.closest('#menu')) event.preventDefault(); });
   $('menu').addEventListener('mousedown', event => { const item = event.target.closest('.menu-item'); if (item) acceptMenu(Number(item.dataset.index)); });
   $('messages').addEventListener('click', event => { const details = event.target.closest('summary')?.parentElement; if (details?.dataset.id) openState.set(details.dataset.id, !details.open); });
+  // Opening sandbox output shows its end (it is a tail). toggle does not bubble, so listen while capturing.
+  $('messages').addEventListener('toggle', event => { const pre = event.target.open && event.target.querySelector?.(':scope > pre[data-tail]'); if (pre) tailEnd(pre); }, true);
   document.addEventListener('click', event => {
     const target = event.target;
     if (target.closest('#menu')) return;
@@ -1177,6 +1358,8 @@
     if (d.compact !== undefined) { const a = agentById(d.compact); send('send', { text: a ? `${quoteName(a.name)} /compact` : '/compact', editor: false, think: false, ultra: false }); closePopover(); }
     if (d.agentRetry) send('agentRetry', { id: d.agentRetry });
     if (d.worktree) worktreeAction(d.worktree, button);
+    if (d.sandbox) sandboxAct(d.sandbox, button);
+    if (d.sandboxRun) runCodeBlock(button);
     if (d.keepCancel) closeKeep(true);
     if (d.changesMore !== undefined) toggleFiles(button);
     if (d.teamOpen) { const back = dialogBack(button); if (d.teamOpen === 'new') openTeamBuilder(undefined, back); else editTeam(back); }
@@ -1199,6 +1382,7 @@
     if (id === 'parallel-limit') send('options', { concurrency: Number(el.value) });
     if (id === 'budget') send('options', { tokenBudget: Number(el.value) });
     if (id === 'worktrees-select' || id === 'setup-worktrees') send('options', { worktrees: el.value });
+    if (id === 'setup-sandbox' || id === 'tools-sandbox') send('options', { sandbox: el.checked });
     if (el.name === 'loop-kind') updateLoopFields();
     if (el.closest?.('#loop-form')) saveLoop(false);
     if (el.dataset.effortAgent) send('agent', { id: el.dataset.effortAgent, options: { effort: el.value } });
@@ -1257,7 +1441,7 @@
     }
     const layer = document.querySelector('.confirm-layer') || (!$('dialog-layer').hidden && $('dialog-layer'));
     if (event.key === 'Tab' && layer) {
-      const focusable = [...layer.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary')];
+      const focusable = [...layer.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),summary,a[href]')];
       const first = focusable[0], last = focusable.at(-1);
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
       if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
@@ -1268,6 +1452,8 @@
   setInterval(() => {
     if (!state) return;
     document.querySelectorAll('.approval-expiry[data-expires]').forEach(el => { el.textContent = mmss(Math.max(0, Math.round((Number(el.dataset.expires) - Date.now()) / 1000))) + ' left'; });
+    document.querySelectorAll('.sbx-elapsed[data-since]').forEach(el => { el.textContent = sinceText(el.dataset.since); });
+    if (dockerStarting && Date.now() - dockerStarting >= 60000) { dockerStarting = 0; renderInspector(); refreshDialog(); }
     if (state.room.loop?.kind === 'interval' && state.room.loopState?.nextAt) chip('chip-loop', 'loop', loopLabel(state.room), $('chip-loop').title);
     if (state.room.agents.some(a => a.unavailable?.until)) renderStrip();
   }, 1000);
@@ -1275,6 +1461,8 @@
     const data = event.data; if (!data || typeof data !== 'object') return;
     if (data.type === 'state') { state = data; render(); }
     if (data.type === 'error' || data.type === 'notice') releaseChanges();
+    // Starting Docker Desktop failed: offer the button again.
+    if (data.type === 'error' && dockerStarting && state) { dockerStarting = 0; renderInspector(); refreshDialog(); }
     if (data.type === 'error') {
       if (lastSent && Date.now() - lastSent.at < 10000 && !$('prompt').value.trim()) { $('prompt').value = lastSent.text; autoGrow(); saveDraft(); }
       lastSent = undefined; toast(data.text);

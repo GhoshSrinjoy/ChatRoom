@@ -3,7 +3,42 @@ export type NativeProviderId = 'codex' | 'claude' | 'copilot';
 /** Chatroom's read-only tools for agents without native tools (Ollama, Copilot through vscode.lm). */
 export type ToolName = 'list_files' | 'read_file' | 'search_files' | 'search_documents' | 'ollama_ocr' | 'semantic_search';
 /** Room tools offered to native CLIs through MCP or Codex dynamic tools. */
-export type RoomToolName = 'search_documents' | 'read_document' | 'semantic_search' | 'ollama_ocr' | 'isolate_workspace';
+export type RoomToolName = 'search_documents' | 'read_document' | 'semantic_search' | 'ollama_ocr' | 'isolate_workspace' | 'sandbox_run';
+/** test: an isolated run on a writable copy; security: also no root user and a read-only copy. */
+export type SandboxProfile = 'test' | 'security';
+export type SandboxLanguage = 'bash' | 'python' | 'node';
+/** What a sandbox run should do. Either `command` (a shell command) or `code` + `language` (a script). */
+export interface SandboxRequest {
+  command?: string; code?: string; language?: SandboxLanguage;
+  profile: SandboxProfile;
+  /** Network inside the container; off unless the user approves it. */
+  network: boolean;
+  timeoutSeconds: number;
+  /** Globs of files (relative to /work) whose text is returned when small. */
+  outputs?: string[];
+  /** Why the run is needed, shown on the approval card. */
+  purpose?: string;
+  /** Which folder is copied into /work: the agent's folder (its worktree when isolated), the workspace, or nothing. */
+  workdirFrom: 'agent' | 'workspace' | 'none';
+}
+/** A sandbox run and its result, shown as a card in the room. */
+export interface SandboxResult {
+  id: string;
+  status: 'pending' | 'pulling' | 'running' | 'done' | 'failed' | 'denied' | 'timeout' | 'cancelled';
+  image: string; profile: SandboxProfile; network: boolean;
+  /** The command or script as run (scripts: the language and the code). */
+  command: string; language?: SandboxLanguage; purpose?: string;
+  limits: { cpus: number; memoryMb: number; timeoutSeconds: number };
+  exitCode?: number; durationMs?: number;
+  /** Tails, at most 16,000 characters each. */
+  stdout: string; stderr: string;
+  /** Files created or changed in /work (at most 50); text for requested outputs under 64 KB. */
+  files?: { path: string; size: number; text?: string }[];
+  error?: string;
+  /** Agent name, or 'You'. */
+  requestedBy: string; agentId?: string;
+  createdAt: number; startedAt?: number; finishedAt?: number;
+}
 export type TaskPreset = 'planning' | 'drafting' | 'review';
 export type ModelDefaults = Record<TaskPreset, Partial<Record<ProviderId, string>>>;
 /** orchestrated: a lead plans for the team; sequential: relay; parallel: independent rounds; pipeline: the user's own team stages. */
@@ -135,7 +170,7 @@ export interface ActivityItem {
   status: 'running' | 'done' | 'failed' | 'declined';
   at: number;
 }
-export type ApprovalKind = 'command' | 'edit' | 'read' | 'network' | 'mcp' | 'plan' | 'other';
+export type ApprovalKind = 'command' | 'edit' | 'read' | 'network' | 'mcp' | 'plan' | 'sandbox' | 'other';
 export interface ApprovalRequest { kind: ApprovalKind; tool: string; title: string; detail?: string; diff?: string; canAllowSession: boolean }
 export interface ApprovalDecision { decision: 'allow' | 'allow-session' | 'deny'; message?: string }
 export interface ApprovalInfo extends ApprovalRequest {
@@ -176,6 +211,8 @@ export interface Message {
   stage?: { index: number; total: number; name: string; lead?: boolean };
   /** Notice: the room's combined worktree changes (kept up to date while it is the latest one). */
   changes?: RoomChanges;
+  /** Notice: a sandbox run and its result (updated in place while it runs). */
+  sandbox?: SandboxResult;
 }
 export interface RoomDocument {
   id: string; name: string; hash: string; kind: 'text' | 'pdf' | 'image' | 'docx'; source: 'attached' | 'workspace';
@@ -223,6 +260,8 @@ export interface Room {
   worktrees?: WorktreeMode;
   /** Combined changes from isolated agents that the user has not applied or discarded yet. */
   changes?: RoomChanges;
+  /** Per-room sandbox switch; undefined = the chatroom.sandbox.enabled setting. */
+  sandbox?: boolean;
 }
 export interface ModelInfo {
   id: string; name: string; capabilities?: string[]; remote?: boolean; error?: string;
@@ -361,7 +400,9 @@ export interface StatePayload {
   teams: TeamConfig[];
   localModels: { vision: string; embedding: string };
   discovering: boolean; modelDefaults: ModelDefaults; defaultPreset: TaskPreset; executionMode: RoomMode; maxParallelAgents: number;
-  settings: { allowFullAccess: boolean; attachOpenFile: boolean; approvalTimeoutSeconds: number; worktrees: WorktreeMode; worktreesAvailable: boolean };
+  settings: { allowFullAccess: boolean; attachOpenFile: boolean; approvalTimeoutSeconds: number; worktrees: WorktreeMode; worktreesAvailable: boolean;
+    /** enabled: the setting (and the room switch); available: Docker answers; detail: why not, or the Docker version. */
+    sandbox: { enabled: boolean; available: boolean; detail: string; action?: 'installDocker' | 'startDocker' } };
   workspace: string; trusted: boolean;
 }
 /** Webview → host messages (validated by the host). */
@@ -369,7 +410,7 @@ export type WebviewMessage =
   | { type: 'ready' | 'open' | 'refresh' | 'settings' | 'new' | 'export' | 'pause' | 'stop' | 'start' | 'attachDocuments' }
   | { type: 'switch' | 'stopAgent' | 'removeAgent' | 'removeDocument'; id: string }
   | { type: 'send'; text: string; editor: boolean; think: boolean; ultra: boolean }
-  | { type: 'options'; mode?: RoomMode; leadId?: string; concurrency?: number; tokenBudget?: number; preset?: TaskPreset; loop?: Partial<LoopConfig>; attachEditor?: boolean; shareSkills?: boolean; permission?: PermissionLevel; worktrees?: WorktreeMode }
+  | { type: 'options'; mode?: RoomMode; leadId?: string; concurrency?: number; tokenBudget?: number; preset?: TaskPreset; loop?: Partial<LoopConfig>; attachEditor?: boolean; shareSkills?: boolean; permission?: PermissionLevel; worktrees?: WorktreeMode; sandbox?: boolean }
   | { type: 'saveDefaults'; modelDefaults: ModelDefaults; defaultPreset: TaskPreset; executionMode: RoomMode; maxParallelAgents: number }
   | { type: 'agent'; id: string; name?: string; model?: string; role?: string; enabled?: boolean; tools?: ToolName[]; options?: Partial<AgentOptions>; isolate?: boolean }
   | { type: 'addAgent'; provider: ProviderId }
@@ -387,7 +428,9 @@ export type WebviewMessage =
   /** Clear an agent's unavailable mark and check it again. */
   | { type: 'agentRetry'; id: string }
   /** The room's combined worktree changes: open the diff, apply them to the workspace, keep them as a branch, discard them, or remove leftover worktrees. */
-  | { type: 'worktree'; action: 'review' | 'apply' | 'keep' | 'discard' | 'cleanup'; name?: string };
+  | { type: 'worktree'; action: 'review' | 'apply' | 'keep' | 'discard' | 'cleanup'; name?: string }
+  /** Sandbox: run a command or a script (every run asks the user first), cancel or repeat a run, or start Docker Desktop. */
+  | { type: 'sandbox'; action: 'run' | 'rerun' | 'cancel' | 'startDocker'; id?: string; command?: string; code?: string; language?: SandboxLanguage; profile?: SandboxProfile; network?: boolean };
 /** Host → webview messages other than state. */
 export type HostMessage = { type: 'error' | 'notice'; text: string } | { type: 'openTeam' };
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cached: 0, cacheWrite: 0, requests: 0, estimated: false });

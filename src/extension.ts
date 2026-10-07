@@ -2,8 +2,8 @@ import * as vscode from 'vscode';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
-import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, WorktreeMode, addUsage, emptyUsage } from './types';
-import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, leadAgent, message, migrateRoom, normalizeTeam, overLimit, patchLoop, roomFraming, teamPlan, unavailableText } from './core';
+import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SandboxRequest, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, WorktreeMode, addUsage, emptyUsage } from './types';
+import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, leadAgent, message, migrateRoom, normalizeTeam, overLimit, patchLoop, roomFraming, sandboxReport, teamPlan, unavailableText } from './core';
 import { RoomEngine } from './engine';
 import { OllamaClient } from './ollama';
 import { Drivers, createDrivers, createLegacyProviders, detectConnections, legacyCapabilities, nativeDriverFor, providerRuntime } from './providers';
@@ -12,11 +12,12 @@ import { RoomToolHost } from './room-tools';
 import { discoverSkills, prepareSkillWiring } from './skills';
 import { EditorTracker } from './editor-tracker';
 import { EFFORT_ORDER } from './codex-native';
-import { ROOM_COMMANDS, parseComposer, parseLoop, parseTeam, parseWorktrees, resolveMention } from './commands';
+import { ROOM_COMMANDS, SANDBOX_USAGE, parseComposer, parseLoop, parseSandbox, parseTeam, parseWorktrees, resolveMention } from './commands';
 import { DocumentService, LocalModels } from './documents';
 import { KnowledgeStore, sha256 } from './knowledge';
 import { MAX_DOCUMENT_BYTES } from './extract';
 import { RoomWorktrees, WorktreeManager, cleanCodexTrust, worktreeRoot } from './worktrees';
+import { DockerStatus, SANDBOX_DECLINED, SANDBOX_OFF, SandboxService, SandboxSettings, requestFromResult, sandboxOn, sandboxRequest, sandboxSettings, startDockerDesktop } from './sandbox';
 
 const MODES: RoomMode[] = ['orchestrated', 'sequential', 'parallel', 'pipeline'];
 const PRESETS: TaskPreset[] = ['planning', 'drafting', 'review'];
@@ -34,6 +35,8 @@ const WORKTREE_ACTIONS = ['review', 'apply', 'keep', 'discard', 'cleanup'];
 const NO_REPO = 'Worktrees need a git repository · agents share the folder.';
 const MODE_TEXT: Record<WorktreeMode, string> = { off: 'off · agents share the folder', auto: 'auto · agents that edit without asking get their own worktree when others could edit at the same time',
   always: 'always · every agent that can edit gets its own worktree' };
+const SANDBOX_SETTING_OFF = 'The sandbox is turned off in Settings (chatroom.sandbox.enabled). Turn it on there to use it.';
+const SANDBOX_ROOM_OFF = 'The sandbox is off in this room. Turn it on with /sandbox on, or in Room setup.';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 let app: ChatroomApp | undefined;
@@ -94,6 +97,11 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   private worktreesAvailable = false;
   private worktreesSwept = false;
   private worktreeNoticed = false;
+  /** Optional sandbox runs in Docker: the service, Docker's last known status, and whether orphans were swept this session. */
+  private sandbox: SandboxService;
+  private dockerChecking?: Promise<void>;
+  private sandboxSwept = false;
+  private dockerStarting = false;
   constructor(private readonly context: vscode.ExtensionContext) {
     const saved = context.workspaceState.get<unknown[]>('chatroom.rooms.v1', []);
     this.rooms = (Array.isArray(saved) ? saved : []).filter((r: any) => r && typeof r.id === 'string' && Array.isArray(r.agents) && Array.isArray(r.messages)).slice(0, 20).map(r => this.restore(r));
@@ -131,6 +139,14 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       framing: (room, agent) => this.framingFor(agent, room, false),
       log: (text, kind) => this.engine.log(text, kind ?? 'info')
     };
+    this.sandbox = new SandboxService({
+      settings: () => this.sandboxSettings(),
+      storageDir: () => context.globalStorageUri.fsPath,
+      approve: (room, agentId, request, signal) => room === this.engine.room ? this.engine.requestApproval(agentId, request, signal)
+        : Promise.resolve({ decision: 'deny', message: 'This room is not open.' }),
+      changed: () => this.changed(),
+      log: (text, kind) => this.engine.log(text, kind ?? 'tool')
+    });
     this.drivers = createDrivers(this.host);
     this.legacy = createLegacyProviders(this.ollama, models => this.copilotModels(models));
     this.engine = this.makeEngine(this.rooms[0]!);
@@ -140,6 +156,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         if (event.affectsConfiguration('chatroom.allowFullAccess')) this.enforceFullAccess();
         if (event.affectsConfiguration('chatroom.sharedMcpServers')) this.caps.clear();
         if (event.affectsConfiguration('chatroom.worktrees')) this.worktreeNotice();
+        if (event.affectsConfiguration('chatroom.sandbox')) void this.detectDocker();
         this.changed();
       }),
       vscode.workspace.onDidChangeWorkspaceFolders(() => { void this.refreshSkills(); void this.detectWorktrees(); }),
@@ -373,6 +390,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     const agent = this.rooms.flatMap(r => r.agents).find(a => a.id === agentId);
     this.engine.log(`${agent?.name ?? 'An agent'} → chatroom.${name}`, 'tool');
     if (name === 'isolate_workspace') return this.isolateTool(agentId);
+    if (name === 'sandbox_run') return this.sandboxTool(agentId, args, signal);
     return this.tools.executeRoomTool(name, args, signal);
   }
   /** isolate_workspace: an agent in Full access asks for its own worktree from its next turn. */
@@ -403,6 +421,119 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       this.notice(`${result.removed ? `Removed ${result.removed} old worktree${result.removed === 1 ? '' : 's'}.` : 'No old worktrees to clean up.'}${result.kept.length ? ` Kept branches with work: ${result.kept.join(', ')}.` : ''}`);
     }
     this.changed();
+  }
+  // ── Sandbox (optional) ────────────────────────────────────────────────────
+  private sandboxSettings(): SandboxSettings {
+    return sandboxSettings({ enabled: this.config('sandbox.enabled', true), images: this.config<unknown>('sandbox.images', undefined), cpus: this.config<unknown>('sandbox.cpus', undefined),
+      memoryMb: this.config<unknown>('sandbox.memoryMb', undefined), timeoutSeconds: this.config<unknown>('sandbox.timeoutSeconds', undefined), maxCopyMb: this.config<unknown>('sandbox.maxCopyMb', undefined) });
+  }
+  /** Docker's last known status (only checked while chatroom.sandbox.enabled is on). */
+  private dockerState(): DockerStatus {
+    if (this.dockerStarting) return { available: false, detail: 'Starting Docker Desktop…', action: 'startDocker' };
+    return this.sandbox.lastStatus ?? { available: false, detail: 'Checking Docker…' };
+  }
+  private sandboxState(room: Room): StatePayload['settings']['sandbox'] {
+    const settings = this.sandboxSettings();
+    if (!settings.enabled) return { enabled: false, available: false, detail: SANDBOX_SETTING_OFF };
+    const docker = this.dockerState();
+    return { enabled: sandboxOn(settings, room), available: docker.available, detail: docker.detail, ...(!docker.available && docker.action ? { action: docker.action } : {}) };
+  }
+  /** Checks Docker while the sandbox setting is on (nothing runs while it is off); the first time Docker answers, leftover containers are removed. */
+  private detectDocker(): Promise<void> {
+    if (!this.sandboxSettings().enabled || this.disposed) { this.changed(); return Promise.resolve(); }
+    return this.dockerChecking ??= (async () => {
+      try {
+        const status = await this.sandbox.status(0);
+        if (status.available && !this.sandboxSwept) {
+          this.sandboxSwept = true;
+          void this.sandbox.sweep().then(swept => {
+            if (swept.containers.length) this.engine.log(`Removed ${swept.containers.length} leftover sandbox container${swept.containers.length === 1 ? '' : 's'}`);
+          }, error => this.engine.log(`Sandbox cleanup skipped · ${errorText(error)}`, 'error'));
+        }
+      } catch (error) { this.engine.log(`Docker check failed · ${errorText(error)}`, 'error'); }
+      finally { this.dockerChecking = undefined; this.changed(); }
+    })();
+  }
+  /** The folder a run copies for an agent: its worktree while isolated, else the workspace. */
+  private agentFolder(room: Room, agent: Agent): string { return this.worktrees.cwdFor(room, agent) ?? this.root(); }
+  /** sandbox_run: the approval card, then the run; the agent's turn waits without timing out. */
+  private async sandboxTool(agentId: string, args: Record<string, unknown>, signal: AbortSignal): Promise<string> {
+    const room = this.rooms.find(r => r.agents.some(a => a.id === agentId)), agent = room?.agents.find(a => a.id === agentId);
+    if (!room || !agent) throw new Error('This agent is not in a Chatroom room.');
+    const settings = this.sandboxSettings();
+    if (!sandboxOn(settings, room)) throw new Error(SANDBOX_OFF);
+    if (room !== this.engine.room) throw new Error('This room is not open in Chatroom right now.');
+    const request = sandboxRequest(args, { timeoutSeconds: settings.timeoutSeconds, workdirFrom: 'agent' });
+    const hold = this.engine.holdTurn(agentId);
+    try {
+      const result = await this.sandbox.run({ room, request, requestedBy: agent.name, agentId, folder: request.workdirFrom === 'none' ? undefined : this.agentFolder(room, agent),
+        signal: hold.signal ? AbortSignal.any([signal, hold.signal]) : signal,
+        onStatus: r => { if (r.status === 'pulling' || r.status === 'running') hold.detail(r.status === 'pulling' ? `Sandbox: downloading ${r.image}` : 'Sandbox: running'); } });
+      if (result.status === 'denied') return `${SANDBOX_DECLINED}${result.error ? ` ${result.error}` : ''}`;
+      if (result.status === 'cancelled' && !room.messages.some(m => m.sandbox === result)) return 'The sandbox run was cancelled before it started.';
+      return sandboxReport(result, { tail: 8000, texts: true, max: 23_000 });
+    } finally { hold.release(); }
+  }
+  /** The user's own run (/sandbox, a code block's Run button, Run again): checked now, then the approval card from You. */
+  private async userSandbox(room: Room, request: SandboxRequest, folderAgentId?: string): Promise<void> {
+    this.requireTrust();
+    const settings = this.sandboxSettings();
+    if (!settings.enabled) throw new Error(SANDBOX_SETTING_OFF);
+    if (!sandboxOn(settings, room)) throw new Error(SANDBOX_ROOM_OFF);
+    const status = await this.sandbox.status(0);
+    this.changed();
+    if (!status.available) throw new Error(status.detail);
+    const agent = folderAgentId ? room.agents.find(a => a.id === folderAgentId) : undefined;
+    const folder = request.workdirFrom === 'none' ? undefined : agent ? this.agentFolder(room, agent) : this.root();
+    void this.sandbox.run({ room, request, requestedBy: 'You', folder }).catch(error => this.toast('error', errorText(error)));
+  }
+  /** The webview's sandbox actions: run, rerun and cancel (by the run's id or its card's message id), and start Docker Desktop. */
+  private async sandboxAction(room: Room, data: any): Promise<void> {
+    const card = typeof data.id === 'string' ? room.messages.find(m => m.sandbox && (m.sandbox.id === data.id || m.id === data.id))?.sandbox : undefined;
+    const settings = this.sandboxSettings();
+    switch (data.action) {
+      case 'run':
+        await this.userSandbox(room, sandboxRequest({ command: data.command, code: data.code, language: data.language, profile: data.profile, network: data.network === true },
+          { timeoutSeconds: settings.timeoutSeconds, workdirFrom: 'workspace' }));
+        return;
+      case 'rerun': {
+        if (!card) throw new Error('That sandbox run is not in this room.');
+        const request = this.sandbox.original(card.id)?.request ?? requestFromResult(card, settings.images, card.agentId ? 'agent' : 'workspace');
+        await this.userSandbox(room, request, card.agentId);
+        return;
+      }
+      case 'cancel':
+        if (!card || !this.sandbox.cancel(card.id)) throw new Error('This sandbox run is not running.');
+        return;
+      case 'startDocker': await this.startDocker(); return;
+    }
+  }
+  /** Starts Docker Desktop and waits for it (up to 3 minutes); without Docker it opens the download page. */
+  private async startDocker(): Promise<void> {
+    if (this.dockerStarting) return;
+    const status = await this.sandbox.status(0);
+    if (status.available) { this.changed(); void this.detectDocker(); return; }
+    if (status.action === 'installDocker') { await vscode.env.openExternal(vscode.Uri.parse('https://www.docker.com/products/docker-desktop/')); return; }
+    const error = startDockerDesktop();
+    if (error) throw new Error(error);
+    this.dockerStarting = true; this.changed();
+    try {
+      for (let i = 0; i < 60 && !this.disposed; i++) {
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        const next = await this.sandbox.status(0);
+        if (next.available) { this.toast('notice', `Docker is running · ${next.detail}.`); return; }
+      }
+      this.toast('error', 'Docker Desktop did not start within 3 minutes.');
+    } finally { this.dockerStarting = false; this.changed(); void this.detectDocker(); }
+  }
+  /** /sandbox status. */
+  private describeSandbox(room: Room): string {
+    const settings = this.sandboxSettings(), docker = this.dockerState(), running = this.sandbox.running.length;
+    if (!settings.enabled) return SANDBOX_SETTING_OFF;
+    return [`Sandbox: ${sandboxOn(settings, room) ? 'on' : 'off'} in this room${room.sandbox === undefined ? ' (setting)' : ''} · ${docker.detail}`,
+      `Images: bash ${settings.images.bash}, python ${settings.images.python}, node ${settings.images.node} · limits ${settings.cpus} CPUs, ${settings.memoryMb} MB, ${settings.timeoutSeconds} s by default · copies up to ${settings.maxCopyMb} MB.`,
+      running ? `${running} run${running === 1 ? '' : 's'} going.` : '',
+      SANDBOX_USAGE].filter(Boolean).join('\n');
   }
   private release(roomId: string, agentId?: string): Promise<void> {
     return Promise.allSettled(Object.values(this.drivers).map(driver => driver.release(roomId, agentId))).then(() => {});
@@ -458,7 +589,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       localModels: this.models, discovering: this.discovering, modelDefaults: this.defaults(),
       defaultPreset: this.config<TaskPreset>('defaultPreset', 'planning'), executionMode: this.config<RoomMode>('executionMode', 'orchestrated'), maxParallelAgents: this.config('maxParallelAgents', 3),
       settings: { allowFullAccess: this.userConfig('allowFullAccess', false), attachOpenFile, approvalTimeoutSeconds: boundedNumber(this.config('approvalTimeoutSeconds', 300), 30, 3600, 300),
-        worktrees: this.worktreeSetting(), worktreesAvailable: this.worktreesAvailable },
+        worktrees: this.worktreeSetting(), worktreesAvailable: this.worktreesAvailable, sandbox: this.sandboxState(room) },
       workspace: vscode.workspace.workspaceFolders?.[0]?.name ?? 'No folder open', trusted: vscode.workspace.isTrusted };
     const started = Date.now();
     for (const view of this.views) void view.postMessage(state);
@@ -472,6 +603,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     this.discovering = true; this.changed();
     try {
       const worktrees = this.detectWorktrees().catch(error => this.engine.log(`Worktrees: ${errorText(error)}`, 'error'));
+      void this.detectDocker();
       this.connections = await detectConnections(this.ollama, copilot, this.connections);
       await worktrees;
       this.pickLocalModels();
@@ -571,6 +703,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     const room = this.engine.room;
     const name = (id: string) => room.agents.find(a => a.id === id)?.name ?? 'Removed agent';
     const text = `# ${room.title}\n\n` + room.messages.map(m => m.kind === 'approval' && m.approval ? `> ${m.author} asked to ${m.approval.tool}: ${m.approval.title} — ${m.approval.status}\n`
+      : m.sandbox ? `## Sandbox\n\n~~~text\n${sandboxReport(m.sandbox, { tail: 4000, echo: true, texts: true, max: 40_000 })}\n~~~\n`
       : `## ${m.author}${m.step ? ` · step ${m.step.id}` : m.turn === 'synthesis' ? ' · final answer' : ''}${m.status !== 'complete' ? ` (${m.status})` : ''}\n\n${m.step ? `> ${m.step.task}\n\n` : ''}${m.text}\n${m.plan?.length ? '\n' + m.plan.map(s => `- **${s.id}** ${name(s.agentId)}: ${s.task}${s.after.length ? ` _(after ${s.after.join(', ')})_` : ''} — ${s.status}`).join('\n') + '\n' : ''}`).join('\n');
     const uri = await vscode.window.showSaveDialog({ defaultUri: vscode.Uri.file(`${this.root()}/chatroom-${room.id.slice(0, 8)}.md`), filters: { Markdown: ['md'] } });
     if (uri) await vscode.workspace.fs.writeFile(uri, Buffer.from(text));
@@ -622,7 +755,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       }
       case 'start': this.requireTrust(); await this.recheckOllama(); await this.engine.start(); break;
       case 'pause': this.engine.pause(); break;
-      case 'stop': this.engine.stop(); break;
+      case 'stop': this.sandbox.cancelRoom(room.id); this.engine.stop(); break;
       case 'stopAgent': if (typeof data.id === 'string') this.engine.stopAgent(data.id); break;
       case 'options': this.updateRoom(room, data); break;
       case 'saveDefaults': {
@@ -747,11 +880,13 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         break;
       }
       case 'worktree': await this.worktreeAction(room, data.action, typeof data.name === 'string' ? data.name : undefined); break;
+      case 'sandbox': await this.sandboxAction(room, data); break;
     }
   }
   /** Room settings from the composer chips (§9.1). Only the editor toggle is accepted while agents work. */
   private updateRoom(room: Room, data: any): void {
     if (typeof data.attachEditor === 'boolean') room.attachEditor = data.attachEditor;
+    if (typeof data.sandbox === 'boolean') { room.sandbox = data.sandbox; if (data.sandbox) void this.detectDocker(); }
     const keys = ['mode', 'leadId', 'concurrency', 'tokenBudget', 'preset', 'loop', 'shareSkills', 'permission', 'rounds', 'worktrees'].filter(key => data[key] !== undefined);
     if (keys.length && this.engine.busy) throw new Error('Pause or stop the run before changing room settings.');
     if (data.mode === 'pipeline' && !room.team) throw new Error(NO_TEAM);
@@ -866,7 +1001,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       }
       case 'new': this.newRoom(); return;
       case 'export': await this.exportRoom(); return;
-      case 'stop': this.engine.stop(); return;
+      case 'stop': this.sandbox.cancelRoom(room.id); this.engine.stop(); return;
       case 'loop': {
         const parsed = parseLoop(args);
         if (parsed.show) { this.notice(`Loop: ${this.describeLoop(room.loop)}.`); return; }
@@ -955,6 +1090,25 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
         await this.worktreeAction(room, parsed.action, parsed.name);
         return;
       }
+      case 'sandbox': {
+        const parsed = parseSandbox(args), settings = this.sandboxSettings();
+        if (parsed.error) throw new Error(parsed.error);
+        if (parsed.toggle !== undefined) {
+          room.sandbox = parsed.toggle;
+          if (!parsed.toggle) { this.notice('Sandbox off for this room: agents can\'t run code in it. Turn it on again with /sandbox on.'); return; }
+          if (!settings.enabled) { this.notice(`Sandbox on for this room, but it is turned off in Settings (chatroom.sandbox.enabled). Turn it on there to use it.`); return; }
+          await this.detectDocker();
+          const docker = this.dockerState();
+          this.notice(`Sandbox on for this room: agents can ask to run code with sandbox_run, and you can use /sandbox <command>. Every run asks you first.${docker.available ? '' : ` ${docker.detail}`}`);
+          return;
+        }
+        if (parsed.status) { await this.detectDocker(); this.notice(this.describeSandbox(room)); return; }
+        if (!settings.enabled) { this.notice(SANDBOX_SETTING_OFF); return; }
+        if (!sandboxOn(settings, room)) { this.notice(SANDBOX_ROOM_OFF); return; }
+        await this.userSandbox(room, sandboxRequest({ command: parsed.command, code: parsed.code, language: parsed.language, profile: parsed.profile, network: parsed.network,
+          timeoutSeconds: parsed.timeoutSeconds, copyFiles: parsed.copyFiles }, { timeoutSeconds: settings.timeoutSeconds, workdirFrom: 'workspace' }));
+        return;
+      }
       case 'model': {
         idle();
         if (targets.length !== 1) throw new Error('Mention the agent: @Claude /model opus');
@@ -1011,6 +1165,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   dispose(): Promise<void> {
     if (this.disposed) return this.disposed;
     this.engine.dispose();
+    this.sandbox.dispose();
     for (const controller of this.ingestions.values()) controller.abort();
     void this.knowledge.flush();
     // Drivers start killing their processes synchronously; deactivate waits for them.
