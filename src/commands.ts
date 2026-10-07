@@ -1,4 +1,5 @@
-import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo } from './types';
+import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo, TeamConfig } from './types';
+import { normalizeTeam } from './core';
 
 export const ROOM_COMMANDS: RoomCommandInfo[] = [
   { name: 'help', description: 'Show Chatroom commands', agentScoped: false },
@@ -7,8 +8,9 @@ export const ROOM_COMMANDS: RoomCommandInfo[] = [
   { name: 'new', description: 'Open a new room', agentScoped: false },
   { name: 'export', description: 'Export this conversation as Markdown', agentScoped: false },
   { name: 'loop', args: '[N | consensus | done | every 10m <prompt> | off]', description: "Repeat the room's work until a condition or limit", agentScoped: false },
-  { name: 'mode', args: 'team | relay | parallel', description: 'Choose how agents collaborate', agentScoped: false },
+  { name: 'mode', args: 'team | relay | parallel | custom', description: 'Choose how agents collaborate', agentScoped: false },
   { name: 'lead', args: '<agent>', description: 'Choose the lead for Team mode', agentScoped: false },
+  { name: 'team', args: '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', description: 'Set up your own team: stages such as lead, drafting, review, testing', agentScoped: false },
   { name: 'model', args: '<model>', description: 'Set the model of the mentioned agent', agentScoped: true },
   { name: 'effort', args: '<level>', description: 'Set reasoning effort for the mentioned agents (or all)', agentScoped: true },
   { name: 'permissions', args: 'plan | ask | auto | full', description: 'Set what agents may do without asking', agentScoped: true },
@@ -225,4 +227,29 @@ function offsetOf(text: string, n: number): number {
   let m: RegExpExecArray | null, i = 0;
   while ((m = re.exec(text))) { if (i++ === n) return m.index; }
   return text.length;
+}
+const TEAM_USAGE = 'Usage: /team · /team <saved name> · /team Lead: Claude > Draft: Codex > Review: Claude, Copilot · /team save <name> · /team edit · /team off';
+export interface ParsedTeam { show?: true; off?: true; edit?: true; save?: string; remove?: string; use?: string; team?: TeamConfig; error?: string }
+/** /team arguments: show, off, edit, save <name>, delete <name>, an inline team ("Lead: Claude > Draft: Codex (first pass) > Review: Claude, Copilot") or a team name. */
+export function parseTeam(args: string): ParsedTeam {
+  const text = (args ?? '').trim(), lower = text.toLowerCase();
+  if (!text) return { show: true };
+  if (lower === 'off') return { off: true };
+  if (lower === 'edit') return { edit: true };
+  const named = /^(save|delete|remove)(?:\s+([\s\S]*))?$/i.exec(text);
+  if (named) {
+    const name = (named[2] ?? '').trim().slice(0, 40);
+    if (named[1]!.toLowerCase() === 'save') return { save: name };
+    return name ? { remove: name } : { error: TEAM_USAGE };
+  }
+  if (!text.includes(':')) return { use: text };
+  const stages = text.split(/\s*(?:->|→|>|\||;|\n)\s*/).map(part => part.trim()).filter(Boolean).map(part => {
+    const colon = part.indexOf(':'), name = colon >= 0 ? part.slice(0, colon).trim() : '';
+    let refs = colon >= 0 ? part.slice(colon + 1).trim() : part, task = '';
+    const paren = /\(([^()]*)\)\s*$/.exec(refs);
+    if (paren) { task = paren[1]!.trim(); refs = refs.slice(0, paren.index).trim(); }
+    return { name, agents: refs.split(/\s*[,+&]\s*|\s+and\s+/i).map(r => r.trim()).filter(Boolean), ...(task ? { task } : {}) };
+  });
+  const team = normalizeTeam({ name: 'Custom team', stages });
+  return team ? { team } : { error: `That team has no stage with an agent. ${TEAM_USAGE}` };
 }

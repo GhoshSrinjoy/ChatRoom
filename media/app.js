@@ -5,6 +5,8 @@
   const saved = bridge.getState() || {};
   let state, tab = saved.tab || 'usage', editing, dialogKind = '', dialogDirty = false, dialogHtml = '', returnFocus, returnKey = '', lastRoom, nearBottom = true, lastSent;
   let droppedKey = '', think = false, ultra = false, pop = '', popAnchor, popHtml = '', confirmClose;
+  // Team builder: the draft being edited (agent NAMES, not ids), the saved team it came from, and the dialog to return to.
+  let teamDraft, teamOrigin = '', teamFrom = '', teamError = '', teamBack;
   const ultraConfirmed = saved.ultraConfirmed || {}, openState = new Map(), nodes = new Map(), capsAsked = {};
   const menu = { open: false, kind: '', query: '', start: 0, end: 0, items: [], index: 0 };
   const $ = id => document.getElementById(id);
@@ -46,7 +48,10 @@
     alert: '<path d="M12 3.5 2.5 20h19Z"/><path d="M12 10v4.5M12 17.2h.01"/>',
     tool: '<path d="M14.5 4.5a4.5 4.5 0 0 0-5.3 5.9l-5.7 5.7v4.4h4.4l5.7-5.7a4.5 4.5 0 0 0 5.9-5.3l-2.8 2.8-2.9-.6-.6-2.9Z"/>',
     book: '<path d="M4 4.5h5.5A2.5 2.5 0 0 1 12 7v13a2 2 0 0 0-2-2H4ZM20 4.5h-5.5A2.5 2.5 0 0 0 12 7v13a2 2 0 0 1 2-2h6Z"/>',
-    compress: '<path d="M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5"/>'
+    compress: '<path d="M4 9h5V4M20 9h-5V4M4 15h5v5M20 15h-5v5"/>',
+    clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+    ban: '<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>',
+    up: '<path d="m6 15 6-6 6 6"/>', down: '<path d="m6 9 6 6 6-6"/>'
   };
   const icon = name => name === 'logo' ? icons.logo : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.grid}</svg>`;
   // Provider glyphs. Copilot (copilot-16) and Ollama (cpu-16) are Primer Octicons, MIT (see ThirdPartyNotices.txt); Codex and Claude are drawn here.
@@ -64,12 +69,14 @@
     ['read_document', 'Read documents', 'file', 'Read a PDF, Word (.docx) or image file from the workspace as text, using local OCR for scans and images. It also attaches the file to the room so every agent can search it. Use your own tools for plain text files.'],
     ['semantic_search', 'Semantic search', 'search', 'Find relevant workspace code or text snippets with the local embedding model.'],
     ['ollama_ocr', 'Local OCR', 'eye', 'Extract text from a workspace image with the local vision model.']];
-  const modeLabels = { orchestrated: 'Team', sequential: 'Relay', parallel: 'Parallel' };
+  const modeLabels = { orchestrated: 'Team', sequential: 'Relay', parallel: 'Parallel', pipeline: 'Custom team' };
   const modeHelp = {
     orchestrated: 'The lead gets your message first. It answers itself or splits the work for the team; independent steps run in parallel, and the lead writes the final answer.',
     sequential: 'Agents reply one after another, and each builds on the replies before it.',
-    parallel: 'Agents answer independently at the same time. The next round sees all replies.'
+    parallel: 'Agents answer independently at the same time. The next round sees all replies.',
+    pipeline: 'Your own stages, in order — for example lead, drafting, review, testing. Set them up with Edit team or /team.'
   };
+  const presetLabels = { planning: 'Planning', drafting: 'Drafting', review: 'Review' };
   const permLabels = { plan: 'Plan', ask: 'Ask', 'auto-edit': 'Auto-edit', full: 'Full access' };
   const permHelp = { plan: 'Read and plan only', ask: 'Ask before edits and commands (approval cards)', 'auto-edit': 'Edit files freely, ask for the rest', full: 'No approvals. Use with care' };
   const effortLabels = { none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultra: 'Ultra' };
@@ -141,6 +148,48 @@
   function leadOf(r) { return r.agents.find(a => a.id === r.leadId && a.enabled) || r.agents.find(a => a.enabled); }
   function needsSetup(a) { const c = caps(a); if (c) return ['missing', 'signed-out', 'error'].includes(c.status); const k = conn(a); return !k || ['missing', 'error'].includes(k.status); }
   function avatar(agent, extra = '') { const p = agent?.provider; return `<span class="avatar ${esc(p || 'ollama')} ${extra}" aria-hidden="true">${GLYPHS[p] || GLYPHS.ollama}</span>`; }
+  const clip = (text, max) => { const s = String(text ?? ''); return s.length > max ? s.slice(0, max - 1) + '…' : s; };
+  // Availability: a mark from the host (out of usage, not installed, signed out, model or server missing) until it expires.
+  function unavailOf(a) { const u = a?.unavailable; return u && (!u.until || u.until > Date.now()) ? u : undefined; }
+  function untilText(at, short) {
+    const d = new Date(at), hm = { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' };
+    if (short && d.toDateString() === new Date().toDateString()) return d.toLocaleTimeString('en', hm);
+    if (at - Date.now() > 6 * 864e5) return d.toLocaleString('en', { month: 'short', day: 'numeric', ...(short ? {} : hm) });
+    return d.toLocaleString('en', { weekday: 'short', ...hm });
+  }
+  function unavailLabel(u) {
+    return ({ 'usage-limit': u.until ? `Out of usage · back ${untilText(u.until)}` : 'Out of usage', missing: 'Not installed', 'signed-out': 'Signed out', model: `Model ${u.model || 'default'} unavailable`, offline: 'Not running' })[u.reason] || 'Unavailable';
+  }
+  function unavailShort(u) { return ({ 'usage-limit': u.until ? 'back ' + untilText(u.until, true) : 'out of usage', missing: 'not installed', 'signed-out': 'signed out', model: 'no model', offline: 'offline' })[u.reason] || 'unavailable'; }
+  const unavailIcon = u => u.reason === 'usage-limit' || u.reason === 'offline' ? 'clock' : 'ban';
+  function unavailNote(a, modelHint) {
+    const u = unavailOf(a); if (!u) return '';
+    return `<strong>${esc(unavailLabel(u))}.</strong> Chatroom skips ${esc(a.name)} and continues with the others.${u.reason === 'model' ? ' ' + modelHint : ''}`;
+  }
+  const retryButton = a => `<button type="button" class="outline-button inline" data-agent-retry="${esc(a.id)}" title="${esc(`Clear the mark; ${a.name} is tried again on the next message`)}">Try again now</button>`;
+  function unavailBanner(a) {
+    const u = unavailOf(a); if (!u) return '';
+    return `<div class="unavailable-banner" role="status">${icon(unavailIcon(u))}<div class="unavailable-text">${unavailNote(a, 'Choose another model below, or Default.')}${u.detail ? `<small title="${esc(u.detail)}">${esc(u.detail)}</small>` : ''}</div>${retryButton(a)}</div>`;
+  }
+  function unavailLine(a) {
+    const u = unavailOf(a);
+    return u ? `<div class="unavail-line">${icon(unavailIcon(u))}<span title="${esc(u.detail || '')}">${unavailNote(a, 'Choose another model in its settings.')}</span>${retryButton(a)}</div>` : '';
+  }
+  // Team stages name agents (or providers); resolved like the host: agent name, else a provider with exactly one enabled agent.
+  function resolveRef(ref, agents = enabledAgents()) {
+    const k = String(ref).trim().toLowerCase(), byName = agents.find(a => a.name.toLowerCase() === k);
+    if (byName) return byName;
+    const same = agents.filter(a => a.provider === k || names[a.provider].toLowerCase() === k);
+    return same.length === 1 ? same[0] : undefined;
+  }
+  const refIs = (ref, a) => String(ref).trim().toLowerCase() === a.name.toLowerCase() || resolveRef(ref) === a;
+  function stageAgents(stage) { const out = []; for (const ref of stage.agents || []) { const a = resolveRef(ref); if (a && !out.includes(a)) out.push(a); } return out; }
+  function teamPlan(team) { return (team.stages || []).map(s => { const list = stageAgents(s); return `${s.name} (${list.length ? list.map(a => a.name).join(', ') : 'nobody'})`; }).join(' → '); }
+  function pipelineLeadOf(r) { const s = r.team?.stages?.find(x => x.lead); return s && stageAgents(s).find(a => !unavailOf(a)); }
+  const savedTeams = () => (state.teams || []).filter(t => !t.builtIn);
+  const sameName = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+  const canonTeam = t => JSON.stringify([String(t.name || '').trim().toLowerCase(), !!t.wrapUp, (t.stages || []).map(s => [String(s.name || '').trim(), (s.agents || []).map(x => String(x).trim().toLowerCase()), s.run === 'relay', !!s.lead, s.task || '', s.preset || ''])]);
+  const plainTeam = t => { const { builtIn, ...rest } = JSON.parse(JSON.stringify(t)); return rest; };
   // Replaces the markup only when it changed, and moves keyboard focus to the same control in the new markup.
   function setHtml(el, html) {
     if (!el || el._html === html) return;
@@ -175,32 +224,36 @@
     renderStrip(); renderChips(); renderContextChips(); renderRunControls();
     const activeNames = r.agents.filter(a => (r.activeAgents || [r.currentAgent]).includes(a.id)).map(a => a.name);
     const failed = Object.values(r.agentStates || {}).filter(s => s.status === 'error').length;
-    const modeText = r.mode === 'parallel' ? `Parallel (max ${r.concurrency || 3})` : r.mode === 'orchestrated' ? `Lead + team (max ${r.concurrency || 3} in parallel)` : 'Relay';
+    const p = r.progress, modeText = p ? `Custom team · stage ${p.stage}/${p.total}: ${p.name}` : r.mode === 'pipeline' ? 'Custom team' + (r.team ? ' · ' + r.team.name : '') : r.mode === 'parallel' ? `Parallel (max ${r.concurrency || 3})` : r.mode === 'orchestrated' ? `Lead + team (max ${r.concurrency || 3} in parallel)` : 'Relay';
     const loopText = r.loopState && !r.loopState.stoppedReason && r.loop.kind !== 'once' ? ` · loop ${r.loopState.iteration}` : '';
     $('runtime-status').textContent = modeText + ' · ' + activeNames.length + ' running · ' + (r.queuedTurns || 0) + ' queued' + (failed ? ' · ' + failed + ' failed' : '') + loopText + (activeNames.length ? ' — ' + activeNames.join(', ') : '');
-    $('prompt').placeholder = r.mode === 'orchestrated' ? `Message the team · ${leadOf(r)?.name || 'the lead'} leads — @ to mention, / for commands` : 'Message the room — @ to mention, / for commands';
+    $('prompt').placeholder = r.mode === 'pipeline' && r.team ? `Message the team · ${r.team.name} — @ to mention, / for commands` : r.mode === 'orchestrated' ? `Message the team · ${leadOf(r)?.name || 'the lead'} leads — @ to mention, / for commands` : 'Message the room — @ to mention, / for commands';
     renderMessages(); renderPopover(); renderInspector(); refreshDialog();
     if (menu.open) openMenu(menu.kind, menu.query, menu.start, menu.end, false);
   }
   function statusOf(a) {
     if (!a.enabled) return 'off';
-    const r = state.room, s = r.agentStates?.[a.id]?.status;
-    if (s && s !== 'complete' && s !== 'stopped') return s;
+    const r = state.room, s = r.agentStates?.[a.id]?.status, u = unavailOf(a);
+    if (s && !['complete', 'stopped', 'unavailable'].includes(s) && !(u && s === 'error')) return s;
     if ((r.activeAgents || [r.currentAgent]).includes(a.id)) return 'active';
+    if (u) return 'unavailable';
     if (needsSetup(a)) return 'setup';
-    return s || 'idle';
+    return s === 'unavailable' ? 'idle' : s || 'idle';
   }
   function stateLabel(a, s) {
     const detail = state.room.agentStates?.[a.id]?.detail;
+    if (s === 'unavailable') return unavailLabel(unavailOf(a));
     return ({ off: 'Off', thinking: 'Thinking…', active: 'Working…', tool: 'Using ' + (detail || 'a tool'), approval: 'Waiting for your approval', queued: 'Queued', complete: 'Done', error: 'Failed', stopped: 'Stopped', idle: 'Ready' })[s] || (s === 'setup' ? caps(a)?.detail || conn(a)?.detail || 'Setup needed' : s);
   }
   function renderStrip() {
     const r = state.room, lead = leadOf(r);
     $('team-strip').classList.toggle('team-mode', r.mode === 'orchestrated');
     setHtml($('team-pills'), r.agents.map(a => {
-      const s = statusOf(a), isLead = lead?.id === a.id, native = isNative(a), effort = native ? opts(a).effort : '';
-      const tip = [a.name, runtimeLabel(a), modelName(a), 'effort ' + (effort ? effortLabel(effort) : 'default'), native ? permLabels[perm(a)] + (supports(a, 'sandbox') ? ' (sandbox ' + sandboxOf(opts(a)) + ')' : '') : 'Read-only (Chatroom tools)', stateLabel(a, s)].join(' · ') + (isLead ? ' · lead' : '') + ' · click for settings';
-      return `<button type="button" class="agent-pill status-${esc(s)}${isLead ? ' is-lead' : ''}${a.enabled ? '' : ' is-off'}" data-agent="${esc(a.id)}" aria-label="${esc(a.name)} settings" title="${esc(tip)}">${avatar(a, 'mini')}<span class="pill-name">${esc(a.name)}</span><span class="pill-meta">${esc(shortModel(a) + (effort ? ' · ' + effortLabel(effort) : ''))}</span>${isLead ? `<span class="lead-star">${icon('star')}</span>` : ''}<span class="pill-dot"></span></button>`;
+      const s = statusOf(a), isLead = lead?.id === a.id, native = isNative(a), effort = native ? opts(a).effort : '', u = s === 'unavailable' && unavailOf(a);
+      const tip = [a.name, runtimeLabel(a), modelName(a), 'effort ' + (effort ? effortLabel(effort) : 'default'), native ? permLabels[perm(a)] + (supports(a, 'sandbox') ? ' (sandbox ' + sandboxOf(opts(a)) + ')' : '') : 'Read-only (Chatroom tools)', stateLabel(a, s)].join(' · ') + (isLead ? ' · lead' : '')
+        + (u ? (u.detail ? ' · ' + clip(u.detail, 160) : '') + (u.until ? ' · Skipped until then' : ' · Skipped for now') : '') + ' · click for settings';
+      const meta = u ? unavailShort(u) : shortModel(a) + (effort ? ' · ' + effortLabel(effort) : '');
+      return `<button type="button" class="agent-pill status-${esc(s)}${isLead ? ' is-lead' : ''}${a.enabled ? '' : ' is-off'}" data-agent="${esc(a.id)}" aria-label="${esc(a.name + ' settings' + (u ? ', ' + unavailLabel(u) : ''))}" title="${esc(tip)}">${avatar(a, 'mini')}<span class="pill-name">${esc(a.name)}</span><span class="pill-meta">${esc(meta)}</span>${isLead ? `<span class="lead-star">${icon('star')}</span>` : ''}${u ? `<span class="pill-icon">${icon(unavailIcon(u))}</span>` : '<span class="pill-dot"></span>'}</button>`;
     }).join('') || '<span class="strip-empty">No agents yet. Add one with +</span>');
   }
   function loopLabel(r) {
@@ -215,7 +268,9 @@
   function chip(id, iconName, label, title) { const el = $(id); setHtml(el, `${icon(iconName)}<span class="chip-label">${esc(label)}</span>`); el.title = title; el.setAttribute('aria-label', `${CHIP_NAMES[id]}: ${label}`); }
   function renderChips() {
     const r = state.room, enabled = enabledAgents(), natives = enabled.filter(isNative), lead = leadOf(r), running = busy();
-    chip('chip-team', 'users', r.mode === 'orchestrated' ? `Team · ${lead?.name || 'no'} lead${lead ? 's' : ''}` : r.mode === 'parallel' ? 'Parallel' : 'Relay', `How agents work together: ${modeHelp[r.mode || 'sequential']} Click to change the mode or the lead.`);
+    const team = r.mode === 'pipeline' && r.team;
+    chip('chip-team', 'users', team ? `Team · ${clip(team.name, 22)}` : r.mode === 'pipeline' ? 'Custom team' : r.mode === 'orchestrated' ? `Team · ${lead?.name || 'no'} lead${lead ? 's' : ''}` : r.mode === 'parallel' ? 'Parallel' : 'Relay',
+      team ? `How agents work together: your team "${team.name}", stage by stage: ${teamPlan(team)}. Click to change the team or the mode.` : `How agents work together: ${modeHelp[r.mode || 'sequential']} Click to change the mode or the lead.`);
     chip('chip-loop', 'loop', loopLabel(r), r.loopState?.stoppedReason ? `Loop stopped: ${r.loopState.stoppedReason}` : 'Repeat the room\'s work until a condition or limit');
     $('chip-loop').classList.toggle('muted', r.loop.kind === 'once');
     const perms = new Set(natives.map(perm)), level = perms.size === 1 ? [...perms][0] : '';
@@ -346,7 +401,8 @@
   }
   function chatNode(m) {
     const r = state.room, agent = agentById(m.agentId), article = document.createElement('article'), streaming = m.status === 'streaming';
-    const turnChip = ({ plan: 'Plan', step: `Step ${m.step?.id || ''}`, synthesis: 'Final answer', direct: '1:1', handoff: 'Hand-off', command: 'Command' })[m.turn] || '';
+    const st = m.stage, turnChip = st ? `${st.name} · ${st.index + 1}/${st.total}` : ({ plan: 'Plan', step: `Step ${m.step?.id || ''}`, synthesis: 'Final answer', direct: '1:1', handoff: 'Hand-off', command: 'Command' })[m.turn] || '';
+    const chipClass = st ? 'stage' + (st.lead ? ' lead' : '') : m.turn, chipTitle = st ? `Team stage ${st.index + 1} of ${st.total}: ${st.name}${st.lead ? ' (lead)' : ''}` : '';
     const planMessage = m.step?.plan && r.messages.find(p => p.id === m.step.plan);
     const inputs = (m.step?.after || []).map(id => { const s = planMessage?.plan?.find(p => p.id === id); const a = s && agentById(s.agentId); return a ? `${a.name} (${id})` : id; });
     const marker = markerOf(m);
@@ -355,7 +411,7 @@
     if (marker === 'done') text = text.replace(/\s*\[DONE\]\s*$/, '');
     article.className = `message ${m.kind} ${m.status}${m.turn ? ` turn-${m.turn}` : ''}`; article.dataset.id = m.id;
     const who = m.kind === 'user' ? `<span class="avatar user-avatar">${m.author === 'Loop' ? icon('loop') : 'Y'}</span>` : avatar(agent || { provider: 'ollama' });
-    article.innerHTML = `<div class="message-avatar">${who}</div><div class="message-main"><div class="message-heading"><strong>${esc(m.author)}</strong>${turnChip ? `<span class="turn-chip ${esc(m.turn)}">${esc(turnChip)}</span>` : ''}${m.handoff ? handoffChip(m) : ''}${agent ? `<span class="model-label">${esc(agent.model || names[agent.provider])}</span>` : m.kind === 'user' ? '<span class="model-label">You</span>' : ''}<time>${clock(m.createdAt)}</time></div>${m.step ? `<div class="step-task">${esc(m.step.task)}${inputs.length ? `<span class="builds-on"> · builds on ${esc(inputs.join(', '))}</span>` : ''}</div>` : ''}${m.thinking ? `<details class="thinking-block" data-id="${esc(m.id)}-t"${isOpen(m.id + '-t', streaming) ? ' open' : ''}><summary>Thinking</summary><div class="thinking-text"></div></details>` : ''}${m.activity?.length ? activityHtml(m) : ''}<div class="message-content"></div>${m.plan?.length ? renderPlan(m.plan, r.agents) : ''}${m.kind === 'user' ? userMeta(m) : ''}<div class="message-footer"></div></div>`;
+    article.innerHTML = `<div class="message-avatar">${who}</div><div class="message-main"><div class="message-heading"><strong>${esc(m.author)}</strong>${turnChip ? `<span class="turn-chip ${esc(chipClass)}"${chipTitle ? ` title="${esc(chipTitle)}"` : ''}>${esc(turnChip)}</span>` : ''}${m.handoff ? handoffChip(m) : ''}${agent ? `<span class="model-label">${esc(agent.model || names[agent.provider])}</span>` : m.kind === 'user' ? '<span class="model-label">You</span>' : ''}<time>${clock(m.createdAt)}</time></div>${m.step ? `<div class="step-task">${esc(m.step.task)}${inputs.length ? `<span class="builds-on"> · builds on ${esc(inputs.join(', '))}</span>` : ''}</div>` : ''}${m.thinking ? `<details class="thinking-block" data-id="${esc(m.id)}-t"${isOpen(m.id + '-t', streaming) ? ' open' : ''}><summary>Thinking</summary><div class="thinking-text"></div></details>` : ''}${m.activity?.length ? activityHtml(m) : ''}<div class="message-content"></div>${m.plan?.length ? renderPlan(m.plan, r.agents) : ''}${m.kind === 'user' ? userMeta(m) : ''}<div class="message-footer"></div></div>`;
     const thinking = article.querySelector('.thinking-text'); if (thinking) thinking.textContent = m.thinking;
     article.querySelectorAll('.act-diff').forEach(pre => fillDiff(pre, m.activity[Number(pre.dataset.diff)]?.diff || ''));
     const content = article.querySelector('.message-content');
@@ -423,14 +479,26 @@
   function teamPop() {
     const r = state.room, dis = busy() ? ' disabled' : '', lead = leadOf(r), preset = r.preset || state.defaultPreset || 'planning';
     return `<div class="pop-title">How the agents work together</div><div class="radio-list" role="radiogroup" aria-label="Collaboration mode">${Object.keys(modeLabels).map(mode => `<label class="radio-row"><input type="radio" name="mode" value="${mode}" ${(r.mode || 'sequential') === mode ? 'checked' : ''}${dis}><span><strong>${modeLabels[mode]}</strong><small>${esc(modeHelp[mode])}</small></span></label>`).join('')}</div>`
+      + `<div class="pop-section team-section" role="group" aria-labelledby="team-pop-title"><div class="pop-title" id="team-pop-title">Your team</div><label class="pop-field">Team<select id="team-select"${dis}>${teamSelectOptions()}</select></label>`
+      + (r.team ? `<p class="team-plan"${r.mode === 'pipeline' ? '' : ' title="Not in use. Choose Custom team to use it."'}>${esc(teamPlan(r.team))}</p>` : '<p class="team-plan">Set up stages such as lead, drafting, review and testing.</p>')
+      + `<div class="pop-actions"><button type="button" class="outline-button" data-team-open="edit">${icon('edit')} Edit team…</button><button type="button" class="outline-button" data-team-open="new">${icon('plus')} New team…</button></div></div>`
       + `<label class="pop-field">Lead${r.mode === 'orchestrated' ? '' : ' <span class="subtle">for @lead and "Until done" loops</span>'}<select id="lead-select"${dis}>${enabledAgents().map(a => `<option value="${esc(a.id)}" ${lead?.id === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>`
       + `<label class="pop-field">Model routing<select id="preset-select"${dis}>${['planning', 'drafting', 'review'].map(p => `<option value="${p}" ${preset === p ? 'selected' : ''}>${p[0].toUpperCase() + p.slice(1)}</option>`).join('')}</select></label>`
       + `<label class="pop-field">Parallel limit<select id="parallel-limit"${dis}>${[1, 2, 3, 4].map(n => `<option ${n === (r.concurrency || 3) ? 'selected' : ''}>${n}</option>`).join('')}</select></label>`
       + `<p class="fine-print">Start a line with @Name to talk to one agent. Agents hand work to each other the same way.${busy() ? ' Wait for the agents to finish to change these.' : ''}</p>`;
   }
+  // Saved teams and templates; the room's own team is listed separately when it matches none of them.
+  function teamSelectOptions() {
+    const r = state.room, list = state.teams || [], match = r.team ? list.find(t => canonTeam(t) === canonTeam(r.team)) : undefined;
+    const selected = r.mode === 'pipeline' && r.team ? (match ? 't:' + match.name : 'room') : '';
+    return (selected ? '' : '<option value="" selected>Choose a team…</option>')
+      + (r.team && !match ? `<option value="room"${selected === 'room' ? ' selected' : ''}>Current room team</option>` : '')
+      + list.map(t => `<option value="${esc('t:' + t.name)}"${selected === 't:' + t.name ? ' selected' : ''}>${esc(t.name + (t.builtIn ? ' · template' : ''))}</option>`).join('');
+  }
   function loopPop() {
     const r = state.room, l = r.loop, dis = busy() ? ' disabled' : '', ls = r.loopState;
-    const kinds = [['once', 'Once', 'One pass, then stop'], ['rounds', 'Rounds', 'A fixed number of passes'], ['consensus', 'Until agree', 'Until every agent ends with [AGREE]'], ['lead-done', 'Until done', `Until ${leadOf(r)?.name || 'the lead'} (the lead) ends with [DONE]`], ['interval', 'Every few minutes', 'Repeat on a timer']];
+    const leader = (r.mode === 'pipeline' && r.team ? pipelineLeadOf(r) : leadOf(r))?.name || 'the lead';
+    const kinds = [['once', 'Once', 'One pass, then stop'], ['rounds', 'Rounds', 'A fixed number of passes'], ['consensus', 'Until agree', 'Until every agent ends with [AGREE]'], ['lead-done', 'Until done', `Until ${leader} (the lead) ends with [DONE]`], ['interval', 'Every few minutes', 'Repeat on a timer']];
     const field = (forKinds, label, input) => `<label class="pop-field"${forKinds ? ` data-loop-for="${forKinds}"` : ''}>${label}${input}</label>`;
     return `<form id="loop-form"><div class="pop-title">Repeat the room's work</div><div class="radio-list" role="radiogroup" aria-label="Loop">${kinds.map(([k, label, help]) => `<label class="radio-row"><input type="radio" name="loop-kind" value="${k}" ${l.kind === k ? 'checked' : ''}${dis}><span><strong>${label}</strong><small>${esc(help)}</small></span></label>`).join('')}</div><div class="loop-fields">`
       + field('rounds', 'Rounds', `<input id="loop-rounds" type="number" min="1" max="50" value="${Number(l.rounds) || 2}"${dis}>`)
@@ -565,7 +633,7 @@
     const q = query.toLowerCase(), items = [], r = state.room, lead = leadOf(r);
     if ('all'.startsWith(q)) items.push({ insert: '@all ', name: '@all', desc: 'Everyone, using the room mode' });
     if (r.mode === 'orchestrated' && lead && 'lead'.startsWith(q)) items.push({ insert: '@lead ', name: '@lead', desc: `${lead.name} · the lead` });
-    for (const a of enabledAgents()) if (a.name.toLowerCase().split(/[\s._-]+/).some(w => w.startsWith(q)) || a.name.toLowerCase().startsWith(q) || a.provider.startsWith(q)) items.push({ insert: quoteName(a.name) + ' ', name: a.name, desc: `${modelName(a)} · ${runtimeLabel(a)}`, avatar: avatar(a, 'mini'), agent: a.id });
+    for (const a of enabledAgents()) if (a.name.toLowerCase().split(/[\s._-]+/).some(w => w.startsWith(q)) || a.name.toLowerCase().startsWith(q) || a.provider.startsWith(q)) items.push({ insert: quoteName(a.name) + ' ', name: a.name, desc: (unavailOf(a) ? unavailLabel(unavailOf(a)) + ' · ' : '') + `${modelName(a)} · ${runtimeLabel(a)}`, avatar: avatar(a, 'mini'), agent: a.id });
     return items;
   }
   function detectMenu() {
@@ -637,7 +705,12 @@
     layer.hidden = false; layer.innerHTML = `<section class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">${html}</section>`;
     (layer.querySelector('[data-autofocus]') || layer.querySelector('input,select,button,textarea'))?.focus();
   }
-  function closeDialog() { if ($('dialog-layer').hidden) return; $('dialog-layer').hidden = true; $('dialog-layer').replaceChildren(); editing = undefined; dialogKind = ''; (returnFocus?.isConnected ? returnFocus : returnKey && document.querySelector(returnKey))?.focus?.(); }
+  function closeDialog() {
+    if ($('dialog-layer').hidden) return;
+    // The team builder opened from Room setup or Models and defaults returns there.
+    if (dialogKind === 'team' && teamBack) { const back = teamBack; teamBack = undefined; back.open(); if (back.key) $('dialog-layer').querySelector(back.key)?.focus(); return; }
+    $('dialog-layer').hidden = true; $('dialog-layer').replaceChildren(); editing = undefined; dialogKind = ''; (returnFocus?.isConnected ? returnFocus : returnKey && document.querySelector(returnKey))?.focus?.();
+  }
   function rerenderDialog(html) {
     const box = $('dialog-layer').querySelector('.dialog'); if (!box) return;
     const scroll = box.scrollTop, active = document.activeElement, key = box.contains(active) ? keyOf(active) : '', advanced = box.querySelector('details.advanced')?.open;
@@ -650,9 +723,13 @@
     if (dialogKind === 'agent') {
       const a = agentById(editing); if (!a) { closeDialog(); return; }
       if (!dialogDirty) { const html = agentDialog(a); if (html !== dialogHtml) rerenderDialog(html); }
-      else setHtml($('agent-session'), sessionHtml(a));
+      else { setHtml($('agent-session'), sessionHtml(a)); setHtml($('agent-unavail'), unavailBanner(a)); }
     } else if (dialogKind === 'setup') { const html = setupDialog(); if (html !== dialogHtml) rerenderDialog(html); }
+    // The builder's fields write to the draft as you type; never replace a field that is being edited.
+    else if (dialogKind === 'team') { if (!editingField($('dialog-layer'))) { const html = teamDialog(); if (html !== dialogHtml) rerenderDialog(html); } }
+    else if (dialogKind === 'defaults') setHtml($('defaults-teams'), teamListHtml());
   }
+  function editingField(root) { const a = document.activeElement; return !!root?.contains(a) && (a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || (a.tagName === 'INPUT' && !['radio', 'checkbox'].includes(a.type))); }
   function agentModelOptions(a, selected) {
     const models = modelsOf(a);
     return '<option value="">Automatic / client default</option>' + (selected && !models.some(m => m.id === selected) ? `<option value="${esc(selected)}" selected>${esc(selected)} (saved)</option>` : '') + models.map(m => `<option value="${esc(m.id)}" ${selected === m.id ? 'selected' : ''} title="${esc(m.description || '')}">${esc(m.name)}${m.remote ? ' · cloud' : ''}</option>`).join('');
@@ -690,7 +767,7 @@
     const lead = leadOf(state.room)?.id === a.id;
     const leadControl = a.enabled ? `<p class="lead-line">${lead ? `${icon('star')} Leads this room${state.room.mode === 'orchestrated' ? '' : ' (used for @lead and "Until done" loops)'}` : `<button type="button" class="text-button link" data-make-lead="${esc(a.id)}"${running ? ' disabled' : ''}>Make ${esc(a.name)} the lead</button>`}</p>` : '';
     return `<div class="dialog-heading">${avatar(a)}<div class="dialog-heading-text"><h2 id="dialog-title">Agent settings</h2><p class="runtime-line">${runtime}</p></div><label class="switch" title="Take part in this room"><input type="checkbox" id="agent-enabled" role="switch" aria-label="${esc(a.name)} takes part" ${a.enabled ? 'checked' : ''}></label><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div>`
-      + leadControl + `<form id="agent-form"><label>Display name<input id="agent-name" maxlength="40" value="${esc(a.name)}" data-autofocus></label>`
+      + `<div id="agent-unavail">${unavailBanner(a)}</div>` + leadControl + `<form id="agent-form"><label>Display name<input id="agent-name" maxlength="40" value="${esc(a.name)}" data-autofocus></label>`
       + `<div class="field-row"><label>Model<select id="agent-model">${agentModelOptions(a, a.model)}</select></label><label id="effort-field"${efforts.length ? '' : ' hidden'}>Effort<select id="agent-effort">${effortOptions(efforts, o.effort)}</select></label></div>`
       + (sup('thinking') ? `<label class="check-row"><input type="checkbox" id="agent-thinking" ${o.thinking !== 'off' ? 'checked' : ''}><span>Extended thinking</span></label>` : '')
       + (sup('summary') ? `<label>Reasoning summary<select id="agent-summary">${['auto', 'concise', 'detailed', 'none'].map(s => `<option value="${s}" ${o.summary === s ? 'selected' : ''}>${s[0].toUpperCase() + s.slice(1)}</option>`).join('')}</select></label>` : '')
@@ -730,9 +807,10 @@
   function setupDialog() {
     const r = state.room, lead = leadOf(r), dis = busy() ? ' disabled' : '', preset = r.preset || state.defaultPreset || 'planning';
     return `<div class="dialog-heading"><div><h2 id="dialog-title">Room setup</h2><p>Who is in this room, who leads, and how they work together.</p></div><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div>`
-      + `<div class="section-heading">AGENTS <span class="subtle">star = lead</span></div><div class="setup-roster">${r.agents.map(a => `<div class="setup-agent${a.enabled ? '' : ' is-off'}"><label class="lead-radio" title="Make ${esc(a.name)} the lead"><input type="radio" name="setup-lead" value="${esc(a.id)}" aria-label="${esc(a.name)} leads" ${lead?.id === a.id ? 'checked' : ''}${a.enabled && !busy() ? '' : ' disabled'}>${icon('star')}</label>${avatar(a)}<div class="setup-agent-text"><strong>${esc(a.name)}</strong><small>${esc(runtimeLabel(a))} · ${esc(shortModel(a))} · ${isNative(a) ? permLabels[perm(a)] : 'Read-only'}</small></div><label class="switch" title="Take part in this room"><input type="checkbox" role="switch" data-enable-agent="${esc(a.id)}" aria-label="${esc(a.name)} takes part" ${a.enabled ? 'checked' : ''}></label><button type="button" class="icon-button small" data-edit="${esc(a.id)}" aria-label="${esc(a.name)} settings">${icon('settings')}</button></div>`).join('') || '<p class="fine-print">No agents yet.</p>'}</div>`
+      + `<div class="section-heading">AGENTS <span class="subtle">star = lead</span></div><div class="setup-roster">${r.agents.map(a => `<div class="setup-agent${a.enabled ? '' : ' is-off'}"><label class="lead-radio" title="Make ${esc(a.name)} the lead"><input type="radio" name="setup-lead" value="${esc(a.id)}" aria-label="${esc(a.name)} leads" ${lead?.id === a.id ? 'checked' : ''}${a.enabled && !busy() ? '' : ' disabled'}>${icon('star')}</label>${avatar(a)}<div class="setup-agent-text"><strong>${esc(a.name)}</strong><small>${esc(runtimeLabel(a))} · ${esc(shortModel(a))} · ${isNative(a) ? permLabels[perm(a)] : 'Read-only'}</small>${unavailOf(a) ? `<small class="unavail-note">${esc(unavailLabel(unavailOf(a)))} · skipped</small>` : ''}</div><label class="switch" title="Take part in this room"><input type="checkbox" role="switch" data-enable-agent="${esc(a.id)}" aria-label="${esc(a.name)} takes part" ${a.enabled ? 'checked' : ''}></label><button type="button" class="icon-button small" data-edit="${esc(a.id)}" aria-label="${esc(a.name)} settings">${icon('settings')}</button></div>`).join('') || '<p class="fine-print">No agents yet.</p>'}</div>`
       + `<button type="button" class="outline-button" data-action="add">${icon('plus')} Add agent</button>`
       + `<div class="section-heading setup-heading">HOW THEY WORK TOGETHER</div><div class="radio-list">${Object.keys(modeLabels).map(mode => `<label class="radio-row"><input type="radio" name="setup-mode" value="${mode}" ${(r.mode || 'sequential') === mode ? 'checked' : ''}${dis}><span><strong>${modeLabels[mode]}</strong><small>${esc(modeHelp[mode])}</small></span></label>`).join('')}</div>`
+      + `<div class="team-setup">${r.team ? `<p class="team-plan"><strong>${esc(r.team.name)}</strong>${r.mode === 'pipeline' ? '' : ' (not in use)'} · ${esc(teamPlan(r.team))}</p>` : ''}<button type="button" class="outline-button inline" data-team-open="edit">${icon('edit')} Edit team…</button></div>`
       + `<label>Model routing<select id="setup-preset"${dis}>${['planning', 'drafting', 'review'].map(p => `<option value="${p}" ${preset === p ? 'selected' : ''}>${p[0].toUpperCase() + p.slice(1)}</option>`).join('')}</select></label>`
       + `<p class="fine-print">Type @Name to talk to one agent, or @all for everyone. In Team mode your message goes to the lead first; the lead answers or brings in teammates. The lead also decides when an "Until done" loop is finished.</p>`;
   }
@@ -741,11 +819,132 @@
     return '<option value="">Automatic / client default</option>' + (selected && !models.some(m => m.id === selected) ? '<option value="' + esc(selected) + '" selected>' + esc(selected) + ' (saved)</option>' : '') + models.map(m => '<option value="' + esc(m.id) + '" ' + (selected === m.id ? 'selected' : '') + '>' + esc(m.name) + (m.remote ? ' · cloud' : '') + '</option>').join('');
   }
   function editDefaults() {
-    openDialog(`<div class="dialog-heading"><div><h2 id="dialog-title">Models and defaults</h2><p>Set a model for each client and task.</p></div><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div><form id="defaults-form">${['planning', 'drafting', 'review'].map(p => `<fieldset><legend>${{ planning: 'Planning / orchestration', drafting: 'Drafting / general tasks', review: 'Review' }[p]}</legend>${Object.keys(names).map(provider => `<label>${names[provider]}<select data-default-preset="${p}" data-default-provider="${provider}">${modelOptions(provider, state.modelDefaults?.[p]?.[provider] || '')}</select></label>`).join('')}</fieldset>`).join('')}<label>Default task<select id="default-preset">${['planning', 'drafting', 'review'].map(p => `<option ${state.defaultPreset === p ? 'selected' : ''}>${p}</option>`).join('')}</select></label><label>Default collaboration<select id="default-mode">${Object.entries({ orchestrated: 'Lead + team', sequential: 'Relay', parallel: 'Parallel' }).map(([value, label]) => `<option value="${value}" ${state.executionMode === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>Parallel agent limit<input id="default-concurrency" type="number" min="1" max="4" value="${state.maxParallelAgents || 3}"></label><p class="fine-print">Defaults apply to new rooms. Model routing in the Team chip applies a task's models to this room. In Team mode, the parallel limit caps how many steps run at once.</p><div class="dialog-actions"><button type="button" class="text-button" data-action="settings">VS Code settings</button><button type="submit" class="primary-button">Save defaults</button></div></form>`, 'defaults');
+    openDialog(`<div class="dialog-heading"><div><h2 id="dialog-title">Models and defaults</h2><p>Set a model for each client and task.</p></div><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div><form id="defaults-form">${['planning', 'drafting', 'review'].map(p => `<fieldset><legend>${{ planning: 'Planning / orchestration', drafting: 'Drafting / general tasks', review: 'Review' }[p]}</legend>${Object.keys(names).map(provider => `<label>${names[provider]}<select data-default-preset="${p}" data-default-provider="${provider}">${modelOptions(provider, state.modelDefaults?.[p]?.[provider] || '')}</select></label>`).join('')}</fieldset>`).join('')}<label>Default task<select id="default-preset">${['planning', 'drafting', 'review'].map(p => `<option ${state.defaultPreset === p ? 'selected' : ''}>${p}</option>`).join('')}</select></label><label>Default collaboration<select id="default-mode">${Object.entries({ orchestrated: 'Lead + team', sequential: 'Relay', parallel: 'Parallel', pipeline: 'Custom team' }).map(([value, label]) => `<option value="${value}" ${state.executionMode === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label>Parallel agent limit<input id="default-concurrency" type="number" min="1" max="4" value="${state.maxParallelAgents || 3}"></label><p class="fine-print">Defaults apply to new rooms. Model routing in the Team chip applies a task's models to this room. In Team mode, the parallel limit caps how many steps run at once.</p>`
+      + `<div class="section-heading setup-heading">TEAMS <span class="subtle">saved right away</span></div><div id="defaults-teams" class="team-list">${teamListHtml()}</div><button type="button" class="outline-button" data-team-open="new">${icon('plus')} New team…</button><div class="dialog-actions"><button type="button" class="text-button" data-action="settings">VS Code settings</button><button type="submit" class="primary-button">Save defaults</button></div></form>`, 'defaults');
   }
   function addAgent() {
     const hints = { codex: 'Codex CLI with its own tools and sessions', claude: 'Claude Code with its own tools, skills and sessions', copilot: 'Copilot CLI, or models available in VS Code', ollama: 'Local & cloud models' };
     openDialog(`<div class="dialog-heading"><div><h2 id="dialog-title">Another perspective.</h2><p>Add an agent to the room.</p></div><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div><div class="provider-grid">${Object.keys(names).map(p => `<button data-provider="${p}">${avatar({ provider: p })}<span><strong>${names[p]}</strong><small>${hints[p]}</small></span>${icon('plus')}</button>`).join('')}</div><p class="fine-print">You can add several agents from the same client, each with its own model, effort, permissions and focus.</p>`, 'add');
+  }
+
+  // ---- Team builder --------------------------------------------------------------------------
+  const blankStage = () => ({ name: '', agents: [], run: 'parallel', lead: false, task: '', preset: '' });
+  function draftOf(t) {
+    return { name: t?.name || '', wrapUp: t ? !!t.wrapUp : true,
+      stages: (t ? t.stages || [] : [blankStage()]).map(s => ({ name: s.name || '', agents: [...(s.agents || [])], run: s.run === 'relay' ? 'relay' : 'parallel', lead: !!s.lead, task: s.task || '', preset: s.preset || '' })) };
+  }
+  // back: { open, key } reopens the dialog the builder came from (Room setup, Models and defaults).
+  function openTeamBuilder(team, back) {
+    teamDraft = draftOf(team); teamError = ''; teamBack = back;
+    teamOrigin = team && !team.builtIn && savedTeams().some(t => sameName(t.name, team.name)) ? team.name : '';
+    teamFrom = team ? (state.teams || []).find(t => canonTeam(t) === canonTeam(team))?.name || '' : '';
+    if (document.activeElement?.closest?.('#popover')) $('chip-team').focus();
+    openDialog(teamDialog(), 'team');
+  }
+  const editTeam = back => openTeamBuilder(state.room.team || (state.teams || []).find(t => t.builtIn) || (state.teams || [])[0], back);
+  function dialogBack(el) {
+    if (!el?.closest?.('#dialog-layer')) return undefined;
+    const key = keyOf(el);
+    if (dialogKind === 'setup') return { open: () => openDialog(setupDialog(), 'setup'), key };
+    if (dialogKind === 'defaults') return { open: editDefaults, key };
+    return undefined;
+  }
+  const stageTitle = (s, i) => `Stage ${i + 1}${s.name.trim() ? ` (${s.name.trim()})` : ''}`;
+  function teamProblem() {
+    const d = teamDraft;
+    if (!d.stages.length) return 'Add at least one stage.';
+    const i = d.stages.findIndex(s => !s.agents.length);
+    return i < 0 ? '' : `${stageTitle(d.stages[i], i)} needs at least one agent. Choose who works in it.`;
+  }
+  function teamOut() {
+    const d = teamDraft, lead = d.stages.some(s => s.lead);
+    return { name: d.name.trim() || 'My team', wrapUp: !!d.wrapUp && lead,
+      stages: d.stages.map((s, i) => ({ name: s.name.trim() || `Stage ${i + 1}`, agents: [...s.agents], run: s.run, lead: !!s.lead, ...(s.task.trim() ? { task: s.task.trim() } : {}), ...(s.preset ? { preset: s.preset } : {}) })) };
+  }
+  function stageCard(s, i) {
+    const n = teamDraft.stages.length, id = `ts-${i}`, title = `Stage ${i + 1}`, agents = state.room.agents, bad = !!teamError && !s.agents.length, full = s.agents.length >= 8;
+    const missing = s.agents.filter(ref => !agents.some(a => refIs(ref, a)));
+    const chips = agents.map(a => {
+      const on = s.agents.some(ref => refIs(ref, a)), u = unavailOf(a);
+      const tip = `${a.name} · ${modelName(a)}` + (u ? ` · ${unavailLabel(u)}: skipped until it can run` : a.enabled ? '' : ' · off in this room');
+      return `<button type="button" class="agent-toggle${u ? ' is-unavailable' : ''}${a.enabled ? '' : ' is-off'}" id="${id}-a-${esc(a.id)}" data-stage-agent="${i}" data-agent-id="${esc(a.id)}" aria-pressed="${on}" title="${esc(tip)}"${!on && full ? ' disabled' : ''}>${avatar(a, 'micro')}<span>${esc(a.name)}</span>${on ? icon('check') : ''}</button>`;
+    }).join('') + missing.map((ref, k) => `<button type="button" class="agent-toggle missing" id="${id}-r-${k}" data-stage-agent="${i}" data-ref="${esc(ref)}" aria-pressed="true" title="${esc(`"${ref}" matches no single agent in this room. Click to remove it.`)}"><span>${esc(ref)}</span>${icon('close')}</button>`).join('');
+    return `<li class="stage-card${s.lead ? ' is-lead' : ''}${bad ? ' invalid' : ''}"><div class="stage-head"><span class="stage-num" aria-hidden="true">${i + 1}</span><input id="${id}-name" data-stage="${i}" data-field="name" maxlength="40" value="${esc(s.name)}" placeholder="${title}" aria-label="${title} name">`
+      + `<button type="button" class="icon-button small" id="${id}-up" data-stage-up="${i}" aria-label="Move ${title} up" title="Move up"${i ? '' : ' disabled'}>${icon('up')}</button><button type="button" class="icon-button small" id="${id}-down" data-stage-down="${i}" aria-label="Move ${title} down" title="Move down"${i < n - 1 ? '' : ' disabled'}>${icon('down')}</button><button type="button" class="icon-button small" id="${id}-remove" data-stage-remove="${i}" aria-label="Remove ${title}" title="Remove stage">${icon('close')}</button></div>`
+      + `<label class="check-row stage-lead"><input type="checkbox" id="${id}-lead" data-stage="${i}" data-field="lead" ${s.lead ? 'checked' : ''}><span>Lead <small>Sets up the work or answers directly</small></span></label>`
+      + `<div class="stage-agents" role="group" aria-label="Agents in ${title}"${bad ? ' aria-describedby="team-error"' : ''}>${chips || '<span class="fine-print">No agents in this room yet.</span>'}</div>`
+      + `<div class="stage-fields">${s.agents.length > 1 ? `<label>Run<select id="${id}-run" data-stage="${i}" data-field="run"><option value="parallel"${s.run === 'relay' ? '' : ' selected'}>Together</option><option value="relay"${s.run === 'relay' ? ' selected' : ''}>One after another</option></select></label>` : ''}`
+      + `<label>Models<select id="${id}-preset" data-stage="${i}" data-field="preset" title="Each agent's own model, or the models set for a task in Models and defaults"><option value="">Each agent's own</option>${Object.entries(presetLabels).map(([p, l]) => `<option value="${p}"${s.preset === p ? ' selected' : ''}>${l}</option>`).join('')}</select></label></div>`
+      + `<label class="stage-task">Task (optional)<input id="${id}-task" data-stage="${i}" data-field="task" maxlength="500" value="${esc(s.task)}" placeholder="e.g. write and run the tests"></label></li>`;
+  }
+  function teamDialog() {
+    const d = teamDraft, list = state.teams || [], lead = d.stages.some(s => s.lead), running = busy(), saved = !!teamOrigin && savedTeams().some(t => sameName(t.name, teamOrigin));
+    const group = (label, items) => items.length ? `<optgroup label="${label}">${items.map(t => `<option value="${esc(t.name)}"${teamFrom === t.name ? ' selected' : ''}>${esc(t.name)}</option>`).join('')}</optgroup>` : '';
+    return `<div class="dialog-heading"><div><h2 id="dialog-title">Your team</h2><p>Stages run in order. Each stage gets the work of the stages before it.</p></div><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div>`
+      + `<form id="team-form" novalidate><div class="field-row team-top"><label>Start from<select id="team-from">${teamFrom && list.some(t => t.name === teamFrom) ? '' : '<option value="" selected>Choose…</option>'}${group('Templates', list.filter(t => t.builtIn))}${group('My teams', list.filter(t => !t.builtIn))}</select></label><label>Team name<input id="team-name" maxlength="40" placeholder="My team" value="${esc(d.name)}" data-autofocus></label></div>`
+      + `<ol class="team-stages">${d.stages.map(stageCard).join('')}</ol>`
+      + `<button type="button" class="outline-button" id="team-add-stage"${d.stages.length >= 8 ? ' disabled title="A team has at most 8 stages"' : ''}>${icon('plus')} Add stage</button>`
+      + `<label class="check-row team-wrapup"><input type="checkbox" id="team-wrapup" ${d.wrapUp && lead ? 'checked' : ''}${lead ? '' : ' disabled'}><span>The lead writes the final answer${lead ? '' : ' <small>Mark a stage as Lead to use this</small>'}</span></label>`
+      + (teamError ? `<p id="team-error" class="team-error" role="alert">${icon('alert')}<span>${esc(teamError)}</span></p>` : '')
+      + (running ? '<p class="fine-print">Agents are working. You can save the team now and use it when they finish.</p>' : '')
+      + `<div class="dialog-actions team-actions">${saved ? '<button type="button" class="text-button danger" id="team-delete">Delete</button>' : '<span></span>'}<span class="team-actions-right"><button type="button" class="outline-button" id="team-save">Save to my teams</button><button type="submit" class="primary-button"${running ? ' disabled' : ''}>Use in this room</button></span></div></form>`;
+  }
+  // Structural changes re-render; prefer moves focus to the first usable match, fallback applies only when focus was lost.
+  function rerenderTeam(prefer = [], fallback = []) {
+    if (teamError) teamError = teamProblem();
+    rerenderDialog(teamDialog());
+    const box = $('dialog-layer'), list = prefer.length ? prefer : box.contains(document.activeElement) ? [] : fallback;
+    for (const sel of list) { const el = box.querySelector(sel); if (el && !el.disabled) { el.focus(); break; } }
+  }
+  function teamValid() {
+    teamError = teamProblem(); if (!teamError) return true;
+    const i = teamDraft.stages.findIndex(s => !s.agents.length);
+    rerenderTeam(i < 0 ? ['#team-add-stage'] : [`.stage-card:nth-child(${i + 1}) .agent-toggle`, `#ts-${i}-name`]);
+    return false;
+  }
+  function teamField(el) {
+    if (el.id === 'team-name') { teamDraft.name = el.value; return; }
+    const s = el.dataset?.stage !== undefined ? teamDraft.stages[Number(el.dataset.stage)] : undefined;
+    if (s && (el.dataset.field === 'name' || el.dataset.field === 'task')) s[el.dataset.field] = el.value;
+  }
+  function teamChange(el) {
+    if (el.id === 'team-from') { const t = (state.teams || []).find(x => x.name === el.value); if (t) { teamDraft = draftOf(t); teamFrom = t.name; teamOrigin = t.builtIn ? '' : t.name; teamError = ''; rerenderTeam(); } return; }
+    if (el.id === 'team-wrapup') { teamDraft.wrapUp = el.checked; return; }
+    const s = el.dataset.stage !== undefined ? teamDraft.stages[Number(el.dataset.stage)] : undefined; if (!s) return;
+    if (el.dataset.field === 'lead') { s.lead = el.checked; rerenderTeam(); }
+    else if (el.dataset.field === 'run' || el.dataset.field === 'preset') s[el.dataset.field] = el.value;
+  }
+  function teamClick(button) {
+    const d = button.dataset, list = teamDraft.stages;
+    if (d.stageAgent !== undefined) {
+      const i = Number(d.stageAgent), s = list[i]; if (!s) return;
+      if (d.ref !== undefined) { s.agents = s.agents.filter(ref => ref !== d.ref); rerenderTeam([], [`#ts-${i}-name`]); return; }
+      const a = agentById(d.agentId); if (!a) return;
+      s.agents = s.agents.some(ref => refIs(ref, a)) ? s.agents.filter(ref => !refIs(ref, a)) : [...s.agents, a.name].slice(0, 8);
+      rerenderTeam();
+    } else if (d.stageUp !== undefined || d.stageDown !== undefined) {
+      const up = d.stageUp !== undefined, i = Number(up ? d.stageUp : d.stageDown), j = i + (up ? -1 : 1);
+      if (!list[i] || !list[j]) return;
+      [list[i], list[j]] = [list[j], list[i]];
+      rerenderTeam(up ? [`#ts-${j}-up`, `#ts-${j}-down`] : [`#ts-${j}-down`, `#ts-${j}-up`]);
+    } else if (d.stageRemove !== undefined) {
+      list.splice(Number(d.stageRemove), 1);
+      rerenderTeam(list.length ? [`#ts-${Math.min(Number(d.stageRemove), list.length - 1)}-name`] : ['#team-add-stage']);
+    } else if (button.id === 'team-add-stage') {
+      if (list.length >= 8) return;
+      list.push(blankStage()); rerenderTeam([`#ts-${list.length - 1}-name`]);
+    } else if (button.id === 'team-save') {
+      if (!teamValid()) return;
+      const team = teamOut(); send('saveTeam', { team }); teamOrigin = team.name;
+    } else if (button.id === 'team-delete') {
+      const name = teamOrigin;
+      confirmBox(`Delete the team "${name}" from your teams? Rooms that use it keep their copy.`, 'Delete team').then(ok => { if (ok && dialogKind === 'team') { send('deleteTeam', { name }); teamOrigin = ''; rerenderTeam(['#team-save']); } });
+    }
+  }
+  function useTeam() { if (!teamValid()) return; send('team', { team: teamOut() }); closeDialog(); }
+  function teamListHtml() {
+    return savedTeams().map(t => `<div class="team-row"><div class="team-row-text"><strong>${esc(t.name)}</strong><small>${esc(teamPlan(t))}</small></div><button type="button" class="text-button" data-team-edit="${esc(t.name)}" aria-label="Edit ${esc(t.name)}">Edit</button><button type="button" class="text-button danger" data-team-delete="${esc(t.name)}" aria-label="Delete ${esc(t.name)}">Delete</button></div>`).join('')
+      || '<p class="fine-print">No saved teams yet. New team… starts from scratch; templates are in its Start from list.</p>';
   }
 
   // ---- Inspector -----------------------------------------------------------------------------
@@ -779,7 +978,7 @@
   function capsCard(a) {
     const c = caps(a), native = isNative(a), status = c?.status || 'unchecked', version = c?.version || conn(a)?.version || '';
     const dot = status === 'ready' ? 'ready' : status === 'unchecked' ? 'unchecked' : 'error';
-    const head = `<div class="caps-head">${avatar(a, 'mini')}<div><strong>${esc(a.name)}</strong><small><span class="connection-dot ${dot}"></span>${esc(`${runtimeLabel(a)} ${version}`.trim())}${c?.account ? ' · ' + esc(c.account) : ''}</small></div><button type="button" class="icon-button small" data-caps-refresh="${esc(a.id)}" aria-label="Refresh ${esc(a.name)} capabilities" title="Refresh">${icon('refresh')}</button></div>`;
+    const head = `<div class="caps-head">${avatar(a, 'mini')}<div><strong>${esc(a.name)}</strong><small><span class="connection-dot ${dot}"></span>${esc(`${runtimeLabel(a)} ${version}`.trim())}${c?.account ? ' · ' + esc(c.account) : ''}</small></div><button type="button" class="icon-button small" data-caps-refresh="${esc(a.id)}" aria-label="Refresh ${esc(a.name)} capabilities" title="Refresh">${icon('refresh')}</button></div>` + unavailLine(a);
     const problem = status !== 'ready' && status !== 'unchecked' ? `<p class="caps-detail">${esc(c?.detail || status)}</p>${hintButtons(c?.action, a.provider, status)}` : '';
     if (!native) {
       const hint = a.provider === 'copilot' ? hintButtons('installCopilot') : '';
@@ -877,11 +1076,22 @@
     if (d.capsRefresh !== undefined) { if (d.capsRefresh) capsAsked[d.capsRefresh] = Date.now(); send('capabilities', d.capsRefresh ? { id: d.capsRefresh } : {}); }
     if (d.session && editing) send('agentSession', { id: editing, action: d.session });
     if (d.compact !== undefined) { const a = agentById(d.compact); send('send', { text: a ? `${quoteName(a.name)} /compact` : '/compact', editor: false, think: false, ultra: false }); closePopover(); }
+    if (d.agentRetry) send('agentRetry', { id: d.agentRetry });
+    if (d.teamOpen) { const back = dialogBack(button); if (d.teamOpen === 'new') openTeamBuilder(undefined, back); else editTeam(back); }
+    if (d.teamEdit !== undefined) { const t = savedTeams().find(x => x.name === d.teamEdit); if (t) openTeamBuilder(t, dialogBack(button)); }
+    if (d.teamDelete !== undefined) { const name = d.teamDelete; confirmBox(`Delete the team "${name}" from your teams? Rooms that use it keep their copy.`, 'Delete team').then(ok => { if (ok) { send('deleteTeam', { name }); $('dialog-layer').querySelector('[data-team-open="new"]')?.focus(); } }); }
+    if (dialogKind === 'team' && teamDraft && button.closest('#team-form')) teamClick(button);
   });
   document.addEventListener('change', event => {
     const el = event.target, id = el.id;
     if (dialogKind === 'agent' && el.closest('#dialog-layer')) dialogDirty = true;
-    if (el.name === 'mode' || el.name === 'setup-mode') send('options', { mode: el.value });
+    if (dialogKind === 'team' && teamDraft && el.closest?.('#team-form')) teamChange(el);
+    if (el.name === 'mode' || el.name === 'setup-mode') {
+      // Custom team needs a team first: open the builder instead of switching.
+      if (el.value === 'pipeline' && !state.room.team) { const current = document.querySelector(`input[name="${el.name}"][value="${state.room.mode || 'sequential'}"]`); if (current) current.checked = true; editTeam(dialogBack(el)); }
+      else send('options', { mode: el.value });
+    }
+    if (id === 'team-select') { const t = el.value === 'room' ? state.room.team : (state.teams || []).find(x => 't:' + x.name === el.value); if (t) send('team', { team: plainTeam(t) }); }
     if (el.name === 'setup-lead' || id === 'lead-select') send('options', { leadId: el.value });
     if (id === 'preset-select' || id === 'setup-preset') send('options', { preset: el.value });
     if (id === 'parallel-limit') send('options', { concurrency: Number(el.value) });
@@ -900,13 +1110,17 @@
     if (id === 'rooms') send('switch', { id: el.value });
     if (id === 'vision-model' || id === 'embedding-model') send('localModels', { vision: $('vision-model').value, embedding: $('embedding-model').value });
   });
-  document.addEventListener('input', event => { if (dialogKind === 'agent' && event.target.closest?.('#dialog-layer')) dialogDirty = true; });
+  document.addEventListener('input', event => {
+    if (dialogKind === 'agent' && event.target.closest?.('#dialog-layer')) dialogDirty = true;
+    if (dialogKind === 'team' && teamDraft && event.target.closest?.('#team-form')) teamField(event.target);
+  });
   document.addEventListener('submit', event => {
     event.preventDefault();
     const id = event.target.id;
     if (id === 'composer') submitComposer();
     if (id === 'loop-form') saveLoop();
     if (id === 'agent-form') saveAgent();
+    if (id === 'team-form') useTeam();
     if (id === 'defaults-form') {
       const modelDefaults = { planning: {}, drafting: {}, review: {} };
       document.querySelectorAll('[data-default-preset]').forEach(el => { modelDefaults[el.dataset.defaultPreset][el.dataset.defaultProvider] = el.value; });
@@ -949,6 +1163,7 @@
     if (!state) return;
     document.querySelectorAll('.approval-expiry[data-expires]').forEach(el => { el.textContent = mmss(Math.max(0, Math.round((Number(el.dataset.expires) - Date.now()) / 1000))) + ' left'; });
     if (state.room.loop?.kind === 'interval' && state.room.loopState?.nextAt) chip('chip-loop', 'loop', loopLabel(state.room), $('chip-loop').title);
+    if (state.room.agents.some(a => a.unavailable?.until)) renderStrip();
   }, 1000);
   window.addEventListener('message', event => {
     const data = event.data; if (!data || typeof data !== 'object') return;
@@ -958,6 +1173,7 @@
       lastSent = undefined; toast(data.text);
     }
     if (data.type === 'notice') toast(data.text, 'info');
+    if (data.type === 'openTeam' && state) { confirmClose?.(); editTeam(); }
   });
   autoGrow();
   send('ready');

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderId, Room, RoomDocument, TaskPreset, ToolCall, ToolName, TurnKind, Usage, emptyUsage } from './types';
+import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomDocument, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
 
 export const SCHEMA = 5;
 export const TOOL_NAMES: ToolName[] = ['list_files', 'read_file', 'search_files', 'search_documents', 'ollama_ocr', 'semantic_search'];
@@ -109,8 +109,97 @@ export function leadAgent(room: Room): Agent | undefined {
   return room.agents.find(a => a.id === room.leadId && a.enabled) ?? room.agents.find(a => a.enabled);
 }
 
+// ── Availability ─────────────────────────────────────────────────────────────
+const USAGE_TEXT = /usage limit|quota|rate.?limit|exceeded your|credit balance|insufficient_quota|out of credits|premium requests?/i;
+const MODEL_TEXT = /\bmodel\b[^\n.]{0,80}\b(not found|not available|unavailable|does not exist|doesn'?t exist|isn'?t available|not supported|unsupported|invalid|no access|not allowed)|\b(unknown|invalid|unsupported) model\b|No matching Copilot model/i;
+const OFFLINE_TEXT = /fetch failed|ECONNREFUSED|ECONNRESET|connect E|socket hang up|not running/i;
+/** Whether a failed turn means the agent cannot run for now (usage limit, missing CLI, signed out, model not available, Ollama not running). */
+export function classifyUnavailable(error: unknown, agent: Agent, now: number): Unavailable | undefined {
+  const text = error instanceof Error ? error.message : String(error), detail = text.slice(0, 300);
+  const mark = (reason: UnavailableReason, extra: Partial<Unavailable> = {}): Unavailable => ({ reason, detail, at: now, ...extra });
+  const model = () => mark('model', agent.model ? { model: agent.model } : {});
+  if (error instanceof ProviderError) {
+    if (error.code === 'usage-limit') return mark('usage-limit', { until: error.extra?.resetsAt ?? now + 15 * 60000 });
+    if (error.code === 'missing' || error.code === 'signed-out') return mark(error.code);
+    if (error.code === 'model-unavailable') return model();
+  }
+  if (USAGE_TEXT.test(text)) return mark('usage-limit', { until: now + 15 * 60000 });
+  if (MODEL_TEXT.test(text)) return model();
+  if (agent.provider === 'ollama' && OFFLINE_TEXT.test(text)) return mark('offline', { until: now + 2 * 60000 });
+}
+/** A short phrase: "out of usage until Thu 23:23", "not installed", "signed out", "model x is not available", "not running". */
+export function unavailableText(u: Unavailable, now: number): string {
+  switch (u.reason) {
+    case 'usage-limit': {
+      if (u.until === undefined) return 'out of usage';
+      const far = u.until - now > 6 * 86400000;
+      return `out of usage until ${new Date(u.until).toLocaleString('en', { ...(far ? { month: 'short', day: 'numeric' } : { weekday: 'short' }), hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}`;
+    }
+    case 'missing': return 'not installed';
+    case 'signed-out': return 'signed out';
+    case 'model': return `model ${u.model || 'default'} is not available`;
+    default: return 'not running';
+  }
+}
+/** No mark on the agent, or its mark has run out. */
+const availableNow = (agent: Agent) => !agent.unavailable || (agent.unavailable.until !== undefined && agent.unavailable.until <= Date.now());
+
+// ── The user's own teams ─────────────────────────────────────────────────────
+const stage = (name: string, agents: string[], extra: Partial<TeamStage> = {}): TeamStage => ({ name, agents, run: 'parallel', lead: false, ...extra });
+export const BUILTIN_TEAMS: TeamConfig[] = [
+  { name: 'Lead, draft, review', builtIn: true, wrapUp: true, stages: [stage('Leads', ['Claude'], { lead: true }), stage('Drafting', ['Codex'], { preset: 'drafting' }), stage('Review', ['Claude', 'Copilot'], { preset: 'review' })] },
+  { name: 'Build and test', builtIn: true, wrapUp: true, stages: [stage('Leads', ['Claude'], { lead: true }), stage('Coding', ['Codex']), stage('Testing', ['Copilot'], { task: 'Write and run tests for the change' }), stage('Review', ['Claude'], { preset: 'review' })] },
+  { name: 'Draft and review', builtIn: true, wrapUp: false, stages: [stage('Drafting', ['Codex'], { preset: 'drafting' }), stage('Review', ['Claude'])] }
+];
+const PRESET_NAMES: TaskPreset[] = ['planning', 'drafting', 'review'];
+const clip = (value: unknown, max: number) => typeof value === 'string' ? value.trim().slice(0, max) : '';
+/** A team from settings or the webview, bounded and cleaned; undefined when no stage has an agent. */
+export function normalizeTeam(raw: unknown): TeamConfig | undefined {
+  if (!raw || typeof raw !== 'object') return;
+  const r = raw as Record<string, unknown>, stages: TeamStage[] = [];
+  for (const item of Array.isArray(r.stages) ? r.stages : []) {
+    if (stages.length >= 8) break;
+    if (!item || typeof item !== 'object') continue;
+    const s = item as Record<string, unknown>, agents: string[] = [];
+    for (const ref of Array.isArray(s.agents) ? s.agents : []) {
+      const value = clip(ref, 40);
+      if (value && agents.length < 8 && !agents.some(a => a.toLowerCase() === value.toLowerCase())) agents.push(value);
+    }
+    if (!agents.length) continue;
+    const name = clip(s.name, 40) || `Stage ${stages.length + 1}`, task = clip(s.task, 500);
+    stages.push({ name, agents, run: s.run === 'relay' ? 'relay' : 'parallel', lead: typeof s.lead === 'boolean' ? s.lead : /^lead(s|er|ers)?\b/i.test(name),
+      ...(task ? { task } : {}), ...(PRESET_NAMES.includes(s.preset as TaskPreset) ? { preset: s.preset as TaskPreset } : {}) });
+  }
+  if (!stages.length) return;
+  return { name: clip(r.name, 40) || 'My team', stages, wrapUp: typeof r.wrapUp === 'boolean' ? r.wrapUp : stages.some(s => s.lead) };
+}
+const STAGE_PROVIDERS: Record<string, ProviderId> = { claude: 'claude', codex: 'codex', copilot: 'copilot', ollama: 'ollama', 'claude code': 'claude', 'github copilot': 'copilot' };
+/** A stage's enabled agents, by agent name or by provider name when exactly one enabled agent has that provider. */
+export function stageAgents(stage: TeamStage, room: Room): Agent[] {
+  const enabled = room.agents.filter(a => a.enabled), out: Agent[] = [];
+  for (const ref of stage.agents) {
+    const key = ref.trim().toLowerCase(), provider = STAGE_PROVIDERS[key], owners = provider ? enabled.filter(a => a.provider === provider) : [];
+    const agent = enabled.find(a => a.name.trim().toLowerCase() === key) ?? (owners.length === 1 ? owners[0] : undefined);
+    if (agent && !out.includes(agent)) out.push(agent);
+  }
+  return out;
+}
+/** "Leads (Claude) → Drafting (Codex) → Review (Claude, Copilot)". */
+export function teamPlan(team: TeamConfig, room: Room): string {
+  return team.stages.map(s => `${s.name} (${stageAgents(s, room).map(a => a.name).join(', ') || 'nobody'})`).join(' → ');
+}
+/** The first available agent of the team's first lead stage. */
+export function pipelineLead(room: Room, available: (agent: Agent) => boolean = availableNow): Agent | undefined {
+  const first = room.team?.stages.find(s => s.lead);
+  return first ? stageAgents(first, room).find(available) : undefined;
+}
+
 // ── Room framing (§7) ────────────────────────────────────────────────────────
-export interface FramingContext { connections: Connection[]; caps: Record<string, AgentCapabilities | undefined>; skillsIndex?: string; legacy?: boolean }
+export interface FramingContext {
+  connections: Connection[]; caps: Record<string, AgentCapabilities | undefined>; skillsIndex?: string; legacy?: boolean;
+  /** Why an agent cannot run right now (its mark, or live status); undefined = it can. */
+  unavailable?: (agent: Agent) => Unavailable | undefined;
+}
 /** Whether an agent runs as its own CLI (native tools and session) rather than as a chat model. */
 export function usesCli(agent: Agent, connections: Connection[]): boolean {
   if (agent.provider === 'claude' || agent.provider === 'codex') return true;
@@ -128,8 +217,11 @@ const ABILITY: Record<PermissionLevel, string> = { plan: 'read-only (planning)',
   'auto-edit': 'edits files directly, asks before other actions', full: 'full access' };
 const mentionName = (name: string) => /\s/.test(name) ? `"${name}"` : name;
 export function roomFraming(agent: Agent, room: Room, ctx: FramingContext): string {
-  const team = room.agents.filter(a => a.enabled), other = team.find(a => a.id !== agent.id);
-  const lead = room.mode === 'orchestrated' ? leadAgent(room) : undefined;
+  const now = Date.now(), why = (a: Agent) => a.id === agent.id ? undefined : ctx.unavailable?.(a);
+  const enabled = room.agents.filter(a => a.enabled), team = enabled.filter(a => !why(a)), other = team.find(a => a.id !== agent.id);
+  const away = enabled.filter(a => why(a)).map(a => `${a.name} (${unavailableText(why(a)!, now)})`);
+  const pipeline = room.mode === 'pipeline' && room.team ? room.team : undefined, chosen = room.mode === 'orchestrated' || (room.mode === 'pipeline' && !pipeline) ? leadAgent(room) : undefined;
+  const lead = chosen && why(chosen) ? team[0] : chosen;
   const line = (a: Agent) => {
     const native = usesCli(a, ctx.connections);
     return `- ${a.name}${a.id === agent.id ? ' (you)' : ''} · ${runtimeLabel(a, native)}${a.model ? ` (${a.model})` : ''} · ${native ? `own tools, skills and MCP; ${ABILITY[a.options?.permission ?? 'ask']}` : 'chat model with Chatroom\'s read-only file tools'}`;
@@ -143,7 +235,9 @@ export function roomFraming(agent: Agent, room: Room, ctx: FramingContext): stri
       : 'Messages from the user and the other agents reach you as <room from="Name">…</room> blocks. Your own earlier replies are already in your history, so you only receive what is new.',
     'Work as a team: build on what others found, correct mistakes with evidence, share findings that help, and don\'t redo work someone already did. Help teammates when they ask, but the user\'s requests come first.',
     team.length >= 2 && other ? `To ask a teammate for help or hand off a task, start a line with @Name and say what you need, for example "@${mentionName(other.name)} can you check the failing test?". Mention someone only when you need them.` : '',
-    lead ? (lead.id === agent.id ? 'You lead this room: the user\'s requests come to you first, and you decide whether to answer yourself or bring in teammates.' : `${lead.name} leads this room and may ask you for help.`) : '',
+    pipeline ? `This room works as a team in stages: ${teamPlan(pipeline, room)}.`
+      : lead ? (lead.id === agent.id ? 'You lead this room: the user\'s requests come to you first, and you decide whether to answer yourself or bring in teammates.' : `${lead.name} leads this room and may ask you for help.`) : '',
+    away.length ? `Unavailable right now: ${away.join(', ')}.` : '',
     agent.role.trim() ? `Your focus in this room: ${agent.role.trim()}` : '',
     !ctx.legacy && room.shareSkills && ctx.skillsIndex ? `Skills from the other agents are listed in ${ctx.skillsIndex}; open a SKILL.md from there when one fits the task.` : ''
   ].filter(Boolean).join('\n');
@@ -157,6 +251,10 @@ export function roomUpdate(framing: string): string { return `<room from="Chatro
 export interface TurnSpec {
   kind: TurnKind; parallel?: boolean; flow?: Flow; step?: PlanStep; round?: number; rounds?: number; wavesLeft?: number;
   handoff?: { from: string; line: string }; loop?: LoopConfig; iteration?: number; briefing?: string; trigger?: Message;
+  /** A turn in a stage of the room's own team; `others` are the stage's other agents, `plan` is teamPlan(). */
+  stage?: { index: number; total: number; name: string; lead?: boolean; task?: string; others: string[]; plan: string; standIn?: string[] };
+  /** The wrap-up synthesis after a team's stages: teamPlan(). */
+  teamPlan?: string;
 }
 const OMITTED = 'omitted:';
 const attr = (value: string) => value.replace(/"/g, '\'');
@@ -170,6 +268,7 @@ export function renderEntry(m: Message, room: Room): string {
   const attrs = [`from="${attr(author)}"`,
     to?.length ? `to="${attr(to.map(name).join(', '))}"` : '',
     m.step ? `step="${attr(`${m.step.id}: ${m.step.task.slice(0, 120)}`)}"` : '',
+    m.stage ? `stage="${attr(`${m.stage.name} (${m.stage.index + 1}/${m.stage.total})`)}"` : '',
     m.turn === 'plan' ? 'kind="plan"' : m.turn === 'synthesis' ? 'kind="final answer"' : ''].filter(Boolean).join(' ');
   return `<room ${attrs}>\n${body(m.text)}${m.plan?.length ? `\n${body(planText(m.plan, room.agents))}` : ''}\n</room>`;
 }
@@ -256,15 +355,27 @@ export function turnAsk(agent: Agent, room: Room, spec: TurnSpec): string {
     }
     case 'synthesis': {
       const k = spec.wavesLeft ?? 0;
+      if (spec.teamPlan) { ask = `The team has finished its stages (${spec.teamPlan}). Write the final answer for the user: combine their work, resolve disagreements, and fix mistakes you notice.`; break; }
       ask = `Your teammates have replied above. Write the final answer for the user: combine their work, resolve disagreements, and fix mistakes you notice.${k > 0 ? ` If essential work is still missing, you can delegate again the same way (${k} more round${k === 1 ? '' : 's'} allowed).` : ''}`;
       break;
     }
     case 'handoff': ask = spec.handoff ? `${spec.handoff.from} mentioned you: "${spec.handoff.line}"` : ''; break;
+    case 'stage': {
+      const s = spec.stage, task = s?.task?.trim().replace(/[\s.!?]+$/, '');
+      if (!s) break;
+      const next = s.index + 1 < s.total;
+      ask = `Team stage ${s.index + 1} of ${s.total}: ${s.name}${s.others.length ? ` (with ${s.others.join(', ')})` : ''}. The team works in stages: ${s.plan}.${s.standIn?.length ? ` You're standing in for ${s.standIn.join(' and ')}, who can't run right now: do this stage's work yourself.` : ''}${task ? ` Your part: ${task}.` : ''}`
+        + (s.lead ? ' You lead: if you can answer the request yourself, do it and end with [DONE]; otherwise set up the work for the next stages without doing their parts.'
+          : s.index === 0 ? (next ? ' The next stage picks up from yours.' : '')
+          : ` Build on the earlier stages' work above${next ? '; the next stage picks up from yours' : ''}.`);
+      break;
+    }
   }
   const i = spec.iteration ?? 1;
-  if (i >= 2 && (spec.kind === 'discussion' || spec.kind === 'plan')) ask = `Round ${i}${spec.loop?.kind === 'rounds' ? ` of ${spec.loop.rounds}` : ''}: keep going — respond to what's new above. ${ask}`;
+  if (i >= 2 && (spec.kind === 'discussion' || spec.kind === 'plan' || (spec.kind === 'stage' && spec.stage?.index === 0))) ask = `Round ${i}${spec.loop?.kind === 'rounds' ? ` of ${spec.loop.rounds}` : ''}: keep going — respond to what's new above. ${ask}`;
   if (spec.loop?.kind === 'consensus') ask += ' When you have nothing to add, say so briefly and end your reply with [AGREE].';
-  if (spec.loop?.kind === 'lead-done' && leadAgent(room)?.id === agent.id) ask += ' When the task is complete, end your reply with [DONE].';
+  const leads = spec.kind === 'stage' ? !!spec.stage?.lead : spec.teamPlan ? true : leadAgent(room)?.id === agent.id;
+  if (spec.loop?.kind === 'lead-done' && leads) ask += ' When the task is complete, end your reply with [DONE].';
   return ask.trim();
 }
 

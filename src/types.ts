@@ -6,9 +6,9 @@ export type ToolName = 'list_files' | 'read_file' | 'search_files' | 'search_doc
 export type RoomToolName = 'search_documents' | 'read_document' | 'semantic_search' | 'ollama_ocr';
 export type TaskPreset = 'planning' | 'drafting' | 'review';
 export type ModelDefaults = Record<TaskPreset, Partial<Record<ProviderId, string>>>;
-/** orchestrated: a lead plans for the team; sequential: relay; parallel: independent rounds. */
-export type RoomMode = 'orchestrated' | 'sequential' | 'parallel';
-export type TurnKind = 'discussion' | 'direct' | 'plan' | 'step' | 'synthesis' | 'handoff' | 'command';
+/** orchestrated: a lead plans for the team; sequential: relay; parallel: independent rounds; pipeline: the user's own team stages. */
+export type RoomMode = 'orchestrated' | 'sequential' | 'parallel' | 'pipeline';
+export type TurnKind = 'discussion' | 'direct' | 'plan' | 'step' | 'synthesis' | 'handoff' | 'command' | 'stage';
 export type PermissionLevel = 'plan' | 'ask' | 'auto-edit' | 'full';
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none';
@@ -50,9 +50,43 @@ export interface AgentSession {
   startedAt?: number;
   lastUsedAt?: number;
 }
+/** Why an agent is skipped: out of usage, CLI not installed, signed out, its model is not available, or its local server is not running. */
+export type UnavailableReason = 'usage-limit' | 'missing' | 'signed-out' | 'model' | 'offline';
+export interface Unavailable {
+  reason: UnavailableReason; detail: string;
+  /** When it was detected (ms). */
+  at: number;
+  /** Retry after this time (ms); undefined = until it is fixed or the user presses Try again. */
+  until?: number;
+  /** reason 'model': the model that was not available. */
+  model?: string;
+}
+/** One stage of a user-defined team. Stages run in order; each sees the work of the stages before it. */
+export interface TeamStage {
+  name: string;
+  /** Agent names (or provider names such as "codex"), resolved in each room. */
+  agents: string[];
+  /** The stage's agents answer together (parallel) or one after another (relay). */
+  run: 'parallel' | 'relay';
+  /** A lead stage sets up the work for the stages after it, or answers directly and ends with [DONE]. */
+  lead?: boolean;
+  /** Optional short instruction from the user for this stage. */
+  task?: string;
+  /** Model routing for this stage; undefined = each agent's own model. */
+  preset?: TaskPreset;
+}
+export interface TeamConfig {
+  name: string; stages: TeamStage[];
+  /** After the last stage, the first lead writes the final answer. */
+  wrapUp: boolean;
+  /** A template that ships with Chatroom (not saved in settings). */
+  builtIn?: boolean;
+}
 export interface Agent {
   id: string; name: string; provider: ProviderId; model: string; role: string;
   enabled: boolean;
+  /** Set when the agent cannot run (usage limit, missing CLI, model not available…); the room skips it until then. */
+  unavailable?: Unavailable;
   /** Legacy Chatroom tools (Ollama, Copilot via vscode.lm). */
   tools: ToolName[];
   options: AgentOptions;
@@ -113,6 +147,8 @@ export interface Message {
   /** Agent message that handed off to other agents, or a handoff turn's origin. */
   handoff?: { from: string; to: string[] };
   marker?: 'agree' | 'done';
+  /** Agent message: a turn in a stage of the room's own team. index is 0-based. */
+  stage?: { index: number; total: number; name: string; lead?: boolean };
 }
 export interface RoomDocument {
   id: string; name: string; hash: string; kind: 'text' | 'pdf' | 'image' | 'docx'; source: 'attached' | 'workspace';
@@ -141,7 +177,7 @@ export interface Room {
   id: string; title: string; createdAt: number; agents: Agent[]; messages: Message[];
   activity: Activity[]; tokenBudget: number; usage: Record<string, Usage>;
   status: 'idle' | 'running' | 'paused'; currentAgent?: string; completedTurns: number;
-  agentStates?: Record<string, { status: 'queued' | 'thinking' | 'tool' | 'approval' | 'complete' | 'error' | 'stopped'; detail?: string }>;
+  agentStates?: Record<string, { status: 'queued' | 'thinking' | 'tool' | 'approval' | 'complete' | 'error' | 'stopped' | 'unavailable'; detail?: string }>;
   mode?: RoomMode; concurrency?: number; preset?: TaskPreset; activeAgents?: string[]; queuedTurns?: number;
   leadId?: string; flow?: Flow; documents?: RoomDocument[]; schema?: number;
   /** New-token total when the current run began; the optional `tokenBudget` (0 = no limit) applies per run. */
@@ -152,6 +188,10 @@ export interface Room {
   attachEditor: boolean;
   /** Share skills between native agents. */
   shareSkills: boolean;
+  /** The user's own team, used when mode is 'pipeline'. */
+  team?: TeamConfig;
+  /** While a team run is in progress: the current stage (1-based). */
+  progress?: { stage: number; total: number; name: string };
 }
 export interface ModelInfo {
   id: string; name: string; capabilities?: string[]; remote?: boolean; error?: string;
@@ -238,7 +278,7 @@ export interface NativeDriver {
   release(roomId: string, agentId?: string): Promise<void>;
   dispose(): Promise<void>;
 }
-export type ProviderErrorCode = 'missing' | 'signed-out' | 'usage-limit' | 'session-lost' | 'crashed' | 'protocol' | 'unsupported' | 'failed';
+export type ProviderErrorCode = 'missing' | 'signed-out' | 'usage-limit' | 'model-unavailable' | 'session-lost' | 'crashed' | 'protocol' | 'unsupported' | 'failed';
 export class ProviderError extends Error {
   constructor(message: string, readonly code: ProviderErrorCode, readonly extra: { action?: HintAction; resetsAt?: number } = {}) { super(message); this.name = 'ProviderError'; }
 }
@@ -284,6 +324,8 @@ export interface StatePayload {
   editor: EditorSnapshot | null;
   sharedSkills: SharedSkill[];
   roomCommands: RoomCommandInfo[];
+  /** Saved teams (chatroom.teams) followed by the built-in templates. */
+  teams: TeamConfig[];
   localModels: { vision: string; embedding: string };
   discovering: boolean; modelDefaults: ModelDefaults; defaultPreset: TaskPreset; executionMode: RoomMode; maxParallelAgents: number;
   settings: { allowFullAccess: boolean; attachOpenFile: boolean; approvalTimeoutSeconds: number };
@@ -303,7 +345,16 @@ export type WebviewMessage =
   | { type: 'agentSession'; id: string; action: 'new' | 'copyResume' }
   | { type: 'capabilities'; id?: string }
   | { type: 'editor'; action: 'reveal' }
-  | { type: 'copilot'; action: 'install' | 'login' };
+  | { type: 'copilot'; action: 'install' | 'login' }
+  /** Use a team in this room (mode 'pipeline'); null returns the room to Team (lead) mode. */
+  | { type: 'team'; team: TeamConfig | null }
+  /** Save a team to chatroom.teams (replaces one with the same name). */
+  | { type: 'saveTeam'; team: TeamConfig }
+  | { type: 'deleteTeam'; name: string }
+  /** Clear an agent's unavailable mark and check it again. */
+  | { type: 'agentRetry'; id: string };
+/** Host → webview messages other than state. */
+export type HostMessage = { type: 'error' | 'notice'; text: string } | { type: 'openTeam' };
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cached: 0, cacheWrite: 0, requests: 0, estimated: false });
 export function addUsage(a: Usage, b: Usage): Usage {
   return { input: a.input + b.input, output: a.output + b.output, cached: a.cached + b.cached, cacheWrite: a.cacheWrite + b.cacheWrite,
