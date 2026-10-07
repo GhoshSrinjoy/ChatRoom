@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRoom, buildContext, parseToolCall, parsePlan, planStages, systemPrompt, message, estimateTokens, boundedNumber, roomFraming, renderEntry, renderContext,
   unseenEntries, boundedHistory, turnAsk, migrateRoom, defaultOptions, framingHash, DEFAULT_LOOP, FramingContext, SCHEMA,
-  BUILTIN_TEAMS, classifyUnavailable, normalizeTeam, pipelineLead, stageAgents, teamPlan, unavailableText } from '../src/core';
-import { Connection, Message, ProviderError, TeamStage, Unavailable, addUsage, emptyUsage } from '../src/types';
+  BUILTIN_TEAMS, classifyUnavailable, normalizeTeam, pipelineLead, stageAgents, teamPlan, unavailableText, sandboxLanguage, sandboxStatusText, sandboxSummary, sandboxWhat } from '../src/core';
+import { Connection, Message, ProviderError, SandboxResult, TeamStage, Unavailable, addUsage, emptyUsage } from '../src/types';
 
 const copilotCli: Connection = { id: 'copilot', status: 'ready', runtime: 'cli', detail: '', models: [] };
 const ctx = (patch: Partial<FramingContext> = {}): FramingContext => ({ connections: [copilotCli], caps: {}, ...patch });
@@ -88,6 +88,22 @@ test('unseen entries skip own, tool, approval, notice and command messages and s
   assert.equal(bounded.length, 20); assert.equal(bounded[0]!.text, 'old 11');
   codex.session = undefined;
   assert.equal(unseenEntries(room, codex, { kind: 'discussion' })[0]!.text, 'old 0', 'a new session gets the bounded history, objective first');
+});
+test('sandbox cards: one-line summaries per status, language aliases, and boundedHistory gives a new session every finished run', () => {
+  const r: SandboxResult = { id: 'a', status: 'pending', image: 'python:3.12-slim', profile: 'test', network: false, command: '\n  import json\nprint(json.dumps({}))', language: 'python',
+    limits: { cpus: 2, memoryMb: 2048, timeoutSeconds: 120 }, stdout: '', stderr: '', requestedBy: 'Codex', agentId: 'codex', createdAt: 1 };
+  assert.equal(sandboxWhat(r), 'Python code: import json');
+  assert.equal(sandboxWhat({ ...r, language: undefined, command: 'npm test\nnpm run lint' }), 'npm test …');
+  assert.equal(sandboxWhat({ ...r, language: undefined, command: 'x'.repeat(150) }), 'x'.repeat(99) + '…');
+  const texts = (['pending', 'pulling', 'running', 'done', 'failed', 'denied', 'timeout', 'cancelled'] as const).map(status => sandboxStatusText({ ...r, status, exitCode: 0, durationMs: 12_400, error: 'boom' }));
+  assert.deepEqual(texts, ['preparing', 'downloading python:3.12-slim', 'running', 'exit code 0 · 12 s', 'failed: boom', 'declined', 'timed out after 120 s and was stopped', 'cancelled']);
+  assert.equal(sandboxSummary({ ...r, status: 'done', exitCode: 1, durationMs: 830 }), 'Sandbox · Python code: import json · exit code 1 · 0.8 s');
+  assert.deepEqual(['sh', 'Shell', 'py', 'python3', 'js', 'JavaScript', 'node', 'ruby', '', 'constructor'].map(sandboxLanguage), ['bash', 'bash', 'python', 'python', 'node', 'node', 'node', undefined, undefined, undefined]);
+  const { room, codex } = teamRoom();
+  const card = message('notice', 'Sandbox', 'Sandbox'); card.sandbox = { ...r, status: 'done', exitCode: 0 }; delete card.agentId;
+  const running = message('notice', 'Sandbox', 'Sandbox'); running.sandbox = { ...r, id: 'b', status: 'running', agentId: undefined };
+  room.messages = [message('user', 'First'), card, running];
+  assert.deepEqual(boundedHistory(room, codex, 12000, { kind: 'discussion' }).map(m => m.id), [room.messages[0]!.id, card.id], 'a new session also gets its own finished runs, not running ones');
 });
 test('steps see the history, the plan and only the outputs they build on; the synthesis sees every output', () => {
   const { room, codex, claude, copilot } = teamRoom();

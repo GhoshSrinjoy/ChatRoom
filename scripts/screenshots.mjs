@@ -124,6 +124,20 @@ const isolated = room({ title: 'CSV export with tests', mode: 'parallel', worktr
     say('c1', 'a1', 'Codex', 'Added `exportCsv()` in src/report/export.ts with RFC 4180 quoting, and a Download CSV button on the report page.'),
     say('c2', 'a2', 'Claude', 'Wrote tests for quoting, empty reports and a 50,000-row report. All pass in my worktree.'),
     { id: 'card', kind: 'notice', author: 'Chatroom', status: 'complete', createdAt: now, changes: combined, text: 'Agents changed 4 files in their worktrees (+141 −9). Review them, then apply them to your folder or keep them as a branch.' }] });
+// Claude asks to run the tests in the sandbox; you allowed it; the run card shows the result.
+const sbxDetail = 'Why: Run the parser tests after the tokenizer change\nImage: python:3.12-slim\nProfile: test · a writable copy\nNetwork: off\nFiles: a copy of the workspace\nLimits: 2 CPUs · 2048 MB memory · 120 s · 512 processes\n\nCommand:\npython -m pytest -q tests/test_parser.py';
+const sbxApproval = { id: 'sbx-ap', kind: 'approval', agentId: 'a2', author: 'Claude', status: 'complete', createdAt: now, text: 'python -m pytest -q tests/test_parser.py',
+  approval: { id: 'ap-sbx', agentId: 'a2', provider: 'claude', kind: 'sandbox', tool: 'sandbox', title: 'python -m pytest -q tests/test_parser.py', detail: sbxDetail, canAllowSession: false, status: 'pending', createdAt: now, expiresAt: Date.now() + 285000 } };
+const sbxRun = { id: 'sbx-run', kind: 'notice', author: 'Sandbox', status: 'complete', createdAt: now, text: 'Sandbox · python -m pytest · exit code 0',
+  sandbox: { id: 'r1', status: 'done', image: 'python:3.12-slim', profile: 'test', network: false, command: 'python -m pytest -q tests/test_parser.py', purpose: 'Run the parser tests after the tokenizer change',
+    limits: { cpus: 2, memoryMb: 2048, timeoutSeconds: 120 }, exitCode: 0, durationMs: 4200, stdout: '............                                                             [100%]\n12 passed in 0.41s\n', stderr: '',
+    files: [{ path: 'reports/junit.xml', size: 3380, text: '<?xml version="1.0"?>\n<testsuite name="pytest" tests="12" failures="0"/>' }], requestedBy: 'Claude', agentId: 'a2', createdAt: now, startedAt: now, finishedAt: now + 4200 } };
+const sbxRoom = room({ title: 'Check the parser in isolation', mode: 'sequential', completedTurns: 1,
+  messages: [{ ...user, text: 'Change the tokenizer to keep comments, and check the parser tests still pass. Run the tests in the sandbox.' },
+    say('t1', 'a2', 'Claude', 'Tokenizer updated. I want to run the parser tests in an isolated container first.'),
+    { ...sbxApproval, approval: { ...sbxApproval.approval, status: 'allowed', decidedAt: now } }, sbxRun,
+    say('t2', 'a2', 'Claude', 'All 12 parser tests pass in the sandbox. Here is the quick check I used, if you want to run it yourself:\n\n```python\nfrom parser import parse\nprint(parse("a = 1  # keep me"))\n```'),
+    { ...sbxApproval, id: 'sbx-ap2', approval: { ...sbxApproval.approval, id: 'ap-sbx2', title: 'Run Python code in the sandbox (2 lines)', detail: sbxDetail.replace('Run the parser tests after the tokenizer change', 'Check that comments survive parsing').replace('Command:\npython -m pytest -q tests/test_parser.py', 'Python code:\nfrom parser import parse\nprint(parse("a = 1  # keep me"))') } }] });
 const done = room({ documents: documents(false), messages: [user, plan(['complete', 'complete', 'complete']), tool, s1, s2, s3, final] });
 
 const server = createServer(async (req, res) => {
@@ -170,6 +184,7 @@ try {
   await shoot('approvals.png', state(fixing), { width: 420, height: 1000 });
   await shoot('commands.png', state(done), { width: 420, height: 1000, slash: '/' });
   await shoot('team-run.png', state(teamRun), { width: 420, height: 1000 });
+  await shoot('sandbox.png', { ...state(sbxRoom), settings: { ...state(sbxRoom).settings, sandbox: { enabled: true, available: true, detail: 'Docker 29.5.3' } } }, { width: 420, height: 1500 });
   await shoot('changes.png', { ...state(isolated), settings: { ...state(isolated).settings, worktrees: 'auto', worktreesAvailable: true } }, { width: 420, height: 1000 });
   await shoot('team.png', state(room({ ...done, mode: 'pipeline', team: ownTeam })), { width: 1100, height: 1300, openTeam: true });
   await shoot('agent-settings.png', state(done), { width: 1100, height: 1300, click: '[data-agent="a2"]' });

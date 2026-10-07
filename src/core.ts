@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomChanges, RoomDocument, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
+import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomChanges, RoomDocument, SandboxLanguage, SandboxResult, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
 
 export const SCHEMA = 5;
 export const TOOL_NAMES: ToolName[] = ['list_files', 'read_file', 'search_files', 'search_documents', 'ollama_ocr', 'semantic_search'];
@@ -69,9 +69,14 @@ export function migrateRoom(raw: any, defaults: { attachEditor: boolean; shareSk
   if (raw.loopState && typeof raw.loopState === 'object') delete raw.loopState.nextAt; else delete raw.loopState;
   if (raw.worktrees !== undefined && !['off', 'auto', 'always'].includes(raw.worktrees)) delete raw.worktrees;
   if (raw.changes !== undefined && (typeof raw.changes?.base !== 'string' || typeof raw.changes?.branch !== 'string' || !Array.isArray(raw.changes?.files))) delete raw.changes;
+  if (raw.sandbox !== undefined && typeof raw.sandbox !== 'boolean') delete raw.sandbox;
   for (const m of raw.messages as Message[]) {
     if (m.status === 'streaming') m.status = 'cancelled';
     if (m.approval?.status === 'pending') m.approval.status = 'expired';
+    if (m.sandbox && typeof m.sandbox === 'object' && !sandboxFinished(m.sandbox) && m.sandbox.status !== 'denied') {
+      Object.assign(m.sandbox, { status: 'cancelled', error: 'Interrupted when the window closed.' });
+      m.text = sandboxSummary(m.sandbox);
+    }
     for (const step of m.plan ?? []) if (step.status === 'pending' || step.status === 'running') Object.assign(step, { status: 'skipped', detail: 'Interrupted when the window closed.' });
   }
   raw.schema = SCHEMA;
@@ -128,6 +133,67 @@ export function upsertChangesCard(room: Room, now: number, push = true): Message
   card.createdAt = now; card.changes = copy;
   room.messages.push(card);
   return card;
+}
+
+// ── The sandbox card ─────────────────────────────────────────────────────────
+export const SANDBOX_LANGUAGE_NAMES: Record<SandboxLanguage, string> = { bash: 'Bash', python: 'Python', node: 'Node.js' };
+const SANDBOX_ALIASES: Record<string, SandboxLanguage> = { bash: 'bash', sh: 'bash', shell: 'bash', zsh: 'bash', console: 'bash', python: 'python', python3: 'python', py: 'python',
+  node: 'node', nodejs: 'node', js: 'node', javascript: 'node', mjs: 'node', cjs: 'node' };
+/** "py", "javascript", "sh"… (a code fence's language) as a sandbox language. */
+export const sandboxLanguage = (value: unknown): SandboxLanguage | undefined => typeof value === 'string' && Object.hasOwn(SANDBOX_ALIASES, value.trim().toLowerCase()) ? SANDBOX_ALIASES[value.trim().toLowerCase()] : undefined;
+/** A run that has ended (with a result, or failed, timed out or cancelled); 'denied' runs never started. */
+export const sandboxFinished = (r: SandboxResult) => r.status === 'done' || r.status === 'failed' || r.status === 'timeout' || r.status === 'cancelled';
+export const formatBytes = (n: number) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+const formatSeconds = (ms: number) => `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+/** What ran, in one line: the command's first line, or "Python code: <first line>". */
+export function sandboxWhat(r: SandboxResult): string {
+  const lines = String(r.command ?? '').split('\n').map(l => l.trim()).filter(Boolean), first = lines[0] ?? '';
+  const short = first.length > 100 ? `${first.slice(0, 99)}…` : first;
+  if (r.language) return `${SANDBOX_LANGUAGE_NAMES[r.language] ?? r.language} code${short ? `: ${short}` : ''}`;
+  return `${short}${lines.length > 1 ? ' …' : ''}`;
+}
+/** The run's state in a few words: "running", "exit code 1 · 2.4 s", "timed out after 120 s"… */
+export function sandboxStatusText(r: SandboxResult): string {
+  switch (r.status) {
+    case 'pending': return 'preparing';
+    case 'pulling': return `downloading ${r.image}`;
+    case 'running': return 'running';
+    case 'done': return `exit code ${r.exitCode ?? '?'}${r.durationMs !== undefined ? ` · ${formatSeconds(r.durationMs)}` : ''}`;
+    case 'timeout': return `timed out after ${r.limits.timeoutSeconds} s and was stopped`;
+    case 'cancelled': return 'cancelled';
+    case 'denied': return 'declined';
+    default: return `failed${r.error ? `: ${r.error}` : ''}`;
+  }
+}
+/** The card's text (exports and plain views); the webview renders the card from `sandbox`. */
+export const sandboxSummary = (r: SandboxResult) => `Sandbox · ${sandboxWhat(r)} · ${sandboxStatusText(r)}`;
+/**
+ * A run as text: what ran, how it ended, the output tails and the files it made. `echo` repeats the command or code (other agents
+ * need it; the agent that asked does not); `texts` adds the requested output files' text while it fits in `max`.
+ */
+export function sandboxReport(r: SandboxResult, opts: { tail?: number; echo?: boolean; texts?: boolean; max?: number } = {}): string {
+  const tail = opts.tail ?? 8000, max = opts.max ?? 23_000;
+  const cut = (text: string) => text.length > tail ? `[… ${(text.length - tail).toLocaleString('en')} earlier characters]\n${text.slice(-tail)}` : text;
+  const code = (text: string) => text.length > 2000 ? `${text.slice(0, 2000)}\n[… ${(text.length - 2000).toLocaleString('en')} more characters]` : text;
+  const files = r.files ?? [];
+  const parts = [
+    `Sandbox run requested by ${r.requestedBy} · ${r.image} · ${r.profile} profile · network ${r.network ? 'on' : 'off'} · limits ${r.limits.cpus} CPUs, ${r.limits.memoryMb} MB, ${r.limits.timeoutSeconds} s`,
+    opts.echo ? (r.language ? `${SANDBOX_LANGUAGE_NAMES[r.language] ?? r.language} code:\n${code(r.command)}` : `Command: ${code(r.command)}`) : '',
+    r.purpose && opts.echo ? `Purpose: ${r.purpose}` : '',
+    `Result: ${sandboxStatusText(r)}`,
+    r.error && r.status !== 'failed' ? `Note: ${r.error}` : '',
+    r.stdout ? `stdout:\n${cut(r.stdout)}` : 'stdout: (empty)',
+    r.stderr ? `stderr:\n${cut(r.stderr)}` : 'stderr: (empty)',
+    files.length ? `Files created or changed in /work (${files.length}): ${files.map(f => `${f.path} (${formatBytes(f.size)})`).join(', ')}` : ''
+  ].filter(Boolean);
+  let text = parts.join('\n');
+  if (opts.texts) for (const file of files.filter(f => f.text !== undefined)) {
+    const room = max - text.length - 80;
+    if (room < 200) { text += `\n[More file contents are on the sandbox card.]`; break; }
+    const body = file.text!.length > room ? `${file.text!.slice(0, room)}\n[… truncated]` : file.text!;
+    text += `\n--- ${file.path} ---\n${body}`;
+  }
+  return text.slice(0, max);
 }
 export const estimateTokens = (text: string) => Math.ceil(text.length / 3);
 export const usageTotal = (usage: Usage) => usage.input + usage.output;
@@ -302,6 +368,7 @@ const body = (text: string) => text.replace(/<\/room>/gi, '<\\/room>');
 export const isRoomUpdate = (m: Message) => m.kind === 'notice' && m.text.startsWith('Room update:');
 export function renderEntry(m: Message, room: Room): string {
   const name = (id: string) => room.agents.find(a => a.id === id)?.name ?? id;
+  if (m.kind === 'notice' && m.sandbox) return `<room from="Sandbox">\n${body(sandboxReport(m.sandbox, { tail: 4000, echo: true, max: 12_000 }))}\n</room>`;
   if (m.kind === 'notice') return `<room from="Chatroom">${body(m.text)}</room>`;
   const author = m.kind === 'user' ? 'User' : room.agents.find(a => a.id === m.agentId)?.name ?? m.author;
   const to = m.kind === 'user' ? m.targets : m.handoff && m.handoff.from === m.agentId ? m.handoff.to : undefined;
@@ -331,6 +398,8 @@ function deliverable(m: Message, agentId: string, includeOwn = false): boolean {
   if (m.turn === 'command') return false;
   if (m.kind === 'user') return true;
   if (m.kind === 'agent') return m.status === 'complete' && (includeOwn || m.agentId !== agentId);
+  // A finished sandbox run reaches every agent; the agent that asked for it already has the result from its tool call.
+  if (m.kind === 'notice' && m.sandbox) return sandboxFinished(m.sandbox) && (includeOwn || m.sandbox.agentId !== agentId);
   return isRoomUpdate(m);
 }
 /** Steps see the history, the plan and only the outputs they build on; the synthesis sees every output of the plan. */

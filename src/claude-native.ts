@@ -15,7 +15,10 @@ const MODES: Record<PermissionLevel, string> = { plan: 'plan', ask: 'default', '
 const LEVELS: Record<string, PermissionLevel> = { plan: 'plan', default: 'ask', manual: 'ask', acceptEdits: 'auto-edit', bypassPermissions: 'full' };
 const LOST_TITLE = 'Previous session could not be resumed · started a new one with recent room history';
 const RANK: Record<PermissionLevel, number> = { plan: 0, ask: 1, 'auto-edit': 2, full: 3 };
-/** Exactly the room tools of the in-process `chatroom` server (other servers' tools can share the prefix). */
+/**
+ * Exactly the room tools of the in-process `chatroom` server (other servers' tools can share the prefix). The CLI runs them without
+ * a card of its own: they are read-only, or (sandbox_run) Chatroom shows its own approval card before anything runs.
+ */
 const ROOM_TOOLS = new Set(ROOM_TOOL_NAMES.map(name => `mcp__chatroom__${name}`));
 /**
  * Suggestions sent back on "Allow for session": session-scoped rules only. A `setMode` suggestion would switch the

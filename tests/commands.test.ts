@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseTeam, parseWorktrees, resolveMention, stripCode } from '../src/commands';
+import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseSandbox, parseTeam, parseWorktrees, resolveMention, SANDBOX_USAGE, stripCode } from '../src/commands';
 import { Agent, AgentCapabilities, NativeCommand, ProviderId } from '../src/types';
 
 const agent = (id: string, name: string, provider: ProviderId, enabled = true): Agent => ({ id, name, provider, model: '', role: '', enabled, tools: [],
@@ -20,13 +20,37 @@ const capsMap: Record<string, AgentCapabilities> = {
 };
 
 test('room commands table is exact and agent-scoped names are derived from it', () => {
-  assert.deepEqual(ROOM_COMMANDS.map(c => c.name), ['help', 'clear', 'compact', 'new', 'export', 'loop', 'mode', 'lead', 'team', 'worktrees', 'model', 'effort', 'permissions', 'status', 'stop']);
+  assert.deepEqual(ROOM_COMMANDS.map(c => c.name), ['help', 'clear', 'compact', 'new', 'export', 'loop', 'mode', 'lead', 'team', 'worktrees', 'sandbox', 'model', 'effort', 'permissions', 'status', 'stop']);
   assert.deepEqual(AGENT_SCOPED, ['clear', 'compact', 'model', 'effort', 'permissions', 'status']);
   assert.equal(ROOM_COMMANDS.find(c => c.name === 'loop')?.args, '[N | consensus | done | every 10m <prompt> | off]');
   assert.equal(ROOM_COMMANDS.find(c => c.name === 'compact')?.description, "Summarize each agent's native session to free context");
   assert.equal(NATIVE_COMMAND_DENYLIST.codex.length, 0);
   assert.deepEqual(ROOM_COMMANDS.find(c => c.name === 'team'), { name: 'team', args: '[name | Lead: Claude > Draft: Codex > … | save <name> | edit | off]', description: 'Set up your own team: stages such as lead, drafting, review, testing', agentScoped: false });
   assert.deepEqual(ROOM_COMMANDS.find(c => c.name === 'worktrees'), { name: 'worktrees', args: 'off | auto | always | status | apply | keep [name] | discard | cleanup', description: 'Give agents their own git worktrees so parallel edits never collide', agentScoped: false });
+  assert.deepEqual(ROOM_COMMANDS.find(c => c.name === 'sandbox'), { name: 'sandbox', args: '<command> | python|node|bash <code> | on | off | status', description: 'Run a command or code in a throwaway Docker container on a copy of the folder (you approve each run)', agentScoped: false });
+});
+test('/sandbox arguments: on, off, status; code after an interpreter or in a fence; interpreter flags run as a command; options; usage', () => {
+  assert.deepEqual(parseSandbox(''), { status: true });
+  assert.deepEqual(parseSandbox(' STATUS '), { status: true });
+  assert.deepEqual(parseSandbox('on'), { toggle: true });
+  assert.deepEqual(parseSandbox('Off'), { toggle: false });
+  assert.deepEqual(parseSandbox('npm test -- --watch=false'), { command: 'npm test -- --watch=false' });
+  assert.deepEqual(parseSandbox('ls -la && echo "on"'), { command: 'ls -la && echo "on"' });
+  assert.deepEqual(parseSandbox('python print(1 + 1)'), { code: 'print(1 + 1)', language: 'python' });
+  assert.deepEqual(parseSandbox('py\nimport sys\nprint(sys.version)'), { code: 'import sys\nprint(sys.version)', language: 'python' });
+  assert.deepEqual(parseSandbox('node console.log(42)'), { code: 'console.log(42)', language: 'node' });
+  assert.deepEqual(parseSandbox('bash for i in 1 2; do echo $i; done'), { code: 'for i in 1 2; do echo $i; done', language: 'bash' });
+  assert.deepEqual(parseSandbox('python -m pytest -q'), { command: 'python -m pytest -q', language: 'python' });
+  assert.deepEqual(parseSandbox('node scripts/check.js --fast'), { command: 'node scripts/check.js --fast', language: 'node' });
+  assert.deepEqual(parseSandbox('sh -c "echo hi"'), { command: 'sh -c "echo hi"' });
+  assert.deepEqual(parseSandbox('```python\nprint("fenced")\n```'), { code: 'print("fenced")', language: 'python' });
+  assert.deepEqual(parseSandbox('python ```\nx = 1\nprint(x)\n```'), { code: 'x = 1\nprint(x)', language: 'python' });
+  assert.deepEqual(parseSandbox('```\necho plain\n```'), { code: 'echo plain', language: 'bash' });
+  assert.match(parseSandbox('```ruby\nputs 1\n```').error!, /bash, python and node code, not ruby/);
+  assert.deepEqual(parseSandbox('--network --security --timeout 30 --no-files pip install requests'), { network: true, profile: 'security', timeoutSeconds: 30, copyFiles: false, command: 'pip install requests' });
+  assert.deepEqual(parseSandbox('--timeout=9999 python print(1)'), { timeoutSeconds: 1800, code: 'print(1)', language: 'python' });
+  for (const bad of ['--network', 'python', '--timeout x', '--security=1 ls']) assert.equal(parseSandbox(bad).error, SANDBOX_USAGE, bad);
+  assert.deepEqual(parseSandbox('--verbose ls'), { command: '--verbose ls' }, 'unknown options belong to the command');
 });
 test('/worktrees arguments: a mode, status, apply, keep with an optional name, discard, cleanup; anything else is usage', () => {
   assert.deepEqual(parseWorktrees(''), { action: 'status' });

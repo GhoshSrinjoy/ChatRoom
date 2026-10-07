@@ -12,9 +12,10 @@ const INIT_MS = 20_000, SESSION_MS = 60_000, OPTION_MS = 10_000, PROMPT_MS = 12 
 const MISSING = 'The GitHub Copilot CLI was not found. Install it to give Copilot its own tools, skills and sessions: npm i -g @github/copilot';
 const SIGNED_OUT = 'Sign in to the GitHub Copilot CLI: run "copilot login" in a terminal, then try again.';
 const RESUME_NOTE = 'Previous session could not be resumed · started a new one with recent room history';
-const ROOM_TOOL = /\b(search_documents|read_document|semantic_search|ollama_ocr)\b/;
+/** Room tools the CLI may run without its own card: the read-only ones, and sandbox_run, whose gate is Chatroom's own approval card. */
+const ROOM_TOOL = /\b(search_documents|read_document|semantic_search|ollama_ocr|sandbox_run)\b/;
 /** A room tool's title when the CLI reports no server: exactly `chatroom-<tool>` (or `.`, `/`, `_` separators), nothing else. */
-const ROOM_TOOL_TITLE = /^chatroom[-_/.]{1,2}(search_documents|read_document|semantic_search|ollama_ocr)$/;
+const ROOM_TOOL_TITLE = /^chatroom[-_/.]{1,2}(search_documents|read_document|semantic_search|ollama_ocr|sandbox_run)$/;
 interface TurnState { req: NativeTurnRequest; text: string; thinking: string; breakPending: boolean; items: Map<string, ActivityItem>; command: boolean }
 interface Live {
   key: string; roomId: string; agentId: string; spawnKey: string; proc: JsonlProcess; rpc: RpcConnection; ready: Promise<void>; version?: string;
@@ -103,7 +104,10 @@ function diffOf(content: unknown): string | undefined {
 function serverOf(call: any): string | undefined {
   return [call?._meta?.mcpServerName, call?._meta?.serverName].find(v => typeof v === 'string' && v);
 }
-/** Room tools are read-only and always allowed: the chatroom server (from CLI metadata) with a room tool name, or exactly a room tool's title. */
+/**
+ * Room tools are allowed here without a card of their own (they are read-only, or sandbox_run, which shows Chatroom's approval card
+ * before anything runs): the chatroom server (from CLI metadata) with a room tool name, or exactly a room tool's title.
+ */
 function isRoomTool(call: any): boolean {
   if (['execute', 'edit', 'delete', 'move', 'fetch'].includes(call?.kind)) return false;
   const title = str(call?.title) ?? '', server = serverOf(call);

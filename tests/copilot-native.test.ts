@@ -200,6 +200,13 @@ test('request_permission: cards in ask mode, auto rules for auto-edit, plan and 
   const named = await permissionRound('plan', { toolCallId: 'p7', kind: 'other', title: 'search_documents', rawInput: { query: 'x' }, _meta: { mcpServerName: 'chatroom' } });
   assert.equal(named.outcome.optionId, 'opt-allow'); assert.equal(named.approvals.length, 0);
   assert.equal((await permissionRound('ask', { toolCallId: 'p6', kind: 'execute', title: 'Running: echo chatroom search_documents' })).approvals.length, 1);
+  // sandbox_run goes to Chatroom without a Copilot card: Chatroom's own approval card is the gate. Not when it is an execute call or another server's tool.
+  const sandbox = await permissionRound('ask', { toolCallId: 'p8', kind: 'other', title: 'chatroom-sandbox_run', rawInput: { command: 'npm test' } });
+  assert.equal(sandbox.outcome.optionId, 'opt-allow'); assert.equal(sandbox.approvals.length, 0);
+  const sandboxNamed = await permissionRound('plan', { toolCallId: 'p9', kind: 'other', title: 'sandbox_run', rawInput: { command: 'ls' }, _meta: { mcpServerName: 'chatroom' } });
+  assert.equal(sandboxNamed.outcome.optionId, 'opt-allow'); assert.equal(sandboxNamed.approvals.length, 0);
+  assert.equal((await permissionRound('ask', { toolCallId: 'p10', kind: 'execute', title: 'chatroom-sandbox_run' }, () => ({ decision: 'deny' }))).approvals.length, 1);
+  assert.equal((await permissionRound('ask', { toolCallId: 'p11', kind: 'other', title: 'sandbox_run', _meta: { mcpServerName: 'evil' } }, () => ({ decision: 'deny' }))).approvals.length, 1);
   const fullWithout = await permissionRound('full', execute, () => ({ decision: 'deny' }));
   assert.equal(fullWithout.approvals.length, 1, 'full access needs chatroom.allowFullAccess');
   const full = await permissionRound('full', execute, undefined, { allowFullAccess: true });

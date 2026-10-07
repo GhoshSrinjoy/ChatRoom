@@ -18,7 +18,8 @@ const roomCommands = [
   ['model', '<model>', 'Set the model of the mentioned agent', true], ['effort', '<level>', 'Set reasoning effort for the mentioned agents (or all)', true],
   ['permissions', 'plan | ask | auto | full', 'Set what agents may do without asking', true], ['status', '', 'Show sessions, models and context use', true],
   ['stop', '', 'Stop all running agents', false],
-  ['worktrees', 'off | auto | always | status | apply | keep [name] | discard | cleanup', 'Give agents their own git worktrees so parallel edits never collide', false]].map(([name, args, description, agentScoped]) => ({ name, ...(args ? { args } : {}), description, agentScoped }));
+  ['worktrees', 'off | auto | always | status | apply | keep [name] | discard | cleanup', 'Give agents their own git worktrees so parallel edits never collide', false],
+  ['sandbox', 'on | off | status | <command> | python|node|bash <code>', 'Run a command or script in a throwaway Docker container (asks you first)', false]].map(([name, args, description, agentScoped]) => ({ name, ...(args ? { args } : {}), description, agentScoped }));
 const capabilities = {
   a1: { provider: 'codex', runtime: 'cli', status: 'ready', version: '0.160.1', models: [], efforts: ['low', 'medium', 'high', 'xhigh'], tools: [], skills: [{ name: 'pdf', description: 'Work with PDF files' }],
     commands: [{ name: 'review', description: 'Review your changes with a subagent', source: 'mapped' }, { name: 'goal', argumentHint: '<objective> | clear', description: 'Set a goal to keep pursuing', source: 'mapped' }, { name: 'pdf', description: 'Work with PDF files', source: 'skill' }],
@@ -59,7 +60,7 @@ const state = {
     { name: 'pdf', description: 'Read, merge and split PDF files.', path: '/skills/pdf/SKILL.md', dir: '/skills/pdf', source: 'agents-user', nativeTo: ['codex', 'copilot'] }],
   roomCommands,
   localModels: { vision: 'glm-ocr:latest', embedding: 'embeddinggemma:latest' },
-  settings: { allowFullAccess: false, attachOpenFile: true, approvalTimeoutSeconds: 300, worktrees: 'off', worktreesAvailable: true }
+  settings: { allowFullAccess: false, attachOpenFile: true, approvalTimeoutSeconds: 300, worktrees: 'off', worktreesAvailable: true, sandbox: { enabled: true, available: true, detail: 'Docker 29.5.3' } }
 };
 const server = createServer(async (req, res) => {
   if (req.url === '/') { res.setHeader('Content-Type', 'text/html'); res.end('<!doctype html><html lang="en"><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/app.css"><title>Chatroom UI test</title><div id="app"></div><script src="/app.js"></script></html>'); return; }
@@ -747,6 +748,250 @@ try {
   assert.equal(await wtCommand.locator('.menu-hint').textContent(), 'off | auto | always | status | apply | keep [name] | discard | cleanup');
   await prompt.press('Enter'); assert.equal(await prompt.inputValue(), '/worktrees ');
   await prompt.fill('');
+
+  // Sandbox: run cards (live updates, escaping, Cancel, Run again), Run in sandbox on code blocks, sandbox approvals,
+  // the Room setup switch, Start Docker Desktop, Install Docker Desktop, the Tools section and /sandbox.
+  const lastSandbox = async () => (await sent(m => m.type === 'sandbox')).at(-1);
+  const lastSandboxOption = async () => (await sent(m => m.type === 'options' && 'sandbox' in m)).at(-1);
+  const sbxLimits = { cpus: 2, memoryMb: 2048, timeoutSeconds: 120 };
+  const sbxRun = (id, extra = {}) => ({ id: 'run-' + id, status: 'done', image: 'python:3.12-slim', profile: 'test', network: false, command: 'python -m pytest -q', limits: sbxLimits, stdout: '', stderr: '', requestedBy: 'Claude', agentId: 'a2', createdAt: now, startedAt: now, ...extra });
+  const sbxMessage = (id, extra) => ({ id, kind: 'notice', author: 'Sandbox', text: 'Sandbox run', status: 'complete', createdAt: now, sandbox: sbxRun(id, extra) });
+  const sbxScript = Array.from({ length: 9 }, (_, i) => `print(${i})`).join('\n');
+  const sbxCard = id => page.locator(`.sandbox-card[data-id="${id}"]`);
+  const trimmed = async locator => (await locator.allTextContents()).map(s => s.trim());
+  Object.assign(state.room, { status: 'idle', activeAgents: [], currentAgent: undefined, agentStates: {}, messages: [
+    { id: 'u6', kind: 'user', author: 'You', text: 'Try this:\n\n```python\nprint("<b>hi</b>")\n```', status: 'complete', createdAt: now },
+    { id: 'r6', kind: 'agent', agentId: 'a2', author: 'Claude', text: 'Run the checks:\n\n```sh\nnpm test\n```\n\nThe types:\n\n```ts\nconst x: number = 1;\n```\n\n```javascript\nconsole.log(1)\n```', status: 'complete', createdAt: now },
+    sbxMessage('sb1', { status: 'running', startedAt: Date.now() - 5000, stdout: 'collecting <b>tests</b>\n', purpose: 'Check the <em>parser</em> tests' }),
+    sbxMessage('sb2', { exitCode: 0, durationMs: 1400, finishedAt: now, stdout: '3 passed <script>window.HACKED=true</script>\n', files: [{ path: 'reports/<i>out</i>.txt', size: 2048, text: 'ok <img src=x onerror="window.HACKED=true">' }, { path: 'out.bin', size: 5 }] }),
+    sbxMessage('sb3', { exitCode: 1, durationMs: 2100, finishedAt: now, language: 'python', command: sbxScript, profile: 'security', network: true, stdout: 'starting\n', stderr: 'AssertionError: <img src=x onerror="window.HACKED=true">\n' }),
+    sbxMessage('sb4', { status: 'timeout', durationMs: 120000, finishedAt: now, error: 'Stopped after 2 min <b>limit</b>' }),
+    sbxMessage('sb5', { status: 'denied', requestedBy: 'You', agentId: undefined, command: 'ls -la' }),
+    { id: 'r7', kind: 'agent', agentId: 'a1', author: 'Codex', text: 'Writing it:\n\n```python\nprint(1)', status: 'streaming', createdAt: now }] });
+  await deliver(state);
+  const sbxCards = page.locator('.sandbox-card');
+  assert.equal(await sbxCards.count(), 5, 'Sandbox notices render as cards');
+  assert.equal(await page.locator('.notice-line').count(), 0);
+  assert.equal(await page.evaluate(() => window.HACKED), undefined);
+  assert.equal(await page.locator('.sandbox-card script, .sandbox-card img, .sandbox-card i, .sandbox-card em, .sandbox-card b, .message-content b').count(), 0, 'Output, file names, file text and purposes are escaped');
+  // Running: elapsed time, the purpose, the badges and Cancel.
+  assert.match(await sbxCard('sb1').locator('.sbx-chip').textContent(), /^Running… 00:0\d$/);
+  const elapsed = await sbxCard('sb1').locator('.sbx-elapsed').textContent();
+  await page.waitForFunction(before => document.querySelector('.sandbox-card[data-id="sb1"] .sbx-elapsed').textContent !== before, elapsed, { timeout: 3000 });
+  assert.equal(await sbxCard('sb1').locator('.sbx-chip.run').count(), 1);
+  assert.equal(await sbxCard('sb1').getAttribute('aria-label'), 'Sandbox run by Claude: Running…');
+  assert.equal(await sbxCard('sb1').locator('.sbx-by').textContent(), 'by Claude');
+  assert.equal(await sbxCard('sb1').locator('.sbx-purpose').textContent(), 'Check the <em>parser</em> tests');
+  assert.equal(await sbxCard('sb1').locator('.sbx-command').textContent(), 'python -m pytest -q');
+  assert.deepEqual(await sbxCard('sb1').locator('.sbx-badge').allTextContents(), ['python:3.12-slim', 'Test', 'No network', '2 CPUs · 2 GB · 2 min']);
+  assert.equal(await sbxCard('sb1').locator('.sbx-out.stdout pre').textContent(), 'collecting <b>tests</b>\n');
+  assert.equal(await sbxCard('sb1').locator('.sbx-out.stdout pre').isVisible(), true, 'Live output is open');
+  assert.deepEqual(await trimmed(sbxCard('sb1').locator('.sbx-actions button')), ['Cancel'], 'Cancel while running, no Run again');
+  await sbxCard('sb1').getByRole('button', { name: 'Cancel' }).click();
+  assert.deepEqual(await lastSandbox(), { type: 'sandbox', action: 'cancel', id: 'run-sb1' });
+  await sbxCard('sb1').getByRole('button', { name: 'Cancel' }).click();
+  assert.equal((await sent(m => m.type === 'sandbox' && m.action === 'cancel')).length, 1, 'A double click cancels once');
+  // The host updates the same card in place; focus stays on the card's button.
+  Object.assign(state.room.messages[2].sandbox, { status: 'cancelled', durationMs: 5200, finishedAt: Date.now() });
+  await deliver(state);
+  assert.equal(await sbxCards.count(), 5); assert.equal(await page.locator('#messages > *').nth(2).getAttribute('data-id'), 'sb1', 'The card updates in place');
+  assert.equal(await sbxCard('sb1').locator('.sbx-chip').textContent(), 'Cancelled');
+  assert.equal(await sbxCard('sb1').getByRole('button', { name: 'Cancel' }).count(), 0);
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.sandbox), 'rerun', 'Focus moves to Run again on the same card');
+  Object.assign(state.room.messages[2].sandbox, { status: 'done', exitCode: 0 }); await deliver(state);
+  // Done, exit 0: green chip, stdout, files with sizes and text, duration, Run again.
+  assert.equal(await sbxCard('sb2').locator('.sbx-chip').textContent(), 'Exit 0');
+  assert.equal(await sbxCard('sb2').locator('.sbx-chip.ok').count(), 1); assert.equal(await sbxCard('sb2').locator('.sbx-chip.bad').count(), 0);
+  assert.equal(await sbxCard('sb2').locator('.sbx-out.stdout pre').textContent(), '3 passed <script>window.HACKED=true</script>\n');
+  assert.equal(await sbxCard('sb2').locator('.sbx-out.stderr').count(), 0, 'No stderr section without stderr');
+  assert.match(await sbxCard('sb2').locator('.sbx-out.stdout summary').textContent(), /^stdout · 1 line$/);
+  assert.match(await sbxCard('sb2').locator('.sbx-meta').textContent(), /^Took 1\.4 s · /);
+  const sbxFiles = sbxCard('sb2').locator('.sbx-files');
+  assert.equal(await sbxFiles.locator(':scope > summary').textContent(), '2 files created or changed');
+  assert.equal(await sbxFiles.getAttribute('open'), null, 'The file list starts closed');
+  await sbxFiles.locator(':scope > summary').click();
+  assert.deepEqual(await sbxFiles.locator('.sbx-file-path').allTextContents(), ['reports/<i>out</i>.txt', 'out.bin']);
+  assert.deepEqual(await sbxFiles.locator('.sbx-file-size').allTextContents(), ['2 KB', '5 B']);
+  await sbxFiles.locator('.sbx-file > summary').click();
+  assert.equal(await sbxFiles.locator('.sbx-file pre').textContent(), 'ok <img src=x onerror="window.HACKED=true">', 'File text is shown as text');
+  assert.equal(await sbxFiles.locator('.sbx-file pre').isVisible(), true);
+  await sbxCard('sb2').getByRole('button', { name: 'Run again' }).click();
+  assert.deepEqual(await lastSandbox(), { type: 'sandbox', action: 'rerun', id: 'run-sb2' });
+  // Done, exit 1: red chip, stderr open, a long script collapsed, the security profile and network on.
+  assert.equal(await sbxCard('sb3').locator('.sbx-chip').textContent(), 'Exit 1');
+  assert.equal(await sbxCard('sb3').locator('.sbx-chip.bad').count(), 1);
+  assert.equal(await sbxCard('sb3').locator('.sbx-out.stderr[open]').count(), 1, 'stderr opens when the run failed');
+  assert.equal(await sbxCard('sb3').locator('.sbx-out.stderr pre').textContent(), 'AssertionError: <img src=x onerror="window.HACKED=true">\n');
+  assert.deepEqual(await sbxCard('sb3').locator('.sbx-badge').allTextContents(), ['python:3.12-slim', 'Security', 'Network on', '2 CPUs · 2 GB · 2 min']);
+  assert.equal(await sbxCard('sb3').locator('.sbx-badge.net-on').count(), 1);
+  const sbxCode = sbxCard('sb3').locator('.sbx-code');
+  assert.equal(await sbxCode.getAttribute('open'), null, 'A long script starts collapsed');
+  assert.equal(await sbxCode.locator('summary').textContent(), 'python script · 9 lines print(0) …');
+  await sbxCode.locator('summary').click();
+  assert.equal(await sbxCode.locator('pre').textContent(), sbxScript);
+  // Timed out, and denied (the user's own run).
+  assert.equal(await sbxCard('sb4').locator('.sbx-chip').textContent(), 'Timed out');
+  assert.equal(await sbxCard('sb4').locator('.sbx-error').textContent(), 'Stopped after 2 min <b>limit</b>');
+  assert.equal(await sbxCard('sb4').locator('.sbx-chip.bad').count(), 1);
+  assert.equal(await sbxCard('sb5').locator('.sbx-chip').textContent(), 'Denied');
+  assert.equal(await sbxCard('sb5').locator('.sbx-by').textContent(), 'by you');
+  assert.equal(await sbxCard('sb5').locator('.sbx-empty').count(), 0, 'A denied run has no "No output"');
+  assert.equal(await sbxCard('sb5').getByRole('button', { name: 'Run again' }).count(), 1);
+  // Run in sandbox on closed bash, python and node blocks, in the user's and the agents' messages.
+  assert.deepEqual(await page.locator('.code-lang').allTextContents(), ['python', 'sh', 'javascript'], 'Not ts, and not a block still being written');
+  assert.equal(await page.locator('.message[data-id="r7"] .code-run').count(), 0);
+  await page.locator('.message[data-id="u6"]').getByRole('button', { name: 'Run in sandbox: python code' }).click();
+  assert.deepEqual(await lastSandbox(), { type: 'sandbox', action: 'run', code: 'print("<b>hi</b>")', language: 'python' });
+  await page.locator('.message[data-id="r6"]').getByRole('button', { name: 'Run in sandbox: sh code' }).click();
+  assert.deepEqual(await lastSandbox(), { type: 'sandbox', action: 'run', code: 'npm test', language: 'bash' });
+  await page.locator('.message[data-id="r6"]').getByRole('button', { name: 'Run in sandbox: javascript code' }).click();
+  assert.deepEqual(await lastSandbox(), { type: 'sandbox', action: 'run', code: 'console.log(1)', language: 'node' });
+  // Off in Settings, off in this room, or Docker not answering: no run buttons anywhere.
+  for (const [settings, room, why] of [[{ enabled: false }, undefined, 'the setting is off'], [{}, false, 'the room switch is off'], [{ available: false, detail: 'Docker Desktop is not running.', action: 'startDocker' }, undefined, 'Docker is not available']]) {
+    state.settings.sandbox = { enabled: true, available: true, detail: 'Docker 29.5.3', ...settings }; state.room.sandbox = room; await deliver(state);
+    assert.equal(await page.locator('.code-run, .code-block').count(), 0, `No Run in sandbox when ${why}`);
+    assert.equal(await page.getByRole('button', { name: 'Run again' }).count(), 0, `No Run again when ${why}`);
+    assert.equal(await sbxCards.count(), 5, `The cards stay when ${why}`);
+  }
+  state.settings.sandbox = { enabled: true, available: true, detail: 'Docker 29.5.3' }; delete state.room.sandbox; await deliver(state);
+  assert.equal(await page.locator('.code-run').count(), 3, 'The buttons come back');
+  // Sandbox approvals: Allow and Deny only, from an agent or from You. The host's detail ("Why: …", "Image: …", … then the code)
+  // becomes the purpose, a labelled code block, badges and notes; any other detail is shown as text.
+  const apAt = Date.now(), apBase = { canAllowSession: false, status: 'pending', createdAt: apAt, expiresAt: apAt + 300000 };
+  state.room.messages.push(
+    sbxMessage('sb6', { status: 'pending', requestedBy: 'You', agentId: undefined, command: 'ls', createdAt: apAt }),
+    { id: 'ap6', kind: 'approval', author: 'You', text: 'Run Python code in the sandbox (1 line)', status: 'complete', createdAt: apAt,
+      approval: { ...apBase, id: 'appr-6', kind: 'sandbox', tool: 'sandbox', title: 'Run Python code in the sandbox (1 line)',
+        detail: 'Why: Try the snippet\nImage: python:3.12-slim\nProfile: test · a writable copy\nNetwork: off\nFiles: a copy of C:\\ws\\chatroom\nLimits: 2 CPUs · 2048 MB memory · 120 s · 512 processes\n\nPython code:\nprint("<b>hi</b>")' } },
+    { id: 'ap7', kind: 'approval', agentId: 'a2', author: 'Claude', text: 'npm audit', status: 'complete', createdAt: apAt,
+      approval: { ...apBase, id: 'appr-7', agentId: 'a2', provider: 'claude', kind: 'sandbox', tool: 'sandbox', title: 'npm audit --json > audit.json', canAllowSession: true,
+        detail: 'Why: Check the <em>dependencies</em>\nImage: node:22-bookworm-slim\nProfile: security · no root user, read-only copy\nNetwork: ON · the container can reach the internet\nFiles: a copy of C:\\ws\\chatroom\nLimits: 2 CPUs · 2048 MB memory · 300 s · 512 processes\nReturns the text of: audit.json\n\nCommand:\nnpm audit --json > audit.json <script>window.HACKED=true</script>' } },
+    { id: 'ap8', kind: 'approval', agentId: 'a1', author: 'Codex', text: 'curl example.com', status: 'complete', createdAt: apAt,
+      approval: { ...apBase, id: 'appr-8', agentId: 'a1', provider: 'codex', kind: 'sandbox', tool: 'sandbox', title: 'curl example.com', detail: 'Free text <b>from</b> an older host' } });
+  await deliver(state);
+  const userApproval = page.locator('.message.approval[data-id="ap6"]'), agentApproval = page.locator('.message.approval[data-id="ap7"]'), plainApproval = page.locator('.message.approval[data-id="ap8"]');
+  for (const card of [userApproval, agentApproval, plainApproval]) assert.deepEqual(await card.locator('.approval-actions button').allTextContents(), ['Allow', 'Deny'], 'Sandbox runs: Allow or Deny, never Allow for session');
+  assert.equal(await userApproval.locator('.approval-head').textContent(), 'You want to run this in the sandbox');
+  assert.equal(await userApproval.locator('.message-avatar .user-avatar').textContent(), 'Y', 'The user\'s own request has the user\'s avatar');
+  assert.equal(await agentApproval.locator('.approval-head').textContent(), 'Claude wants to run this in the sandbox');
+  assert.equal(await userApproval.locator('.sbx-purpose').textContent(), 'Try the snippet');
+  assert.equal(await userApproval.locator('.sbx-label').textContent(), 'Python code');
+  assert.equal(await userApproval.locator('.approval-code').textContent(), 'print("<b>hi</b>")');
+  assert.equal(await userApproval.locator('.approval-title, .approval-detail').count(), 0, 'The parsed request replaces the title and the raw detail');
+  assert.deepEqual(await userApproval.locator('.sbx-badge').allTextContents(), ['python:3.12-slim', 'Test', 'No network', '2 CPUs · 2 GB · 2 min']);
+  assert.deepEqual(await userApproval.locator('.sbx-note').allTextContents(), ['Files: a copy of C:\\ws\\chatroom']);
+  assert.equal(await agentApproval.locator('.sbx-purpose').textContent(), 'Check the <em>dependencies</em>');
+  assert.equal(await agentApproval.locator('.sbx-label').textContent(), 'Command');
+  assert.equal(await agentApproval.locator('.approval-code').textContent(), 'npm audit --json > audit.json <script>window.HACKED=true</script>');
+  assert.deepEqual(await agentApproval.locator('.sbx-badge').allTextContents(), ['node:22-bookworm-slim', 'Security', 'Network on', '2 CPUs · 2 GB · 5 min']);
+  assert.equal(await agentApproval.locator('.sbx-badge.net-on').count(), 1, 'Network on stands out');
+  assert.deepEqual(await agentApproval.locator('.sbx-note').allTextContents(), ['Files: a copy of C:\\ws\\chatroom', 'Returns the text of: audit.json']);
+  assert.equal(await plainApproval.locator('.approval-title').textContent(), 'curl example.com');
+  assert.equal(await plainApproval.locator('.approval-detail').textContent(), 'Free text <b>from</b> an older host');
+  assert.equal(await page.locator('.approval-card em, .approval-card script, .approval-card b').count(), 0);
+  assert.equal(await page.evaluate(() => window.HACKED), undefined);
+  assert.equal(await sbxCard('sb6').locator('.sbx-chip').textContent(), 'Waiting for you');
+  assert.equal(await sbxCard('sb6').locator('.sbx-chip.wait').count(), 1);
+  assert.match(await page.locator('#run-controls').textContent(), /3 waiting for you/);
+  await userApproval.getByRole('button', { name: 'Allow' }).click();
+  assert.deepEqual((await sent(m => m.type === 'approval')).at(-1), { type: 'approval', id: 'appr-6', decision: 'allow' });
+  await agentApproval.getByRole('button', { name: 'Deny' }).click();
+  assert.deepEqual((await sent(m => m.type === 'approval')).at(-1), { type: 'approval', id: 'appr-7', decision: 'deny' });
+  // Once decided, the result card has the details: the code folds away and the badges go.
+  Object.assign(state.room.messages.find(m => m.id === 'ap6').approval, { status: 'allowed', decidedAt: Date.now() });
+  state.room.messages = state.room.messages.filter(m => m.id !== 'ap8'); await deliver(state);
+  assert.match(await userApproval.locator('.approval-result').textContent(), /^Allowed · /);
+  assert.equal(await userApproval.locator('.sbx-badge, .sbx-note, .approval-actions').count(), 0);
+  assert.equal(await userApproval.locator('.sbx-code summary').textContent(), 'Python code · 1 line print("<b>hi</b>")');
+  assert.equal(await userApproval.locator('.sbx-code').getAttribute('open'), null);
+  // Room setup: the switch, its status line, Start Docker Desktop and Install Docker Desktop.
+  await page.locator('[data-action="room-setup"]').click();
+  const setupSandbox = page.locator('#setup-sandbox');
+  assert.equal(await setupSandbox.isChecked(), true, 'On: the setting applies until the room has its own');
+  assert.equal(await page.getByRole('switch', { name: 'Sandbox runs in this room' }).count(), 1);
+  assert.equal(await page.locator('#setup-sandbox-status').textContent(), 'Docker 29.5.3 · every run asks you first');
+  await setupSandbox.click();
+  assert.deepEqual(await lastSandboxOption(), { type: 'options', sandbox: false });
+  state.room.sandbox = false; await deliver(state);
+  assert.equal(await setupSandbox.isChecked(), false);
+  assert.match(await page.locator('#setup-sandbox-status').textContent(), /^Off in this room\./);
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'setup-sandbox', 'The switch keeps focus');
+  await setupSandbox.click();
+  assert.deepEqual(await lastSandboxOption(), { type: 'options', sandbox: true });
+  delete state.room.sandbox;
+  state.settings.sandbox = { enabled: true, available: false, detail: 'Docker Desktop is not running.', action: 'startDocker' }; await deliver(state);
+  assert.equal(await setupSandbox.isChecked(), true);
+  assert.equal(await page.locator('#setup-sandbox-status').textContent(), 'Docker Desktop is not running.');
+  const startDocker = page.locator('#dialog-layer [data-sandbox="startDocker"]');
+  assert.equal((await startDocker.textContent()).trim(), 'Start Docker Desktop');
+  await startDocker.click();
+  assert.deepEqual(await lastSandbox(), { type: 'sandbox', action: 'startDocker' });
+  assert.equal((await startDocker.textContent()).trim(), 'Starting Docker Desktop…');
+  assert.equal(await startDocker.getAttribute('aria-disabled'), 'true');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.sandbox), 'startDocker', 'The button keeps focus');
+  await page.keyboard.press('Enter');
+  assert.equal((await sent(m => m.type === 'sandbox' && m.action === 'startDocker')).length, 1, 'Pressed once while Docker starts');
+  await deliver({ type: 'error', text: 'Docker Desktop did not start.' });
+  await page.evaluate(() => { document.getElementById('toast').hidden = true; }); await prompt.fill('');
+  assert.equal((await startDocker.textContent()).trim(), 'Start Docker Desktop', 'An error offers the button again');
+  state.settings.sandbox = { enabled: true, available: false, detail: 'Docker is not installed.', action: 'installDocker' }; await deliver(state);
+  assert.equal(await startDocker.count(), 0);
+  const installDocker = page.locator('#dialog-layer a', { hasText: 'Install Docker Desktop' });
+  assert.equal(await installDocker.getAttribute('href'), 'https://www.docker.com/products/docker-desktop/');
+  assert.equal(await page.locator('#dialog-layer .sbx-url').textContent(), 'https://www.docker.com/products/docker-desktop/', 'The address is shown as text');
+  state.settings.sandbox = { enabled: false, available: true, detail: 'Docker 29.5.3' }; await deliver(state);
+  assert.equal(await setupSandbox.isDisabled(), true, 'Off in Settings: the room switch cannot turn it on');
+  assert.equal(await page.locator('#setup-sandbox-status').textContent(), 'Off in Settings (chatroom.sandbox.enabled)');
+  assert.equal(await page.locator('#dialog-layer .sbx-setting [data-action="settings"]').count(), 1);
+  await page.keyboard.press('Escape');
+  state.settings.sandbox = { enabled: true, available: true, detail: 'Docker 29.5.3' }; await deliver(state);
+  // The Tools tab: status, the switch and the last 5 runs, newest first.
+  await page.locator('.inspector-toggle').click(); await page.locator('[data-tab="tools"]').click();
+  const sbxSection = page.locator('.inspector-section', { has: page.locator('.section-heading', { hasText: 'SANDBOX' }) });
+  assert.equal(await sbxSection.locator('.section-heading').first().textContent(), 'SANDBOX 6');
+  assert.equal(await sbxSection.locator('#tools-sandbox').isChecked(), true);
+  assert.equal(await sbxSection.locator('#tools-sandbox-status').textContent(), 'Docker 29.5.3 · every run asks you first');
+  assert.deepEqual(await sbxSection.locator('.sbx-run-cmd').allTextContents(), ['ls', 'ls -la', 'python -m pytest -q', 'print(0) …', 'python -m pytest -q']);
+  assert.deepEqual(await sbxSection.locator('.sbx-run-status').allTextContents(), ['Waiting for you', 'Denied', 'Timed out', 'Exit 1 · 2.1 s', 'Exit 0 · 1.4 s']);
+  await sbxSection.locator('#tools-sandbox').click();
+  assert.deepEqual(await lastSandboxOption(), { type: 'options', sandbox: false });
+  await page.locator('[data-tab="usage"]').click(); await page.locator('.inspector-close').click();
+  // /sandbox in the slash menu.
+  await prompt.fill(''); await prompt.pressSequentially('/sand');
+  const sbxCommand = page.locator('#menu .menu-item', { hasText: '/sandbox' });
+  assert.equal(await sbxCommand.count(), 1);
+  assert.equal(await sbxCommand.locator('.menu-hint').textContent(), 'on | off | status | <command> | python|node|bash <code>');
+  await prompt.press('Enter'); assert.equal(await prompt.inputValue(), '/sandbox ');
+  await prompt.fill('');
+  // 300 and 360 px: the cards, the approvals and the code blocks fit; so do Room setup and the Tools section.
+  state.room.messages[2].sandbox = { ...state.room.messages[2].sandbox, status: 'running', startedAt: Date.now() };
+  for (const width of [300, 360]) {
+    state.settings.sandbox = { enabled: true, available: true, detail: 'Docker 29.5.3' };
+    await page.setViewportSize({ width, height: 900 }); await deliver(state);
+    assert.equal(await page.locator('.code-run').count(), 3);
+    const outside = await page.evaluate(() => {
+      const list = document.getElementById('messages'), box = list.getBoundingClientRect(), out = [];
+      for (const el of list.querySelectorAll('.sandbox-card, .approval-card, .code-block, .sandbox-card button, .approval-card button, .code-run, .sbx-badge')) {
+        const r = el.getBoundingClientRect();
+        if (r.width && (r.left < box.left - 0.5 || r.right > box.right + 0.5)) out.push(el.className);
+      }
+      for (const el of list.querySelectorAll('.sandbox-card, .approval-card')) if (el.scrollWidth > el.clientWidth) out.push('scroll ' + el.className);
+      if (document.documentElement.scrollWidth > window.innerWidth) out.push('page');
+      return out;
+    });
+    assert.deepEqual(outside, [], `Sandbox cards fit at ${width}px`);
+    state.settings.sandbox = { enabled: true, available: false, detail: 'Docker Desktop is not running. Start it, then try again.', action: 'startDocker' }; await deliver(state);
+    await page.locator('[data-action="room-setup"]').click();
+    assert.ok(await page.evaluate(() => { const d = document.querySelector('#dialog-layer .dialog'), b = d.querySelector('[data-sandbox="startDocker"]').getBoundingClientRect(), r = d.getBoundingClientRect(); return d.scrollWidth <= d.clientWidth && b.right <= r.right; }), `Room setup fits at ${width}px`);
+    await page.keyboard.press('Escape');
+    await page.locator('.inspector-toggle').click(); await page.locator('[data-tab="tools"]').click();
+    assert.ok(await page.evaluate(() => { const c = document.getElementById('inspector-content'); return c.scrollWidth <= c.clientWidth; }), `The Tools tab fits at ${width}px`);
+    await page.locator('[data-tab="usage"]').click(); await page.locator('.inspector-close').click();
+  }
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  state.settings.sandbox = { enabled: true, available: true, detail: 'Docker 29.5.3' };
+  assert.equal(await page.evaluate(() => window.HACKED), undefined);
+
   state.room.mode = 'parallel'; state.room.documents = [];
   for (const width of [360, 320]) {
     await page.setViewportSize({ width, height: 900 });
@@ -797,5 +1042,5 @@ try {
   await page.setViewportSize({ width: 600, height: 180 });
   await page.setContent('<html><body style="margin:0;background:white;color:black;font:46px Arial;padding:38px">CHATROOM 123</body></html>');
   await page.screenshot({ path: 'artifacts/ocr-fixture.png' });
-  console.log('UI checks passed: team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, worktrees (pill, changes card, select, agent switch, Tools section, /worktrees), 360px/320px sidebar, escaping and logo rendering.');
+  console.log('UI checks passed: team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, worktrees (pill, changes card, select, agent switch, Tools section, /worktrees), sandbox (run cards, Run in sandbox, approvals, switch, Docker actions, Tools section, /sandbox), 360px/320px sidebar, escaping and logo rendering.');
 } finally { await browser.close(); await new Promise(r => server.close(r)); }

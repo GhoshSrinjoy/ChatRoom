@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, TaskPreset, TeamStage, ToolCall, TurnFlags, TurnKind, TurnSink, Unavailable, addUsage, emptyUsage } from './types';
-import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, classifyUnavailable, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, pipelineLead, planStages, renderContext, renderEntry, roomFresh, roomUpdate, stageAgents, teamPlan, turnAsk, unavailableText, unseenEntries, upsertChangesCard } from './core';
+import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, classifyUnavailable, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, pipelineLead, planStages, renderContext, renderEntry, roomFresh, roomUpdate, sandboxFinished, stageAgents, teamPlan, turnAsk, unavailableText, unseenEntries, upsertChangesCard } from './core';
 import { extractHandoffs, markerOf } from './commands';
 import { plainEditorText } from './editor-context';
 
@@ -58,7 +58,11 @@ interface Pass {
   pipeline?: { index: number; done: Set<string>; noticed?: boolean };
 }
 interface Watchdog { readonly done: boolean; arm(): void; suspend(): void; resume(): void; end(): void }
+/** agentId '' = the user's own request (a sandbox run the user started). */
 interface PendingApproval { agentId: string; finish: (status: ApprovalInfo['status'], decision: ApprovalDecision) => void }
+/** A long tool call in an agent's turn (a sandbox run): the turn's abort signal, a status line, and the release that restarts the inactivity timer. */
+export interface TurnHold { signal?: AbortSignal; detail(text: string): void; release(): void }
+const IDLE_WATCHDOG: Watchdog = { done: true, arm() {}, suspend() {}, resume() {}, end() {} };
 const realClock: Clock = {
   now: () => Date.now(),
   setTimeout: (fn, ms) => { const handle = setTimeout(fn, ms); handle.unref?.(); return handle; },
@@ -80,6 +84,10 @@ export class RoomEngine {
   private queue: QueueItem[] = [];
   private pass?: Pass;
   private controllers = new Map<string, AbortController>();
+  /** The inactivity timer of each agent's running turn. */
+  private watchdogs = new Map<string, Watchdog>();
+  /** Sandbox cards that were still running when an agent's delta was taken: delivered with its next delta once they finish. */
+  private owed = new Map<string, Set<string>>();
   private approvals = new Map<string, PendingApproval>();
   private pauseRequested = false;
   private stopping = false;
@@ -764,15 +772,50 @@ export class RoomEngine {
       promise.then(resolve, reject).finally(() => { this.clock.clearTimeout(grace); signal.removeEventListener('abort', onAbort); });
     });
   }
-  private approval(agent: Agent, request: ApprovalRequest, signals: AbortSignal[], timer: Watchdog): Promise<ApprovalDecision> {
-    const now = this.clock.now(), timeoutMs = Math.max(1000, this.options.approvalTimeoutMs());
-    const info: ApprovalInfo = { kind: request.kind, tool: String(request.tool ?? 'tool'), title: String(request.title ?? 'Permission request').slice(0, 500),
+  /**
+   * An approval card outside a CLI's own permission flow (a sandbox run). For an agent in a running turn, the card cancels with the
+   * turn and the turn's inactivity timer waits while it is pending. Without an agent (the user's own run) the card is from You.
+   * Either way it is denied when it expires or when Stop is pressed.
+   */
+  requestApproval(agentId: string | undefined, request: ApprovalRequest, signal?: AbortSignal): Promise<ApprovalDecision> {
+    const agent = agentId ? this.room.agents.find(a => a.id === agentId) : undefined;
+    if (agentId && !agent) return Promise.resolve({ decision: 'deny', message: 'That agent is not in this room.' });
+    const turn = agent ? this.controllers.get(agent.id)?.signal : undefined;
+    const signals = [signal, turn].filter((s): s is AbortSignal => !!s);
+    return this.approval(agent, request, signals, (agent && this.watchdogs.get(agent.id)) || IDLE_WATCHDOG);
+  }
+  /**
+   * Keeps an agent's turn alive through a long tool call (a sandbox run): its inactivity timer waits until `release`, and `detail`
+   * shows what it is doing. Returns the turn's abort signal, so the work stops with the turn.
+   */
+  holdTurn(agentId: string): TurnHold {
+    const timer = this.watchdogs.get(agentId), signal = this.controllers.get(agentId)?.signal;
+    if (!timer || timer.done) return { signal, detail: () => {}, release: () => {} };
+    let released = false;
+    timer.suspend();
+    const waiting = () => [...this.approvals.values()].some(p => p.agentId === agentId);
+    return {
+      signal,
+      detail: text => { if (released || timer.done || waiting()) return; this.state(agentId, 'tool', text); this.changed(); },
+      release: () => {
+        if (released) return;
+        released = true; timer.resume();
+        if (!timer.done && !waiting() && this.room.agentStates?.[agentId]?.status === 'tool') { this.state(agentId, 'thinking'); this.changed(); }
+      }
+    };
+  }
+  private approval(agent: Agent | undefined, request: ApprovalRequest, signals: AbortSignal[], timer: Watchdog): Promise<ApprovalDecision> {
+    const now = this.clock.now(), timeoutMs = Math.max(1000, this.options.approvalTimeoutMs()), who = agent?.name ?? 'You';
+    const info = { kind: request.kind, tool: String(request.tool ?? 'tool'), title: String(request.title ?? 'Permission request').slice(0, 500),
       ...(request.detail ? { detail: String(request.detail).slice(0, 8000) } : {}), ...(request.diff ? { diff: String(request.diff).slice(0, 8000) } : {}),
-      canAllowSession: !!request.canAllowSession, id: randomUUID(), agentId: agent.id, provider: agent.provider, status: 'pending', createdAt: now, expiresAt: now + timeoutMs };
-    const card = message('approval', info.title, agent.name, agent.id);
+      canAllowSession: !!request.canAllowSession, id: randomUUID(), ...(agent ? { agentId: agent.id, provider: agent.provider } : {}), status: 'pending', createdAt: now, expiresAt: now + timeoutMs } as ApprovalInfo;
+    const card = message('approval', info.title, who, agent?.id);
     card.createdAt = now; card.approval = info;
+    if (!agent) delete card.agentId;
     this.room.messages.push(card);
-    this.state(agent.id, 'approval', info.title); timer.suspend(); this.changed();
+    const before = agent ? this.room.agentStates?.[agent.id] : undefined;
+    if (agent) this.state(agent.id, 'approval', info.title);
+    timer.suspend(); this.changed();
     return new Promise<ApprovalDecision>(resolve => {
       let settled = false, expiry: unknown;
       const finish = (status: ApprovalInfo['status'], decision: ApprovalDecision) => {
@@ -781,12 +824,16 @@ export class RoomEngine {
         this.clock.clearTimeout(expiry); this.approvals.delete(info.id);
         for (const signal of signals) signal.removeEventListener('abort', onAbort);
         timer.resume();
-        if (!timer.done && ![...this.approvals.values()].some(p => p.agentId === agent.id)) this.state(agent.id, 'thinking');
-        this.log(`${agent.name}: ${info.title} → ${decision.decision === 'deny' ? 'Denied' : 'Allowed'}`);
+        if (agent && ![...this.approvals.values()].some(p => p.agentId === agent.id)) {
+          if (!timer.done) this.state(agent.id, 'thinking');
+          // An agent outside a turn goes back to how it was.
+          else if (timer === IDLE_WATCHDOG && this.room.agentStates?.[agent.id]?.status === 'approval') { if (before) this.room.agentStates![agent.id] = before; else delete this.room.agentStates![agent.id]; }
+        }
+        this.log(`${who}: ${info.title} → ${decision.decision === 'deny' ? 'Denied' : 'Allowed'}`);
         resolve(decision);
       };
       const onAbort = () => finish('cancelled', { decision: 'deny', message: 'The request was cancelled.' });
-      this.approvals.set(info.id, { agentId: agent.id, finish });
+      this.approvals.set(info.id, { agentId: agent?.id ?? '', finish });
       expiry = this.clock.setTimeout(() => finish('expired', { decision: 'deny', message: 'No response from the user in time.' }), timeoutMs);
       for (const signal of signals) {
         if (signal.aborted) { onAbort(); return; }
@@ -813,7 +860,7 @@ export class RoomEngine {
   private async nativeTurn(agent: Agent, driver: NativeDriver, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, command?: { name: string; args: string }, override?: { model?: string }): Promise<Message> {
     const model = override?.model || agent.model;
     const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
-    this.controllers.set(id, controller); this.state(id, 'thinking');
+    this.controllers.set(id, controller); this.watchdogs.set(id, timer); this.state(id, 'thinking');
     const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec, command), isolation = this.options.isolation;
     let release: (() => void) | undefined, isolated = !!agent.worktree;
     try {
@@ -829,7 +876,7 @@ export class RoomEngine {
       release = isolated ? undefined : await this.writerLock(agent, signal);
       this.state(id, 'thinking');
       const framing = this.options.framing(agent, this.room, false), maxChars = this.options.contextTokens() * 3;
-      let context = '', ask = '', fullContext = () => '', editor: EditorSnapshot | undefined, flags: TurnFlags = {}, seen: string | undefined;
+      let context = '', ask = '', fullContext = () => '', editor: EditorSnapshot | undefined, flags: TurnFlags = {}, seen: string | undefined, running: string[] = [];
       if (!command) {
         // A native session lives in the folder it started in: another folder means a new session with the room history.
         const moved = !!isolation && !!agent.session?.id && agent.session.cwd !== folder;
@@ -840,8 +887,13 @@ export class RoomEngine {
           agent.session = kept;
         }
         const session = agent.session, trigger = spec.trigger;
-        const entries = session && !moved ? unseenEntries(contextRoom, agent, spec) : boundedHistory(contextRoom, agent, this.options.contextTokens(), spec);
+        const listed = session && !moved ? unseenEntries(contextRoom, agent, spec) : boundedHistory(contextRoom, agent, this.options.contextTokens(), spec);
+        // Sandbox runs that were still running when this agent's last delta was taken, and have finished since.
+        const owed = this.owed.get(id), have = new Set(listed.map(m => m.id));
+        const late = owed?.size ? contextRoom.messages.filter(m => owed.has(m.id) && !have.has(m.id) && !!m.sandbox && sandboxFinished(m.sandbox) && m.sandbox.agentId !== id) : [];
+        const entries = [...late, ...listed];
         seen = contextRoom.messages.at(-1)?.id;
+        running = contextRoom.messages.filter(m => m.sandbox && !sandboxFinished(m.sandbox) && m.sandbox.status !== 'denied' && m.sandbox.agentId !== id).map(m => m.id);
         const unseen = !!trigger && entries.some(m => m.id === trigger.id);
         const rest = unseen ? entries.filter(m => m.id !== trigger!.id) : entries;
         const update = session?.id && framingHash(framing) !== session.framingHash ? roomUpdate(framing) : '';
@@ -888,6 +940,7 @@ export class RoomEngine {
         const seenId = spec.kind === 'step' && spec.flow?.planId ? spec.flow.planId : seen;
         agent.session = { ...agent.session, ...(seenId ? { seen: seenId } : {}), framingHash: framingHash(framing), provider: agent.provider, lastUsedAt: this.clock.now() };
         if (isolation) { if (folder) agent.session.cwd = folder; else delete agent.session.cwd; }
+        if (running.length) this.owed.set(id, new Set(running)); else this.owed.delete(id);
       };
       if (result?.status === 'interrupted') {
         // Stopped after the CLI received the input (it says so, or the model already answered): its session holds it, so later turns must not send it again.
@@ -907,6 +960,7 @@ export class RoomEngine {
         catch (error) { this.log(`${agent.name}'s work could not be saved in its worktree · ${errorText(error)}`, 'error'); }
       }
       if (this.controllers.get(id) === controller) this.controllers.delete(id);
+      if (this.watchdogs.get(id) === timer) this.watchdogs.delete(id);
       this.changed();
     }
     return answer;
@@ -956,7 +1010,7 @@ export class RoomEngine {
   private async legacyTurn(agent: Agent, contextRoom: Room, spec: TurnSpec, handoffFrom?: string, override?: { model?: string }): Promise<Message> {
     const model = override?.model || agent.model, runAgent = model !== agent.model ? { ...agent, model } : agent;
     const id = agent.id, controller = new AbortController(), signal = controller.signal, timer = this.watchdog(agent, controller);
-    this.controllers.set(id, controller); this.state(id, 'thinking');
+    this.controllers.set(id, controller); this.watchdogs.set(id, timer); this.state(id, 'thinking');
     const answer = this.answerFor(agent, spec, handoffFrom), purpose = this.purpose(spec);
     let aggregate = emptyUsage(), pendingInput: string | undefined;
     try {
@@ -1019,6 +1073,7 @@ export class RoomEngine {
     } finally {
       timer.end();
       if (this.controllers.get(id) === controller) this.controllers.delete(id);
+      if (this.watchdogs.get(id) === timer) this.watchdogs.delete(id);
       this.changed();
     }
     return answer;
@@ -1033,6 +1088,7 @@ export class RoomEngine {
       if (!agent) continue;
       // forget (/clear): a new native session that receives nothing from before this point.
       agent.session = mode === 'fresh' ? undefined : { provider: agent.provider, ...(last ? { seen: last } : agent.session?.seen ? { seen: agent.session.seen } : {}) };
+      this.owed.delete(id);
       await this.options.native(agent)?.release(this.room.id, agent.id).catch(error => this.log(`${agent.name}: ${errorText(error)}`, 'error'));
     }
     this.changed();
