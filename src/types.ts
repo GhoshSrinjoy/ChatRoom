@@ -196,6 +196,8 @@ export interface EditorSnapshot {
   key: string;
 }
 export interface TurnFlags { think?: boolean; ultra?: boolean }
+/** Something the user can do from a notice about an agent that can't run: install, update or sign in to its CLI. */
+export interface NoticeFix { provider: ProviderId; status: 'missing' | 'signed-out'; action?: HintAction }
 export interface Message {
   id: string; author: string; agentId?: string; kind: 'user' | 'agent' | 'tool' | 'notice' | 'approval';
   text: string; createdAt: number; status: 'complete' | 'streaming' | 'cancelled' | 'error'; usage?: Usage;
@@ -219,6 +221,8 @@ export interface Message {
   changes?: RoomChanges;
   /** Notice: a sandbox run and its result (updated in place while it runs). */
   sandbox?: SandboxResult;
+  /** Notice: agents that can't run, and what the room can offer for them. */
+  fixes?: NoticeFix[];
 }
 export interface RoomDocument {
   id: string; name: string; hash: string; kind: 'text' | 'pdf' | 'image' | 'docx'; source: 'attached' | 'workspace';
@@ -304,6 +308,12 @@ export interface AgentCapabilities {
   supports: CapabilitySupport;
   /** What this CLI can really turn off, per kind; other kinds show no switch. toolsByName: it also takes tool names it does not list. */
   canDisable?: Partial<Record<DisableKind | 'toolsByName', boolean>>;
+  /** Tools the CLI has no working switch for: listed, not clickable. */
+  fixedTools?: string[];
+  /** Tools that share one switch: turning one off turns off them all. */
+  toolGroups?: string[][];
+  /** The model a turn uses when the agent has none chosen. */
+  activeModel?: string;
   context?: { percent: number; tokens: number; window: number };
   action?: HintAction;
   updatedAt: number;

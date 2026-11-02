@@ -345,6 +345,7 @@ button.cap-chip { background: transparent; color: inherit; font-family: inherit;
 button.cap-chip.more { color: var(--muted); }
 button.cap-chip:hover { border-color: var(--vscode-focusBorder, var(--muted)); }
 .cap-chip.toggle.off { color: var(--muted); border-style: dashed; text-decoration: line-through; opacity: .7; }
+.cap-chip.fixed { color: var(--muted); }
 .cap-add { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
 .cap-add input { flex: 1; min-width: 0; font-size: 11px; }
 .caps-note { margin: 8px 0 0; }

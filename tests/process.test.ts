@@ -162,5 +162,7 @@ test('resolveCli finds the Gemini CLI behind an npm shim, in the current and the
 test('childEnv: the Gemini CLI does not relaunch itself; other CLIs are not told', () => {
   const exe = { command: 'gemini.exe', prefix: [] };
   assert.equal(childEnv(exe, 'gemini').GEMINI_CLI_NO_RELAUNCH, 'true');
+  assert.equal(childEnv(exe, 'gemini').NO_BROWSER, 'true', 'a CLI in the background never opens a sign-in page');
+  assert.equal(childEnv(exe, 'claude').NO_BROWSER, undefined);
   assert.equal(childEnv(exe, 'claude').GEMINI_CLI_NO_RELAUNCH, undefined);
 });

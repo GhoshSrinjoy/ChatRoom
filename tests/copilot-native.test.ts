@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CopilotDriver, copilotArgs, simpleDiff } from '../src/copilot-native';
+import { CopilotDriver, canSwitchSkills, copilotArgs, copilotSkillsOff, simpleDiff, skillSwitchFiles } from '../src/copilot-native';
 import { Agent, ApprovalDecision, ApprovalRequest, DriverHost, EditorSnapshot, NativeTurnRequest, ProviderError, Room, SharedSkill } from '../src/types';
 import { FakeChild, fakeHost, fakeSpawn, recordingSink, RecordingSink, rpcPeer, testAgent, testRoom, waitFor } from './helpers';
 
@@ -68,7 +70,94 @@ test('what is turned off: tools and servers become flags, and a server Chatroom 
   const { driver, agent, room, peers } = setup(undefined, { agent: { options: { disabled: { mcpServers: ['chatroom'] } } as any } });
   const caps = await driver.capabilities(room, agent);
   assert.deepEqual(method(peers[0]!, 'session/new')[0]!.params.mcpServers, []);
-  assert.deepEqual(caps.canDisable, { tools: true, toolsByName: true, skills: false, mcpServers: true, commands: true }, 'no switch for one skill, so none is offered');
+  assert.deepEqual(caps.canDisable, { tools: true, toolsByName: true, skills: true, mcpServers: true, commands: true });
+  await driver.dispose();
+});
+
+test('one skill: a plugin with a hook on the skill tool refuses it, for this process only', async () => {
+  const { driver, agent, room, children, host } = setup(undefined, { agent: { options: { disabled: { skills: ['Demo'], commands: ['built-in-skill'] } } as any } });
+  await driver.turn(request(room, agent, recordingSink()));
+  const args = children[0]!.args, dir = args[args.indexOf('--plugin-dir') + 1]!;
+  assert.ok(args.includes('--plugin-dir'));
+  assert.ok(dir.startsWith(join(host.storageDir(), 'copilot-skill-switch')), 'in the extension\'s storage, not the CLI\'s folders');
+  const entry = JSON.parse(readFileSync(join(dir, 'hooks.json'), 'utf8')).hooks.preToolUse[0];
+  assert.equal(entry.matcher, '^skill$', 'other tools never start the hook');
+  assert.ok(entry.powershell.includes('ELECTRON_RUN_AS_NODE') && entry.bash.includes('ELECTRON_RUN_AS_NODE'), 'it runs with the runtime VS Code already has');
+  assert.equal(JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8')).name, 'chatroom-skill-switch');
+  const script = join(dir, 'refuse-skills.cjs');
+  const run = (input: string) => execFileSync(process.execPath, [script], { input, encoding: 'utf8' });
+  const decide = (skill: unknown) => JSON.parse(run(JSON.stringify({ toolName: 'skill', toolArgs: JSON.stringify({ skill })})) || '{}');
+  assert.deepEqual(decide('demo'), { permissionDecision: 'deny', permissionDecisionReason: 'The user turned this skill off in Chatroom.' });
+  assert.equal(decide(' DEMO ').permissionDecision, 'deny', 'whatever the case');
+  assert.equal(decide('built-in-skill').permissionDecision, 'deny', 'the CLI lists its own skills only as commands');
+  assert.deepEqual(decide('other'), {}, 'other skills go ahead');
+  assert.equal(run('not json'), '', 'nothing it can read is left alone: the matcher already chose skill calls');
+  assert.equal(run(JSON.stringify({ toolName: 'skill', toolArgs: { skill: 'demo' } })).includes('deny'), true, 'arguments as an object too');
+  await driver.dispose();
+});
+
+test('one skill: no plugin until one is off; a change restarts the process and keeps the session', async () => {
+  const { driver, agent, room, children, peers } = setup();
+  const sink = recordingSink();
+  await driver.turn(request(room, agent, sink));
+  adopt(agent, sink);
+  assert.ok(!children[0]!.args.includes('--plugin-dir'));
+  agent.options.disabled = { skills: ['demo'] };
+  await driver.turn(request(room, agent, recordingSink()));
+  assert.equal(children.length, 2);
+  assert.ok(children[1]!.args.includes('--plugin-dir'));
+  assert.equal(method(peers[1]!, 'session/load')[0]!.params.sessionId, 'sess-0');
+  agent.options.disabled = {};
+  await driver.turn(request(room, agent, recordingSink()));
+  assert.ok(!children[2]!.args.includes('--plugin-dir'), 'turned on again');
+  await driver.dispose();
+});
+
+test('one skill: agents with the same list share one plugin; a CLI older than the checked version gets no flag and offers no switch', async () => {
+  const off = { options: { disabled: { skills: ['demo'] } } as any };
+  const first = setup(undefined, { agent: off }), storage = first.host.storageDir();
+  await first.driver.turn(request(first.room, first.agent, recordingSink()));
+  const second = setup(undefined, { agent: off, host: { storageDir: () => storage } });
+  await second.driver.turn(request(second.room, second.agent, recordingSink()));
+  const dirOf = (args: string[]) => args[args.indexOf('--plugin-dir') + 1];
+  assert.equal(dirOf(first.children[0]!.args), dirOf(second.children[0]!.args));
+  await first.driver.dispose(); await second.driver.dispose();
+
+  const old = setup(peer => ({ initialize: () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true }, agentInfo: { name: 'Copilot', version: '1.0.50' }, authMethods: [] }) }),
+    { agent: off, host: { runtime: async () => ({ executable: { command: 'fake-cli', prefix: [] }, version: '1.0.50', source: 'test', modern: true }) } });
+  const caps = await old.driver.capabilities(old.room, old.agent);
+  assert.equal(caps.canDisable?.skills, false);
+  assert.ok(!old.children[0]!.args.includes('--plugin-dir'));
+  await old.driver.dispose();
+});
+
+test('canSwitchSkills and copilotSkillsOff', () => {
+  for (const version of ['1.0.92', '1.0.105', '1.1.0', '2.0.0']) assert.ok(canSwitchSkills(version), version);
+  for (const version of ['1.0.91', '1.0.5', '0.9.99', 'unknown', undefined]) assert.ok(!canSwitchSkills(version), String(version));
+  assert.deepEqual(copilotSkillsOff(testAgent('copilot', { options: { disabled: { skills: ['B', 'a'], commands: ['b', 'c'] } } as any })), ['a', 'b', 'c']);
+  assert.deepEqual(copilotSkillsOff(testAgent('copilot')), []);
+});
+
+test('the hook survives awkward paths', () => {
+  const entry = JSON.parse(skillSwitchFiles(['x'], "C:\\it's here", "C:\\Program Files\\it's\\Code.exe")['hooks.json']!).hooks.preToolUse[0];
+  assert.ok(entry.powershell.includes("& 'C:\\Program Files\\it''s\\Code.exe' 'C:\\it''s here"), entry.powershell);
+  const shell = JSON.parse(skillSwitchFiles(['x'], "/it's here", "/opt/it's/code")['hooks.json']!).hooks.preToolUse[0].bash;
+  assert.ok(shell.startsWith("ELECTRON_RUN_AS_NODE=1 '/opt/it'\\''s/code' '") && shell.includes("it'\\''s here"), shell);
+  const names = skillSwitchFiles(['a"b', "c'd\\e"], '/d')['refuse-skills.cjs']!;
+  assert.ok(names.includes(JSON.stringify(['a"b', "c'd\\e"])), 'names go in as JSON');
+});
+
+test('the CLI\'s note about excluded tools stays out of the reply', async () => {
+  const { driver, agent, room, peers } = setup(peer => ({ 'session/prompt': () => {
+    peer.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Info: Disabled tools: glob, web_fetch' } });
+    peer.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hello' } });
+    peer.update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\nInfo: Disabled tools: is a phrase you might quote.' } });
+    return { stopReason: 'end_turn' };
+  } }), { agent: { options: { disabled: { tools: ['glob', 'web_fetch'] } } as any } });
+  const sink = recordingSink(), result = await driver.turn(request(room, agent, sink));
+  assert.equal(result.text, 'Hello\nInfo: Disabled tools: is a phrase you might quote.', 'only at the start of a reply');
+  assert.ok(sink.texts.every(text => !text.startsWith('Info:')));
+  assert.ok(peers[0]);
   await driver.dispose();
 });
 

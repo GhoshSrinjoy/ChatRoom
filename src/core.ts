@@ -36,6 +36,14 @@ export function normalizeDisabled(raw: unknown): DisabledItems | undefined {
   }
   return Object.keys(result).length ? result : undefined;
 }
+/**
+ * The disabled items after a click. `group` holds the items that go off and on together. Of those, only what the CLI lists is recorded,
+ * so a tool it doesn't have never shows up as turned off.
+ */
+export function toggleDisabled(current: DisabledItems | undefined, kind: DisableKind, name: string, off: boolean, group: string[] = [name], listed: string[] = []): DisabledItems | undefined {
+  const kept = (current?.[kind] ?? []).filter(item => !group.includes(item));
+  return normalizeDisabled({ ...current, [kind]: off ? [...kept, ...group.filter(item => item === name || listed.includes(item))] : kept });
+}
 export function disabledNames(agent: Agent, kind: DisableKind): string[] {
   const list = agent.options?.disabled?.[kind];
   return Array.isArray(list) ? list : [];
@@ -368,6 +376,8 @@ export function roomFraming(agent: Agent, room: Room, ctx: FramingContext): stri
       : lead ? (lead.id === agent.id ? 'You lead this room: the user\'s requests come to you first, and you decide whether to answer yourself or bring in teammates.' : `${lead.name} leads this room and may ask you for help.`) : '',
     away.length ? `Unavailable right now: ${away.join(', ')}.` : '',
     agent.role.trim() ? `Your focus in this room: ${agent.role.trim()}` : '',
+    // The Copilot CLI keeps listing a skill it will refuse, so the agent is told before it tries.
+    !ctx.legacy && agent.provider === 'copilot' && disabledNames(agent, 'skills').length ? `The user turned off these skills for you, so don't use them: ${disabledNames(agent, 'skills').join(', ')}.` : '',
     !ctx.legacy && agent.worktree ? `You work in your own git worktree (branch ${agent.worktree.branch}); your edits reach the user's folder only after the room combines and reviews them. Other agents' changes reach you when the room combines the work.` : '',
     !ctx.legacy && room.shareSkills && ctx.skillsIndex ? `Skills from the other agents are listed in ${ctx.skillsIndex}; open a SKILL.md from there when one fits the task.` : ''
   ].filter(Boolean).join('\n');

@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { ActivityItem, Agent, AgentCapabilities, ApprovalKind, ApprovalRequest, DriverHost, DriverSettings, ModelInfo, NativeDriver, NativeTurnRequest, NativeTurnResult,
   PermissionLevel, ProviderError, Room, Runtime, SkillWiring, Usage, emptyUsage } from './types';
 import { JsonlProcess, RpcConnection, RpcError, spawnJsonl } from './jsonl';
@@ -13,6 +15,10 @@ const INIT_MS = 20_000, SESSION_MS = 60_000, OPTION_MS = 10_000, PROMPT_MS = 12 
 const MISSING = 'The GitHub Copilot CLI was not found. Install it to give Copilot its own tools, skills and sessions: npm i -g @github/copilot';
 const SIGNED_OUT = 'Sign in to the GitHub Copilot CLI: run "copilot login" in a terminal, then try again.';
 const RESUME_NOTE = 'Previous session could not be resumed · started a new one with recent room history';
+/** The CLI announces --excluded-tools as reply text at the start of a session's first turn. */
+const EXCLUDED_NOTE = /^Info: Disabled tools: [^\n]*\n*/;
+/** The oldest CLI checked with a hook from --plugin-dir, which is how one skill is turned off. An older one might not start with that flag. */
+export const COPILOT_SKILL_SWITCH_VERSION = '1.0.92';
 /** Room tools the CLI may run without its own card: the read-only ones, and sandbox_run, whose gate is Chatroom's own approval card. */
 const ROOM_TOOL = /\b(search_documents|read_document|semantic_search|ollama_ocr|sandbox_run)\b/;
 /** A room tool's title when the CLI reports no server: exactly `chatroom-<tool>` (or `.`, `/`, `_` separators), nothing else. */
@@ -36,8 +42,46 @@ const text = (value: string) => ({ type: 'text', text: value });
 const effectivePermission = (agent: Agent, settings: DriverSettings): PermissionLevel =>
   agent.options?.permission === 'full' && !settings.allowFullAccess ? 'ask' : agent.options?.permission ?? 'ask';
 
-/** Spawn arguments. `wiring` is passed only when the room shares skills; `--allow-all` only when a full-access session lacks the allow_all option. */
-export function copilotArgs(agent: Agent, wiring: SkillWiring | undefined, settings: DriverSettings, forceAllowAll = false): string[] {
+const atLeast = (version: string | undefined, floor: string): boolean => {
+  const parts = (value: string) => value.split('.').map(part => parseInt(part, 10) || 0), have = parts(version ?? ''), want = parts(floor);
+  for (let i = 0; i < want.length; i++) if ((have[i] ?? 0) !== want[i]) return (have[i] ?? 0) > want[i]!;
+  return true;
+};
+export const canSwitchSkills = (version: string | undefined): boolean => atLeast(version, COPILOT_SKILL_SWITCH_VERSION);
+/** Names the CLI should refuse as skills. Commands count too: it lists its own built-in skills only as commands, and a name that is no skill never reaches the hook. */
+export function copilotSkillsOff(agent: Agent): string[] {
+  return [...new Set([...disabledNames(agent, 'skills'), ...disabledNames(agent, 'commands')].map(name => name.toLowerCase()))].sort();
+}
+const quotePowerShell = (value: string) => `'${value.replace(/'/g, "''")}'`, quoteShell = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+/**
+ * The files of a plugin for --plugin-dir: a hook on the skill tool that refuses the turned-off skills, for this one process. The CLI has no
+ * switch of its own for this: `copilot skill disable` is global, and sessions over ACP ignore it. It runs with VS Code's own runtime, so
+ * Node.js need not be installed, and only for skill calls. If the hook itself can't start, the CLI refuses every skill, and nothing else.
+ */
+export function skillSwitchFiles(off: string[], dir: string, runtime = process.execPath): Record<string, string> {
+  const script = join(dir, 'refuse-skills.cjs');
+  return {
+    'plugin.json': JSON.stringify({ name: 'chatroom-skill-switch', description: 'Refuses the skills the user turned off for this agent in Chatroom.', version: '1.0.0' }, null, 2),
+    'hooks.json': JSON.stringify({ version: 1, hooks: { preToolUse: [{ type: 'command', matcher: '^skill$', timeoutSec: 15,
+      powershell: `$env:ELECTRON_RUN_AS_NODE='1'; & ${quotePowerShell(runtime)} ${quotePowerShell(script)}`,
+      bash: `ELECTRON_RUN_AS_NODE=1 ${quoteShell(runtime)} ${quoteShell(script)}` }] } }, null, 2),
+    'refuse-skills.cjs': [
+      '// Written by Chatroom for one run of the Copilot CLI.',
+      `const off = new Set(${JSON.stringify(off)});`,
+      "let input = '';",
+      "process.stdin.on('data', chunk => { input += chunk; });",
+      "process.stdin.on('end', () => {",
+      "  let name = '';",
+      '  try {',
+      '    const call = JSON.parse(input), args = typeof call.toolArgs === \'string\' ? JSON.parse(call.toolArgs) : call.toolArgs;',
+      "    name = String(args?.skill ?? '').trim().toLowerCase();",
+      '  } catch { /* Nothing this can read as a skill call. */ }',
+      "  if (off.has(name)) process.stdout.write(JSON.stringify({ permissionDecision: 'deny', permissionDecisionReason: 'The user turned this skill off in Chatroom.' }));",
+      '});', ''].join('\n'),
+  };
+}
+/** Spawn arguments. `wiring` is passed only when the room shares skills; `--allow-all` only when a full-access session lacks the allow_all option; `pluginDir` only when a skill is turned off. */
+export function copilotArgs(agent: Agent, wiring: SkillWiring | undefined, settings: DriverSettings, forceAllowAll = false, pluginDir?: string): string[] {
   const options = agent.options, dir = (path?: string) => path ? ['--add-dir', path] : [];
   return ['--acp', '--no-auto-update', '--no-color', '--log-level', 'warning', ...dir(wiring?.copilotAddDir), ...dir(wiring?.indexDir),
     ...(options.extraDirs ?? []).flatMap(path => dir(path)),
@@ -45,6 +89,7 @@ export function copilotArgs(agent: Agent, wiring: SkillWiring | undefined, setti
     ...(options.useMcp === false ? ['--disable-builtin-mcps'] : []),
     ...disabledNames(agent, 'tools').map(name => `--excluded-tools=${name}`),
     ...disabledNames(agent, 'mcpServers').map(name => `--disable-mcp-server=${name}`),
+    ...(pluginDir ? ['--plugin-dir', pluginDir] : []),
     ...(forceAllowAll && effectivePermission(agent, settings) === 'full' ? ['--allow-all'] : [])];
 }
 function findOption(live: Live | undefined, id: string, category?: string): any | undefined {
@@ -248,9 +293,19 @@ export class CopilotDriver implements NativeDriver {
   /** The agent's folder: its worktree while it is isolated, else the workspace. */
   private cwd(room: Room, agent: Agent): string { return this.host.cwdFor?.(room, agent) ?? this.host.cwd(); }
 
+  /** Writes the skill switch under a name taken from its content, so agents with the same list share one and none piles up per agent. */
+  private async skillSwitch(off: string[]): Promise<string> {
+    const root = join(this.host.storageDir(), 'copilot-skill-switch');
+    const dir = join(root, createHash('sha256').update(JSON.stringify([off, process.execPath])).digest('hex').slice(0, 16));
+    await mkdir(dir, { recursive: true });
+    await Promise.all(Object.entries(skillSwitchFiles(off, dir)).map(([name, content]) => writeFile(join(dir, name), content)));
+    return dir;
+  }
+
   private async live(room: Room, agent: Agent, runtime: Runtime): Promise<Live> {
     const key = keyOf(room.id, agent.id), settings = this.host.settings(), cwd = this.cwd(room, agent);
-    const args = copilotArgs(agent, room.shareSkills ? this.host.skillWiring() : undefined, settings, this.allowAllFlag.has(key));
+    const off = canSwitchSkills(runtime.version) ? copilotSkillsOff(agent) : [];
+    const args = copilotArgs(agent, room.shareSkills ? this.host.skillWiring() : undefined, settings, this.allowAllFlag.has(key), off.length ? await this.skillSwitch(off) : undefined);
     const spawnKey = JSON.stringify([runtime.executable, args, settings.copilotUseEnvToken, cwd]);
     let live = this.lives.get(key);
     // A spawn-time change (the folder included) applies at the next turn; a running turn keeps its process.
@@ -488,7 +543,7 @@ export class CopilotDriver implements NativeDriver {
     const sink = turn.req.sink;
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
-        const chunk = blockText(update.content); if (!chunk) return;
+        const chunk = turn.text ? blockText(update.content) : blockText(update.content).replace(EXCLUDED_NOTE, ''); if (!chunk) return;
         if (turn.breakPending && turn.text && !turn.text.endsWith('\n')) turn.text += '\n\n';
         turn.breakPending = false; turn.text += chunk; sink.text(turn.text); return;
       }
@@ -563,8 +618,8 @@ export class CopilotDriver implements NativeDriver {
       commands, mcpServers: (live?.mcpNames ?? []).map(name => ({ name, status: 'configured' })), ...(agents.length ? { agents } : {}),
       supports: { thinking: false, summary: false, sandbox: false, webSearch: false, useMcp: true, useSkills: false, useProjectSettings: true, extraDirs: true,
         ultraSession: false, ultraTurn: true, thinkHard: efforts.length > 0, fullAccess: true, customAgent: true },
-      // The CLI excludes tools by name and disables servers, but has no switch for one skill.
-      canDisable: { tools: true, toolsByName: true, skills: false, mcpServers: true, commands: true },
+      // Tools go by name and servers by flag. One skill needs the hook, so only a CLI checked with it offers that.
+      canDisable: { tools: true, toolsByName: true, skills: canSwitchSkills(live?.version ?? extra.version), mcpServers: true, commands: true },
       ...((live?.context ?? agent.session?.context) ? { context: live?.context ?? agent.session?.context } : {}), updatedAt: Date.now(), ...extra };
   }
 }

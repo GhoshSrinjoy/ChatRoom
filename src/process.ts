@@ -63,8 +63,8 @@ export function childEnv(executable: Executable, provider?: NativeProviderId, ex
   if (provider === 'claude') env.CLAUDE_CODE_ENTRYPOINT = 'sdk-ts';
   if (provider === 'codex' && !env.RUST_LOG) env.RUST_LOG = 'warn';
   if (provider === 'copilot') env.COPILOT_AUTO_UPDATE = 'false';
-  // One process to stop and one stdin for ACP: no relaunch to raise its memory limit.
-  if (provider === 'gemini') env.GEMINI_CLI_NO_RELAUNCH = 'true';
+  // One process to stop and one stdin for ACP: no relaunch to raise its memory limit. Signing in is something the user asks for, in a terminal: a CLI in the background never opens a browser.
+  if (provider === 'gemini') { env.GEMINI_CLI_NO_RELAUNCH = 'true'; env.NO_BROWSER = 'true'; }
   if (extra.pathPrepend?.length) {
     const key = Object.keys(env).find(k => process.platform === 'win32' ? k.toUpperCase() === 'PATH' : k === 'PATH') ?? 'PATH';
     env[key] = [...extra.pathPrepend, env[key]].filter(Boolean).join(delimiter);

@@ -1187,6 +1187,67 @@ try {
   await clearSent(); await geminiCard.locator('[data-gemini="install"]').click();
   assert.deepEqual(await sideSent('gemini'), [{ type: 'gemini', action: 'install' }]);
   assert.match(await side.locator('.connection-row', { hasText: 'Gemini CLI' }).textContent(), /too old/);
+
+  // A notice about an agent that can't run has the button for it, whatever that agent is called.
+  await side.locator('.inspector-close').click();
+  const fixNotice = (id, text, fixes) => ({ id, author: 'Chatroom', kind: 'notice', text, createdAt: Date.now(), status: 'complete', ...(fixes ? { fixes } : {}) });
+  await sideDeliver({ ...base, room: { ...base.room, messages: [
+    fixNotice('f1', "Gem can't run right now (needs an update). Mention another agent, or press Try again in its settings.", [{ provider: 'gemini', status: 'missing', action: 'updateGemini' }]),
+    fixNotice('f2', 'Skipping Gem (not installed) · continuing with Claude.', [{ provider: 'gemini', status: 'missing' }]),
+    fixNotice('f3', "Gem can't run right now (signed out) · continuing without it.", [{ provider: 'gemini', status: 'signed-out' }]),
+    fixNotice('f4', 'Skipping Pilot (signed out) and Pilot Two (not installed) · continuing with Claude.', [{ provider: 'copilot', status: 'signed-out' }, { provider: 'copilot', status: 'missing' }]),
+    fixNotice('f5', "Claude can't run right now (signed out).", [{ provider: 'claude', status: 'signed-out' }]),
+    fixNotice('f6', 'Skipping Codex (out of usage until Thu 23:23) · continuing with Claude.'),
+  ] } });
+  const fixButtons = id => side.locator(`.notice-line[data-id="${id}"] button`);
+  assert.equal(await fixButtons('f1').textContent(), 'Update Gemini CLI');
+  await clearSent(); await fixButtons('f1').click();
+  assert.deepEqual(await sideSent('gemini'), [{ type: 'gemini', action: 'install' }]);
+  assert.equal(await fixButtons('f2').textContent(), 'Install Gemini CLI');
+  assert.equal(await fixButtons('f3').textContent(), 'Sign in to Gemini');
+  await clearSent(); await fixButtons('f3').click();
+  assert.deepEqual(await sideSent('gemini'), [{ type: 'gemini', action: 'login' }]);
+  assert.deepEqual(await fixButtons('f4').allTextContents(), ['Sign in to Copilot', 'Install Copilot CLI']);
+  assert.equal(await fixButtons('f5').count(), 0, 'nothing is offered that the room can\'t do');
+  assert.equal(await fixButtons('f6').count(), 0);
+
+  // Codex: tools from a read. One with no switch is shown with no button, tools on one switch say so, and a skill's command goes off as the skill.
+  const codexAgent = base.room.agents.find(a => a.provider === 'codex');
+  const codexState = (capsPatch = {}, disabled) => { const next = structuredClone(base); if (disabled) next.room.agents.find(a => a.id === codexAgent.id).options.disabled = disabled;
+    next.capabilities[codexAgent.id] = { ...next.capabilities[codexAgent.id], status: 'ready', detail: undefined, runtime: 'cli', tools: ['exec_command', 'write_stdin', 'apply_patch', 'view_image', 'mem.recall'], fixedTools: ['apply_patch'], toolGroups: [['exec_command', 'write_stdin', 'shell']],
+      skills: [{ name: 'pdf', description: 'PDFs' }], commands: [{ name: 'pdf', description: 'PDFs', source: 'skill' }, { name: 'review', description: 'Review', source: 'builtin' }], mcpServers: [], canDisable: { tools: true, toolsByName: false, skills: true, mcpServers: true, commands: true }, ...capsPatch };
+    return next; };
+  await sideDeliver(codexState());
+  await side.locator('.inspector-toggle').click(); await side.locator('[data-tab="tools"]').click();
+  const codexCard = side.locator('.caps-card').nth(0), toolChip = name => codexCard.locator(`[data-cap='${JSON.stringify([codexAgent.id, 'tools', name])}']`), commandChip = (kind, name) => codexCard.locator(`[data-cap='${JSON.stringify([codexAgent.id, kind, name])}']`);
+  const stuck = codexCard.locator('span.cap-chip.fixed', { hasText: 'apply_patch' });
+  assert.equal(await stuck.count(), 1); assert.match(await stuck.getAttribute('title'), /Codex has no switch for this tool/);
+  assert.equal(await codexCard.locator('button.cap-chip', { hasText: 'apply_patch' }).count(), 0, 'no button that would pretend to work');
+  assert.match(await codexCard.textContent(), /Dimmed tools have no switch in this CLI/);
+  assert.match(await toolChip('exec_command').getAttribute('title'), /together with write_stdin/);
+  assert.doesNotMatch(await toolChip('exec_command').getAttribute('title'), /shell/, 'only tools this CLI lists');
+  assert.doesNotMatch(await toolChip('view_image').getAttribute('title'), /together/);
+  await clearSent(); await toolChip('exec_command').click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: codexAgent.id, kind: 'tools', name: 'exec_command', off: true }]);
+  await clearSent(); await codexCard.locator('.caps-row', { hasText: 'Commands' }).locator('button', { hasText: '/pdf' }).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: codexAgent.id, kind: 'skills', name: 'pdf', off: true }], 'a skill\'s command goes off as the skill, which also stops the model using it');
+  assert.match(await codexCard.locator('.caps-row', { hasText: 'Commands' }).locator('button', { hasText: '/pdf' }).getAttribute('title'), /turn off this skill and its command/);
+  await clearSent(); await codexCard.locator('button', { hasText: '/review' }).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: codexAgent.id, kind: 'commands', name: 'review', off: true }], 'a built-in command stays a command');
+  // What is already off: both lists show it, a fixed tool is not counted, and one turned off as a command turns on as a command.
+  await sideDeliver(codexState({}, { skills: ['pdf'], tools: ['apply_patch', 'view_image'] }));
+  const commandsRow = codexCard.locator('.caps-row', { hasText: 'Commands' });
+  assert.equal(await commandsRow.locator('button.off', { hasText: '/pdf' }).count(), 1);
+  await clearSent(); await commandsRow.locator('button', { hasText: '/pdf' }).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: codexAgent.id, kind: 'skills', name: 'pdf', off: false }]);
+  assert.match(await codexCard.locator('.caps-row', { hasText: 'Tools' }).locator('.caps-label').textContent(), /Tools \(5 · 1 off\)/);
+  await sideDeliver(codexState({}, { commands: ['pdf'] }));
+  await clearSent(); await commandsRow.locator('button', { hasText: '/pdf' }).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: codexAgent.id, kind: 'commands', name: 'pdf', off: false }]);
+  // A CLI with no switch for one skill: its command is only a command.
+  await sideDeliver(codexState({ canDisable: { tools: true, toolsByName: false, skills: false, mcpServers: true, commands: true } }));
+  await clearSent(); await commandsRow.locator('button', { hasText: '/pdf' }).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: codexAgent.id, kind: 'commands', name: 'pdf', off: true }]);
   assert.deepEqual(sideErrors, []);
   await side.close();
   }

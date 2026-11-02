@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
-import { CodexDriver, EFFORT_ORDER, bumpEffort, codexPolicy, commandTitle } from '../src/codex-native';
+import { CodexDriver, codexSwitchConfig, codexToolGroup, codexToolGroups, EFFORT_ORDER, bumpEffort, codexPolicy, commandTitle } from '../src/codex-native';
 import { codexEditorText } from '../src/editor-context';
 import { Agent, ApprovalDecision, ApprovalRequest, DriverHost, EditorSnapshot, NativeTurnRequest, ProviderError, Room } from '../src/types';
 import { FakeChild, RecordingSink, fakeHost, fakeSpawn, recordingSink, rpcPeer, testAgent, testRoom, waitFor } from './helpers';
@@ -643,6 +643,61 @@ test('what is turned off: thread config overrides, and MCP tools are listed so o
   assert.deepEqual(config['mcp_servers.mem.disabled_tools'], ['recall', 'remember']);
   assert.deepEqual(config['skills.config'], [{ name: 'pdf-tools', enabled: false }]);
   await driver.dispose();
+});
+
+test('built-in tools turned off become their switches, and stay off whatever the web search setting says', async () => {
+  const { driver, sent } = setup();
+  const agent = testAgent('codex', { options: { summary: 'auto', webSearch: true, disabled: { tools: ['exec_command', 'clock.sleep', 'mem.recall', 'web_search'] } } as any }), room = testRoom([agent]);
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  const config = sent('thread/start')[0].params.config;
+  assert.equal(config['features.shell_tool'], false);
+  assert.equal(config['features.sleep_tool'], false);
+  assert.equal(config.web_search, 'disabled');
+  assert.equal(config['features.view_image'], undefined, 'only what was turned off');
+  assert.equal(config['features.goals'], undefined);
+  assert.deepEqual(config['mcp_servers.mem.disabled_tools'], ['recall'], 'MCP tools go on as before');
+  await driver.dispose();
+});
+
+test('with web search on and its tool not turned off, the setting decides', async () => {
+  const { driver, sent } = setup();
+  const agent = testAgent('codex', { options: { summary: 'auto', webSearch: true, disabled: { tools: ['view_image'] } } as any }), room = testRoom([agent]);
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  const config = sent('thread/start')[0].params.config;
+  assert.equal(config.web_search, 'live'); assert.equal(config['features.view_image'], false);
+  await driver.dispose();
+});
+
+test('turning a built-in tool off between turns resumes the thread with its switch', async () => {
+  const { driver, sent } = setup();
+  const agent = testAgent('codex', { options: { summary: 'auto' } as any }), room = testRoom([agent]), sink = sinkFor(agent);
+  await driver.turn(request(agent, room, sink));
+  for (const patch of sink.sessions) agent.session = { ...agent.session, ...patch };
+  assert.equal(sent('thread/start')[0].params.config['features.goals'], undefined);
+  agent.options.disabled = { tools: ['create_goal', 'get_goal', 'update_goal'] };
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  assert.equal(sent('thread/resume').at(-1).params.config['features.goals'], false);
+  await driver.dispose();
+});
+
+test('tools on one switch go together', () => {
+  assert.ok(codexToolGroup('write_stdin').includes('exec_command'));
+  assert.deepEqual(codexToolGroup('get_goal'), ['create_goal', 'get_goal', 'update_goal']);
+  assert.deepEqual(codexToolGroup('view_image'), ['view_image']);
+  assert.deepEqual(codexToolGroup('mem.recall'), ['mem.recall'], 'anything else stands alone');
+  assert.ok(codexToolGroups().some(group => group.includes('exec_command')));
+  assert.ok(!codexToolGroups().some(group => group.includes('view_image')), 'one tool alone is no group');
+  assert.deepEqual(codexSwitchConfig(), { 'features.shell_tool': false, 'features.view_image': false, 'features.goals': false, 'features.sleep_tool': false, 'features.multi_agent': false, web_search: 'disabled' });
+});
+
+test('capabilities say which model a turn uses, for reading its tools', async () => {
+  const configured = setup({ 'config/read': () => ({ config: { model: 'gpt-configured', mcp_servers: {} }, origins: {}, layers: null }) });
+  const agent = testAgent('codex'), room = testRoom([agent]);
+  assert.equal((await configured.driver.capabilities(room, agent)).activeModel, 'gpt-configured');
+  await configured.driver.dispose();
+  const plain = setup(), caps = await plain.driver.capabilities(room, agent);
+  assert.equal(caps.activeModel, caps.models.find(m => m.isDefault)?.id);
+  await plain.driver.dispose();
 });
 
 test('turning a server off wins over its tools, and a change resumes the thread with the new config', async () => {

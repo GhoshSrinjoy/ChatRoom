@@ -615,6 +615,39 @@ const usageMark = (until: number): Unavailable => ({ reason: 'usage-limit', deta
 const notices = (room: Room) => room.messages.filter(m => m.kind === 'notice').map(m => m.text);
 const turns = (driver: FakeDriver) => driver.calls.map(c => `${c.agent.name}:${c.kind}`);
 
+test('a notice about an agent that can\'t run offers what its CLI needs', async () => {
+  const fixes = (room: Room) => room.messages.filter(m => m.kind === 'notice').map(m => m.fixes);
+  const outdated = nativeEngine(() => 'ok');
+  outdated.agents[0].provider = 'gemini';
+  outdated.agents[0].unavailable = { reason: 'missing', detail: 'Gemini CLI 0.1.18 is too old: Chatroom needs 0.38.0 or newer.', at: 0 };
+  await outdated.engine.start({ text: 'Hi', targets: [outdated.agents[0].id] });
+  assert.deepEqual(fixes(outdated.room), [[{ provider: 'gemini', status: 'missing', action: 'updateGemini' }]]);
+  assert.match(notices(outdated.room)[0]!, /can't run right now \(needs an update\)/);
+
+  const skipped = nativeEngine(() => 'ok');
+  skipped.agents[0].provider = 'copilot'; skipped.agents[1].provider = 'copilot';
+  skipped.agents[0].unavailable = { reason: 'signed-out', detail: 'Sign in', at: 0 };
+  skipped.agents[1].unavailable = { reason: 'signed-out', detail: 'Sign in', at: 0 };
+  await skipped.engine.start('Hi');
+  assert.deepEqual(fixes(skipped.room), [[{ provider: 'copilot', status: 'signed-out' }]], 'one button for two agents with the same problem');
+
+  const usage = nativeEngine(() => 'ok');
+  usage.agents[0].unavailable = usageMark(Date.now() + 3_600_000);
+  await usage.engine.start('Hi');
+  assert.deepEqual(fixes(usage.room), [undefined], 'nothing to offer for a usage limit');
+
+  const chat = nativeEngine(() => 'ok', { native: agent => agent.provider === 'copilot' ? undefined : new FakeDriver(() => 'ok') });
+  chat.agents[2].unavailable = { reason: 'signed-out', detail: 'Sign in', at: 0 };
+  await chat.engine.start({ text: 'Hi', targets: [chat.agents[2].id] });
+  assert.deepEqual(fixes(chat.room), [undefined], 'a chat model has no CLI to sign in to');
+
+  const handoff = nativeEngine(req => req.agent.name === 'Codex' ? '@Claude please check' : 'ok');
+  handoff.agents[1].provider = 'gemini';
+  handoff.agents[1].unavailable = { reason: 'missing', detail: 'The Gemini CLI was not found.', at: 0 };
+  await handoff.engine.start({ text: 'Hi', targets: [handoff.agents[0].id] });
+  assert.deepEqual(fixes(handoff.room).at(-1), [{ provider: 'gemini', status: 'missing' }], 'an install, not an update');
+});
+
 test('availability: relay skips a marked agent with one notice, a rounds loop keeps going, and the same notice is not posted again', async () => {
   const clock = fakeClock();
   const { engine, driver, agents } = nativeEngine(req => `${req.agent.name} ok`, { clock });
