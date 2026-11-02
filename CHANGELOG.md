@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0
+
+- **Gemini CLI.** Add it with **+**: it runs as `gemini --acp` with its own tools, skills, MCP servers and sessions, permission levels mapped to its approval modes, approval cards, and room tools over MCP. Existing rooms and new rooms are unchanged until you add it.
+  - Needs 0.38 or newer. An older CLI is found, left alone and offered an update (`chatroom.geminiPath` sets the path).
+  - Since June 18, 2026, Google no longer serves the Gemini CLI to free, Google One, AI Pro and AI Ultra logins; it works with a paid API key or a Code Assist Standard or Enterprise license. When Google refuses a login, the agent's card says so and the other agents continue.
+  - Verified against the real CLI 0.66.0 with a scripted model (`scripts/test-gemini.ts`): turns, file edits through approval cards, Plan, stop, resume, room tools over real MCP and turning things off. Not verified with a real Google account.
+- **Delete chats.** The room title now opens a list with a small trash icon beside each chat. A chat with messages asks first; an empty one goes at once. Deleting stops its CLIs and removes its worktrees, keeping unapplied work on a branch. Deleting the last chat leaves a fresh one.
+- **Longer lists open.** **+N more** in the Tools tab is now a button that shows the rest of a list and **Show fewer** closes it, for tools, skills, MCP servers, commands and shared skills. The MCP list used to stop at 24 with no hint of the rest.
+- **Turn things off.** Click a tool, skill, MCP server or command in the Tools tab to turn it off for that agent, from its next turn; tools a CLI doesn't list can be turned off by name. Each CLI's own switches do the work, and the real Claude Code, Codex, Copilot and Gemini CLIs were checked to honour them. Nothing is written to your CLI settings files. Copilot has no switch for one skill, so its skills show none.
+- **Codex tools are listed.** Its MCP tools now appear under Tools, as `server.tool`. The empty list no longer says "Listed after the first turn" for CLIs that never list theirs.
+
 ## 0.7.0
 
 - **Sandbox (optional, on by default; every run asks you first).** Agents (the `sandbox_run` room tool) and you (`/sandbox`, or **Run in sandbox** on bash, Python and JavaScript code blocks) can run code, tests or security checks in a throwaway Docker container.

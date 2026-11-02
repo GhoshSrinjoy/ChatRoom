@@ -4,6 +4,7 @@ import { JsonlProcess, spawnJsonl } from './jsonl';
 import { childEnv } from './process';
 import { claudeEditorBlocks } from './editor-context';
 import { filterNativeCommands } from './commands';
+import { disabledNames } from './core';
 import { ROOM_TOOL_NAMES } from './tool-specs';
 import {
   ActivityItem, Agent, AgentCapabilities, ApprovalKind, ApprovalRequest, DriverHost, DriverSettings, ModelInfo, NativeCommand, NativeDriver,
@@ -31,6 +32,14 @@ const sessionRules = (request: any): any[] => (Array.isArray(request?.permission
 const permissionOf = (agent: Agent, settings: DriverSettings): PermissionLevel =>
   agent.options.permission === 'full' && !settings.allowFullAccess ? 'ask' : agent.options.permission;
 
+/** Permission rules for what is turned off: tools by name, whole servers by their tool prefix, and skills. A comma or parenthesis in a name cannot be written in a rule. */
+export function disallowedTools(agent: Agent): string[] {
+  const writable = (name: string) => !/[,()]/.test(name);
+  return [...new Set([...(agent.options.webSearch === false ? ['WebSearch', 'WebFetch'] : []), ...disabledNames(agent, 'tools').filter(writable),
+    ...disabledNames(agent, 'mcpServers').filter(writable).map(name => `mcp__${name.replace(/[^A-Za-z0-9_-]/g, '_')}`),
+    ...disabledNames(agent, 'skills').filter(writable).map(name => `Skill(skill:${name})`)])];
+}
+
 export function claudeArgs(agent: Agent, room: Room, model: ModelInfo | undefined, session: { id: string; resume: boolean }, wiring: SkillWiring | undefined, settings: DriverSettings, storageDir: string): string[] {
   void storageDir;
   const o = agent.options, permission = permissionOf(agent, settings);
@@ -50,7 +59,11 @@ export function claudeArgs(agent: Agent, room: Room, model: ModelInfo | undefine
   if (o.useMcp === false) args.push('--strict-mcp-config');
   if (o.useProjectSettings === false) args.push('--setting-sources', 'user');
   if (o.useSkills === false) args.push('--disable-slash-commands');
-  if (o.webSearch === false) args.push('--disallowedTools', 'WebSearch,WebFetch');
+  const denied = disallowedTools(agent);
+  if (denied.length) args.push('--disallowedTools', denied.join(','));
+  // The rule refuses a skill under any of its names; this also hides it from the model, for this process only.
+  const skillsOff = disabledNames(agent, 'skills');
+  if (skillsOff.length) args.push('--settings', JSON.stringify({ skillOverrides: Object.fromEntries(skillsOff.map(name => [name, 'off'])) }));
   if (o.customAgent) args.push('--agent', o.customAgent);
   return args;
 }
@@ -59,7 +72,7 @@ function spawnKey(agent: Agent, room: Room, wiring: SkillWiring | undefined, set
   const o = agent.options;
   return JSON.stringify({ cwd, full: permissionOf(agent, settings) === 'full', thinking: o.thinking, plugin: room.shareSkills ? wiring?.claudePluginDir : undefined,
     indexDir: room.shareSkills ? wiring?.indexDir : undefined, extraDirs: o.extraDirs, mcp: settings.sharedMcpServers ?? {}, useMcp: o.useMcp,
-    useProjectSettings: o.useProjectSettings, useSkills: o.useSkills, webSearch: o.webSearch, customAgent: o.customAgent });
+    useProjectSettings: o.useProjectSettings, useSkills: o.useSkills, webSearch: o.webSearch, customAgent: o.customAgent, denied: disallowedTools(agent), skillsOff: disabledNames(agent, 'skills') });
 }
 const num = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : 0;
 export function claudeUsage(u: any): Usage {
@@ -623,6 +636,7 @@ export class ClaudeDriver implements NativeDriver {
       agents: (Array.isArray(init.agents) ? init.agents : []).map((a: any) => a?.name).filter((a: unknown): a is string => typeof a === 'string'),
       supports: { thinking: true, summary: false, sandbox: false, webSearch: true, useMcp: true, useSkills: true, useProjectSettings: true, extraDirs: true,
         ultraSession: ultra, ultraTurn: ultra, thinkHard: true, fullAccess: true, customAgent: true },
+      canDisable: { tools: true, toolsByName: true, skills: true, mcpServers: true, commands: true },
       ...(agent.session?.context ? { context: agent.session.context } : {}),
       updatedAt: Date.now(),
     };

@@ -1,8 +1,8 @@
 {
   "name": "chatroom",
   "displayName": "Chatroom",
-  "description": "One room where Claude Code, Codex and the GitHub Copilot CLI work together with their own tools, skills and sessions, plus Ollama. Agents discuss, hand off with @mentions and work as a team.",
-  "version": "0.7.0",
+  "description": "One room where Claude Code, Codex, the GitHub Copilot CLI and the Gemini CLI work together with their own tools, skills and sessions, plus Ollama. Agents discuss, hand off with @mentions and work as a team.",
+  "version": "0.8.0",
   "publisher": "chatroom-local",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/GhoshSrinjoy/ChatRoom.git" },
@@ -10,7 +10,7 @@
   "bugs": { "url": "https://github.com/GhoshSrinjoy/ChatRoom/issues" },
   "engines": { "vscode": "^1.106.0" },
   "categories": ["AI", "Other"],
-  "keywords": ["agents", "codex", "claude", "claude-code", "copilot", "copilot-cli", "ollama", "mcp", "multi-agent"],
+  "keywords": ["agents", "codex", "claude", "claude-code", "copilot", "copilot-cli", "gemini", "gemini-cli", "ollama", "mcp", "multi-agent"],
   "main": "./dist/extension.js",
   "icon": "media/icon.png",
   "activationEvents": ["onStartupFinished", "onView:chatroom.chat", "onView:chatroom.sidebar"],
@@ -22,7 +22,8 @@
       { "command": "chatroom.new", "title": "Chatroom: New Room", "icon": "$(add)" },
       { "command": "chatroom.refresh", "title": "Chatroom: Refresh Connections", "icon": "$(refresh)" },
       { "command": "chatroom.export", "title": "Chatroom: Export Conversation" },
-      { "command": "chatroom.copilotLogin", "title": "Chatroom: Sign in to Copilot CLI" }
+      { "command": "chatroom.copilotLogin", "title": "Chatroom: Sign in to Copilot CLI" },
+      { "command": "chatroom.geminiLogin", "title": "Chatroom: Sign in to Gemini CLI" }
     ],
     "viewsContainers": { "secondarySidebar": [{ "id": "chatroom-secondary", "title": "Chatroom", "icon": "media/chatroom.svg" }] },
     "views": { "chatroom-secondary": [{ "type": "webview", "id": "chatroom.chat", "name": "Chatroom" }] },
@@ -36,10 +37,11 @@
         "chatroom.codexPath": { "type": "string", "default": "codex", "scope": "machine", "description": "Codex executable or CLI JavaScript file. Default prefers the installed Codex extension runtime, then PATH. Uses your existing login." },
         "chatroom.claudePath": { "type": "string", "default": "claude", "scope": "machine", "description": "Claude executable or CLI JavaScript file. Default prefers the installed Claude Code extension runtime, then PATH. Uses your existing login." },
         "chatroom.copilotPath": { "type": "string", "default": "copilot", "scope": "machine", "description": "Copilot CLI executable. The default looks on PATH (npm or WinGet install)." },
-        "chatroom.modelDefaults": { "type": "object", "default": { "planning": {}, "drafting": {}, "review": {} }, "description": "Model IDs by task preset and provider (codex, claude, copilot, ollama). Configure with Chatroom's Settings button. Empty values choose from the discovered client catalog; drafting prefers a small model when available.", "additionalProperties": false, "properties": {
-          "planning": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } },
-          "drafting": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } },
-          "review": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "ollama": { "type": "string" } } }
+        "chatroom.geminiPath": { "type": "string", "default": "gemini", "scope": "machine", "description": "Gemini CLI executable. The default looks on PATH (npm install). Needs version 0.38 or newer. Uses your existing login or GEMINI_API_KEY." },
+        "chatroom.modelDefaults": { "type": "object", "default": { "planning": {}, "drafting": {}, "review": {} }, "description": "Model IDs by task preset and provider (codex, claude, copilot, gemini, ollama). Configure with Chatroom's Settings button. Empty values choose from the discovered client catalog; drafting prefers a small model when available.", "additionalProperties": false, "properties": {
+          "planning": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "gemini": { "type": "string" }, "ollama": { "type": "string" } } },
+          "drafting": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "gemini": { "type": "string" }, "ollama": { "type": "string" } } },
+          "review": { "type": "object", "additionalProperties": false, "properties": { "codex": { "type": "string" }, "claude": { "type": "string" }, "copilot": { "type": "string" }, "gemini": { "type": "string" }, "ollama": { "type": "string" } } }
         } },
         "chatroom.defaultPreset": { "type": "string", "enum": ["planning", "drafting", "review"], "default": "planning", "description": "Task preset for new rooms. Planning also covers orchestration. Switching a room's preset applies its models to all agents." },
         "chatroom.executionMode": { "type": "string", "enum": ["orchestrated", "sequential", "parallel", "pipeline"], "enumDescriptions": ["Team: the lead answers or brings in teammates with @mentions or a step plan; independent steps run in parallel and the lead writes the final answer.", "Relay: agents reply one after another, each building on the replies before it.", "Parallel: agents answer independently with the same context; the next round sees all replies.", "Your own team: the stages you set up, in order."], "default": "orchestrated", "description": "How agents collaborate in new rooms. @mentioning agents in a message always sends it to just those agents." },
@@ -74,7 +76,7 @@
         "chatroom.allowFullAccess": { "type": "boolean", "scope": "machine", "default": false, "description": "Allow choosing Full access (no approvals) for agents. User settings only: a workspace cannot set it." },
         "chatroom.approvalTimeoutSeconds": { "type": "number", "default": 300, "minimum": 30, "maximum": 3600, "description": "Unanswered approval requests are denied after this time." },
         "chatroom.attachOpenFile": { "type": "boolean", "default": true, "description": "Share the file open in the editor (and your selection) with agents. You can turn it off per room with the eye button." },
-        "chatroom.shareSkills": { "type": "boolean", "default": true, "description": "Share skills between Claude Code, Codex and Copilot in new rooms." },
+        "chatroom.shareSkills": { "type": "boolean", "default": true, "description": "Share skills between Claude Code, Codex, Copilot and Gemini in new rooms." },
         "chatroom.sharedMcpServers": { "type": "object", "scope": "machine", "default": {}, "additionalProperties": { "type": "object" }, "description": "MCP servers given to every native agent, in Claude's `.mcp.json` format: `{\"name\":{\"command\":\"…\",\"args\":[]}}` or `{\"name\":{\"type\":\"http\",\"url\":\"…\"}}`. User settings only: a workspace cannot add servers. Names starting with `chatroom` are reserved." },
         "chatroom.maxHandoffs": { "type": "integer", "default": 6, "minimum": 0, "maximum": 20, "description": "Maximum agent-to-agent @mention hand-offs per message." },
         "chatroom.idleSessionMinutes": { "type": "number", "default": 20, "minimum": 1, "maximum": 240, "description": "Stop an agent's CLI process after this much idle time. Its session resumes on the next turn." },
@@ -90,7 +92,7 @@
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.7.0.vsix",
+    "package": "npm run check && npm run build && vsce package --no-dependencies --allow-missing-repository --out artifacts/chatroom-0.8.0.vsix",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {

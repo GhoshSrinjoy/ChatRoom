@@ -1,15 +1,16 @@
 import * as vscode from 'vscode';
 import { Agent, AgentCapabilities, Connection, DriverHost, NativeDriver, NativeProviderId, Provider, ProviderRequest, ProviderResult, Runtime, ToolCall, emptyUsage } from './types';
 import { OllamaClient } from './ollama';
-import { findRuntime, codexModels, claudeModels } from './catalog';
+import { GEMINI_MIN_VERSION, findRuntime, codexModels, claudeModels } from './catalog';
 import { toolSpecs } from './tool-specs';
 import { ClaudeDriver } from './claude-native';
 import { CodexDriver } from './codex-native';
 import { CopilotDriver } from './copilot-native';
+import { GeminiDriver } from './gemini-native';
 
-const EXTENSIONS: Record<NativeProviderId, string | undefined> = { codex: 'openai.chatgpt', claude: 'anthropic.claude-code', copilot: undefined };
+const EXTENSIONS: Record<NativeProviderId, string | undefined> = { codex: 'openai.chatgpt', claude: 'anthropic.claude-code', copilot: undefined, gemini: undefined };
 const runtimes = new Map<string, { expires: number; promise: Promise<Runtime | undefined> }>();
-/** Settings `chatroom.{codex,claude,copilot}Path`, cached for 3 minutes. */
+/** Settings `chatroom.{codex,claude,copilot,gemini}Path`, cached for 3 minutes. */
 export function providerRuntime(id: NativeProviderId): Promise<Runtime | undefined> {
   const configured = vscode.workspace.getConfiguration('chatroom').get<string>(`${id}Path`, id);
   const extension = EXTENSIONS[id], extensionPath = extension ? vscode.extensions.getExtension(extension)?.extensionPath : undefined;
@@ -17,9 +18,9 @@ export function providerRuntime(id: NativeProviderId): Promise<Runtime | undefin
   if (existing && existing.expires > Date.now()) return existing.promise;
   const promise = findRuntime(id, configured, extensionPath); runtimes.set(key, { promise, expires: Date.now() + 180000 }); return promise;
 }
-export interface Drivers { claude: ClaudeDriver; codex: CodexDriver; copilot: CopilotDriver }
+export interface Drivers { claude: ClaudeDriver; codex: CodexDriver; copilot: CopilotDriver; gemini: GeminiDriver }
 export function createDrivers(host: DriverHost): Drivers {
-  return { claude: new ClaudeDriver(host), codex: new CodexDriver(host), copilot: new CopilotDriver(host) };
+  return { claude: new ClaudeDriver(host), codex: new CodexDriver(host), copilot: new CopilotDriver(host), gemini: new GeminiDriver(host) };
 }
 export function createLegacyProviders(ollama: OllamaClient, connected?: (models: vscode.LanguageModelChat[]) => void): { copilot: Provider; ollama: Provider } {
   return { copilot: new CopilotProvider(connected), ollama };
@@ -28,6 +29,7 @@ export function createLegacyProviders(ollama: OllamaClient, connected?: (models:
 export function nativeDriverFor(agent: Agent, drivers: Drivers, connections: Connection[]): NativeDriver | undefined {
   if (agent.provider === 'claude') return drivers.claude;
   if (agent.provider === 'codex') return drivers.codex;
+  if (agent.provider === 'gemini') return drivers.gemini;
   if (agent.provider !== 'copilot') return undefined;
   const choice = agent.options?.copilotRuntime ?? 'auto';
   if (choice === 'vscode-lm') return undefined;
@@ -91,8 +93,17 @@ async function copilotConnection(includeCopilot: boolean, previous: Connection[]
   return { id: 'copilot', status: models.length ? 'ready' : 'missing', runtime: 'vscode-lm', detail: models.length ? `${models.length} models available through VS Code` : 'Sign in to GitHub Copilot in VS Code',
     models: models.map(m => ({ id: m.id, name: m.name })), modelSource: 'VS Code Copilot catalog', hint: INSTALL_HINT };
 }
+/** Found but too old counts as missing: it cannot run, and the hint updates it. */
+async function geminiConnection(): Promise<Connection> {
+  const runtime = await providerRuntime('gemini');
+  if (!runtime) return { id: 'gemini', status: 'missing', runtime: 'cli', detail: 'Gemini CLI not found', models: [], hint: { text: 'Install the Gemini CLI to add it to the room: npm i -g @google/gemini-cli', action: 'installGemini' } };
+  const executable = runtime.executable.prefix[0] ?? runtime.executable.command;
+  if (!runtime.modern) return { id: 'gemini', status: 'missing', runtime: 'cli', detail: `Gemini CLI ${runtime.version} is too old: Chatroom needs ${GEMINI_MIN_VERSION} or newer`, models: [], executable, version: runtime.version,
+    hint: { text: 'Update it: npm i -g @google/gemini-cli@latest', action: 'updateGemini' } };
+  return { id: 'gemini', status: 'ready', runtime: 'cli', detail: `Gemini CLI ${runtime.version} · sign-in is checked when an agent connects`, models: [], modelSource: 'Gemini CLI (models load when the agent connects)', executable, version: runtime.version };
+}
 export async function detectConnections(ollama: OllamaClient, includeCopilot: boolean, previous: Connection[]): Promise<Connection[]> {
-  return Promise.all((['codex', 'claude', 'copilot', 'ollama'] as const).map(async id => {
+  return Promise.all((['codex', 'claude', 'copilot', 'gemini', 'ollama'] as const).map(async id => {
     try {
       if (id === 'codex' || id === 'claude') {
         const runtime = await providerRuntime(id);
@@ -104,6 +115,7 @@ export async function detectConnections(ollama: OllamaClient, includeCopilot: bo
         const models = await ollama.models();
         return { id, status: 'ready', runtime: 'http', detail: `${models.length} installed models · loopback endpoint`, models, modelSource: 'Ollama installed models' } as Connection;
       }
+      if (id === 'gemini') return await geminiConnection();
       return await copilotConnection(includeCopilot, previous);
     } catch (error) { return { id, status: 'error', detail: error instanceof Error ? error.message : String(error), models: [] } as Connection; }
   }));

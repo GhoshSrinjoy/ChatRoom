@@ -2,13 +2,13 @@
 
 [![Latest release](https://img.shields.io/github/v/release/GhoshSrinjoy/ChatRoom?label=release)](https://github.com/GhoshSrinjoy/ChatRoom/releases/latest) [![Release build](https://github.com/GhoshSrinjoy/ChatRoom/actions/workflows/release.yml/badge.svg)](https://github.com/GhoshSrinjoy/ChatRoom/actions/workflows/release.yml) [![License: Apache 2.0](https://img.shields.io/github/license/GhoshSrinjoy/ChatRoom)](LICENSE)
 
-A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs work in one chat room with you, plus local Ollama models. Each agent is the CLI itself, with its own tools, skills, slash commands, MCP servers, sessions, effort levels and permission modes. The agents see each other's messages, hand work to each other with `@mentions`, and can work as a team under a lead. Attach PDFs, Word files or images, and every agent can read and search them using local OCR and embeddings.
+A VS Code extension where the real Claude Code, Codex, GitHub Copilot and Gemini CLIs work in one chat room with you, plus local Ollama models. Each agent is the CLI itself, with its own tools, skills, slash commands, MCP servers, sessions, effort levels and permission modes. The agents see each other's messages, hand work to each other with `@mentions`, and can work as a team under a lead. Attach PDFs, Word files or images, and every agent can read and search them using local OCR and embeddings.
 
 <p align="center"><img src="docs/images/lead-team.png" width="860" alt="Team mode: the lead's plan, with two steps in parallel and a third that builds on both"><br><em>Team mode. Claude leads: Codex and Copilot take two steps in parallel, Claude checks both against the code, then writes the final answer.</em></p>
 
 ## Features
 
-- **The CLIs themselves.** Claude Code runs as `claude` in stream-json mode, Codex as one `codex app-server` per window, and Copilot as `copilot --acp` (when the Copilot CLI is installed). Each keeps its own tools, skills, `CLAUDE.md`/`AGENTS.md`, hooks, MCP servers and native session, and resumes that session after a reload.
+- **The CLIs themselves.** Claude Code runs as `claude` in stream-json mode, Codex as one `codex app-server` per window, Copilot as `copilot --acp` (when the Copilot CLI is installed), and the [Gemini CLI](#gemini-cli) as `gemini --acp`. Each keeps its own tools, skills, `CLAUDE.md`/`AGENTS.md`, hooks, MCP servers and native session, and resumes that session after a reload.
 - **One room, shared context.** Every message reaches every agent once. An agent's own replies are already in its session, so each turn sends only what is new. A new or lost session gets a bounded copy of the room history.
 - **Teamwork.** A line that starts with `@Name` hands the next turn to that agent. In **Team** mode a lead answers or brings in teammates (with mention lines or a step plan), independent steps run in parallel, and the lead writes the final answer. **Relay** and **Parallel** modes and `@Agent` messages are there too.
 - **Your own team.** Set up stages that run in order, such as **Leads → Drafting → Review → Testing → Coding**, with one or more agents per stage, an optional task and model routing. Use the team builder, the `chatroom.teams` setting or `/team`.
@@ -19,8 +19,9 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
 - **Composer like Claude Code.** `@` to mention, `/` for room commands and each agent's own slash commands, chips for team mode, loops, permissions and effort, ✦ to think harder and ⚡ Ultra for one message, and a context ring per agent.
 - **Loops.** Repeat for N rounds, until everyone agrees, until the lead says done, or every few minutes. Iteration, time and token caps always apply.
 - **Open file and selection.** The file you have open and your selection go with your message in each CLI's native format. Turn it off per room with the eye button.
-- **Shared skills and room tools.** Skills from Claude Code, Codex and Copilot are shared with the other CLIs. Every native agent gets four room tools (document search, document reading with OCR, semantic search and OCR) through MCP or Codex dynamic tools.
+- **Shared skills and room tools.** Skills from Claude Code, Codex, Copilot and Gemini are shared with the other CLIs. Every native agent gets four room tools (document search, document reading with OCR, semantic search and OCR) through MCP or Codex dynamic tools.
 - **Documents.** PDFs (text layer, plus OCR for scanned pages), images, Word and text files are read automatically, split into passages and embedded locally. The relevant passages go to every agent with each message.
+- **Turn off what you don't want.** In the **Tools** tab, click any tool, skill, MCP server or command of an agent to [turn it off](#turning-tools-off) for that agent, and **+N more** opens the rest of a long list.
 - **Your accounts, your machine.** Chatroom uses the CLIs you are already signed in to. It has no API-key form, no backend and no telemetry.
 
 
@@ -31,6 +32,7 @@ A VS Code extension where the real Claude Code, Codex and GitHub Copilot CLIs wo
   - **Claude Code**: the Claude Code extension or CLI.
   - **Codex**: the Codex extension or CLI.
   - **GitHub Copilot CLI** (recommended for Copilot): `npm i -g @github/copilot`, then `copilot login` (or run **Chatroom: Sign in to Copilot CLI**). Without it, Copilot runs through VS Code's chat models as a chat-only agent.
+  - **Gemini CLI**: `npm i -g @google/gemini-cli@latest` (0.38 or newer). Google no longer serves it to personal logins; see [Gemini CLI](#gemini-cli).
   - **Ollama**: local models.
 - For documents (optional): [Ollama](https://ollama.com) with a vision/OCR model and an embedding model, for example `ollama pull glm-ocr` and `ollama pull embeddinggemma`.
 - For the [sandbox](#sandbox-optional) (optional): Docker Desktop (Windows, macOS) or Docker Engine (Linux).
@@ -61,11 +63,13 @@ npm run package
 ## Getting started
 
 1. Open a local folder you trust and run **Chatroom: Open Room**. It opens in the right Secondary Side Bar.
-2. Chatroom finds the installed CLIs. The team strip above the conversation shows one pill per agent; click a pill for its model, effort, permission, session and tools. **+** adds agents, including several models from the same CLI.
+2. Chatroom finds the installed CLIs. The team strip above the conversation shows one pill per agent; click a pill for its model, effort, permission, session and tools. **+** adds agents, including several models from the same CLI and the Gemini CLI (new rooms start with Codex, Claude and Copilot).
 3. Type a message. It goes to the room in its current mode (the **Team** chip). Start it with `@Claude` (or `@Codex @Copilot`) to send it to just those agents.
 4. Type `/` for commands: Chatroom's own (`/loop`, `/mode`, `/clear`, `/compact`, `/status`…) and each agent's native commands and skills (`@Claude /review`, `@Codex /goal …`).
 5. When an agent in **Ask** wants to edit a file or run a command, an approval card appears in the room. **Allow**, **Allow for session** or **Deny**.
 6. **Stop** (the send button while agents work) interrupts every agent; turn a pill off to stop only that agent.
+
+The room title opens your chats: click one to switch to it, or the trash icon beside it to delete it. A chat with messages asks first, because deleting can't be undone; an empty one goes at once. Deleting removes the chat from Chatroom and stops its CLIs. Worktree changes you haven't applied are kept on a `chatroom/orphaned/…` branch. Each CLI keeps its own session files, and documents stay in the local cache other chats share.
 
 The grid button beside the room title opens **Usage**, **Tools** and **Activity**. **Chatroom: Open in Editor** opens the room in an editor tab beside your current one.
 
@@ -134,12 +138,12 @@ Chatroom shows why an agent can't run and continues with the others:
 
 ## Permissions, approvals and safety
 
-| Level | Claude Code | Codex | Copilot CLI |
-| --- | --- | --- | --- |
-| Plan | `plan` permission mode | read-only sandbox, plan collaboration mode | `#plan` mode; edits and commands are rejected |
-| Ask (default) | `default` mode, approvals in the room | `on-request` approvals, read-only sandbox | every permission request becomes a card |
-| Auto-edit | `acceptEdits` | `on-request`, workspace-write sandbox | reads and edits inside the workspace and extra folders allowed; network and the rest ask |
-| Full access | `bypassPermissions` | no approvals, full access | allow all |
+| Level | Claude Code | Codex | Copilot CLI | Gemini CLI |
+| --- | --- | --- | --- | --- |
+| Plan | `plan` permission mode | read-only sandbox, plan collaboration mode | `#plan` mode; edits and commands are rejected | `plan` mode; edits and commands are rejected |
+| Ask (default) | `default` mode, approvals in the room | `on-request` approvals, read-only sandbox | every permission request becomes a card | `default` mode; every permission request becomes a card |
+| Auto-edit | `acceptEdits` | `on-request`, workspace-write sandbox | reads and edits inside the workspace and extra folders allowed; network and the rest ask | `autoEdit` mode; reads and edits inside the workspace and extra folders allowed; network and the rest ask |
+| Full access | `bypassPermissions` | no approvals, full access | allow all | `yolo` mode |
 
 <p align="center"><img src="docs/images/approvals.png" width="340" alt="Approval cards for a command and a file edit, with Allow, Allow for session and Deny"><br><em>In Ask, every edit and command is a card in the room: the exact command or diff, <b>Allow</b>, <b>Allow for session</b> or <b>Deny</b>, and the time left before it is denied.</em></p>
 
@@ -171,6 +175,7 @@ Where an agent's own commands run depends on its CLI. For runs you want isolated
 | Codex | Inside **Codex's own sandbox** | Plan: read-only. Ask: read-only sandbox; anything more asks you. Auto-edit: writes inside the workspace (and extra folders), no network. Full access: no sandbox |
 | Claude Code | On your machine as you | Plan: read-only. Ask: a card for every edit and command. Auto-edit: edits allowed, commands still ask. Full access: nothing asks |
 | Copilot CLI | On your machine as you (its own sandbox is experimental and off on Windows) | Plan: read-only. Ask: a card for every request. Auto-edit: reads and edits inside the workspace allowed, the rest asks. Full access: nothing asks |
+| Gemini CLI | On your machine as you | Plan: read-only. Ask: a card for every request; the CLI itself runs read-only commands such as `echo` without one. Auto-edit: reads and edits inside the workspace allowed, the rest asks. Full access: nothing asks |
 
 For code you don't trust, keep agents in Plan or Ask and have them use the sandbox's Security profile, or open the folder in a dev container or WSL so every CLI runs inside it.
 
@@ -256,6 +261,30 @@ The sandbox runs a command or a script in a **throwaway Docker container**, for 
 
 **Costs:** Docker Desktop's VM memory while it runs, about 50–150 MB per image on first use, the time to copy large folders (capped by `chatroom.sandbox.maxCopyMb`), and about a second to start each run.
 
+## Gemini CLI
+
+Chatroom runs the Gemini CLI as `gemini --acp`, with its own tools, skills, MCP servers and sessions. Add it with **+** in the team strip.
+
+- **Version:** 0.38 or newer. An older one is found and left alone: the agent says it needs an update and offers **Update Gemini CLI**, which runs `npm i -g @google/gemini-cli@latest` in a terminal.
+- **Sign-in:** it uses the login of your `gemini` command, or `GEMINI_API_KEY`. Since June 18, 2026, [Google no longer serves the Gemini CLI to free, Google One, AI Pro and AI Ultra logins](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/). It keeps working with a paid Gemini API key or a Gemini Code Assist Standard or Enterprise license. When Google refuses a login, the agent's card and the room say what it answered, and the other agents continue.
+- **Trust:** Chatroom runs only in folders you trust in VS Code, so it tells the CLI this folder is trusted, for that process only.
+- **Different from the other CLIs:** it doesn't list its tools, so you [turn one off by name](#turning-tools-off). It has no `/compact` here; it compresses its own session when it fills up. It has no effort levels, think harder or Ultra, and project settings (`GEMINI.md`) can't be turned off per agent.
+- **Your files:** what Chatroom needs from the CLI goes in a small policy file in the extension's storage. Nothing is written to `~/.gemini`.
+
+## Turning tools off
+
+The **Tools** tab lists what each agent has. Click an item to turn it off for that agent; click it again to turn it back on. **+N more** opens the rest of a long list. A change applies from the agent's next turn: its CLI restarts if it has to, and its session continues. Turned-off items are saved with the agent in that room, and a new room starts with everything on. Nothing is written to your CLI settings files.
+
+| Item | Claude Code | Codex | Copilot CLI | Gemini CLI |
+| --- | --- | --- | --- | --- |
+| Tool | Removed from the model's tools (`--disallowedTools`) | MCP tools only (`disabled_tools`) | Removed from the model's tools (`--excluded-tools`) | Denied and removed (policy rule) |
+| Skill | Hidden and refused (`skillOverrides`, deny rule) | Removed (`skills.config`) | No switch for one skill, so the list shows none | Refused when called (policy rule) |
+| MCP server | All its tools removed | Turned off in the thread's config | Turned off (`--disable-mcp-server`) | All its tools denied and removed |
+| Command | Chatroom stops offering and forwarding it | Same | Same | Same |
+
+- **Listing tools:** Claude Code reports its tools after the first turn. Codex reports only MCP tools, so those are the ones listed here. Copilot and Gemini don't report theirs, so you can type a tool's name under **Tools** (for example `web_fetch`).
+- **Commands and skills:** turning a skill off also takes the slash command of the same name out of the `/` menu. A command that is off is refused with a message saying where to turn it back on.
+
 ## Commands
 
 | Command | What it does |
@@ -278,7 +307,7 @@ Native commands go to the agent that has them: `@Claude /review`, `@Codex /goal 
 
 The **Settings** button opens **Models and defaults** for the Planning, Drafting and Review presets (`chatroom.modelDefaults`). Each agent's settings choose its model, reasoning effort, Claude thinking, Codex reasoning summary and sandbox, web search, MCP, skills, project settings, extra folders and Ultra. ✦ (think harder) raises effort for one message: `ultrathink` for Claude, one effort level higher for Codex and Copilot. ⚡ Ultra lets each agent orchestrate its own sub-agents for one message (Claude `ultracode`, Codex Ultra effort, Copilot fleet) and can use many times more tokens.
 
-Native sessions persist with the room. **Copy resume command** in an agent's settings gives `claude --resume …`, `codex resume …` or `copilot --resume …` to continue the same session in a terminal. CLI processes stop after `chatroom.idleSessionMinutes` (default 20) of idle time, when you switch rooms, and when VS Code closes; their sessions resume on the next turn.
+Native sessions persist with the room. **Copy resume command** in an agent's settings gives `claude --resume …`, `codex resume …`, `copilot --resume …` or `gemini --resume …` to continue the same session in a terminal. CLI processes stop after `chatroom.idleSessionMinutes` (default 20) of idle time, when you switch rooms, and when VS Code closes; their sessions resume on the next turn.
 
 ## Documents, OCR and embeddings
 
@@ -297,7 +326,7 @@ Chatroom selects installed local models automatically, preferring a vision model
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `chatroom.claudePath`, `chatroom.codexPath`, `chatroom.copilotPath` | `claude`, `codex`, `copilot` | CLI executables. Claude and Codex prefer the runtimes bundled with their VS Code extensions |
+| `chatroom.claudePath`, `chatroom.codexPath`, `chatroom.copilotPath`, `chatroom.geminiPath` | `claude`, `codex`, `copilot`, `gemini` | CLI executables. Claude and Codex prefer the runtimes bundled with their VS Code extensions |
 | `chatroom.defaultPermission` | `ask` | Permission level for new agents (user settings only) |
 | `chatroom.allowFullAccess` | `false` | Allow Full access (no approvals) (user settings only) |
 | `chatroom.approvalTimeoutSeconds` | `300` | Unanswered approvals are denied after this time |
@@ -321,7 +350,7 @@ Chatroom selects installed local models automatically, preferring a vision model
 ## Usage and caching
 
 - **Token limit per message** (Usage tab) is an optional safety stop, off by default. It counts new tokens (input minus cached re-reads, plus output) from the moment you send a message or press **Resume**. Loops have their own token cap.
-- Usage comes from each CLI: Claude reports tokens and cost, Codex reports token totals per turn and rate-limit windows, Copilot reports usage when its CLI provides it. Missing figures are estimated and marked `~`. Cost is a client-reported estimate, not a bill.
+- Usage comes from each CLI: Claude reports tokens and cost, Codex reports token totals per turn and rate-limit windows, Copilot reports usage when its CLI provides it, Gemini reports tokens per turn. Missing figures are estimated and marked `~`. Cost is a client-reported estimate, not a bill.
 - Native sessions keep their own history, so Chatroom sends each agent only the messages it has not seen. The context ring and `/status` show how full each session is; `/compact` frees space.
 - Conversations, including native session ids, are stored in VS Code's local workspace state. Provider requests go to each client's own service.
 
@@ -386,9 +415,12 @@ node scripts/test-sidebar.mjs
 node --import tsx scripts/test-local.ts
 node --import tsx scripts/test-documents.ts path\to\scan.jpg
 
+# The Gemini driver against a real Gemini CLI with a scripted model: no account, no tokens, nothing in ~/.gemini is read or changed.
+node --import tsx scripts/test-gemini.ts path\to\gemini-cli\bundle\gemini.js
+
 # Optional live runs with your own logins (they use real tokens).
 node --import tsx scripts/test-team.ts path\to\scan.jpg medgemma:4b
-node --import tsx scripts/test-clients.ts [claude|codex|copilot]
+node --import tsx scripts/test-clients.ts [claude|codex|copilot|gemini]
 ```
 
 ## Architecture
@@ -396,7 +428,7 @@ node --import tsx scripts/test-clients.ts [claude|codex|copilot]
 - `src/extension.ts`: VS Code host, validated webview messages, room commands, migration, the driver host, capabilities, skills and editor wiring.
 - `src/engine.ts`: passes, hand-offs, Team plans, loops and caps, approvals, inactivity timeouts, one writer at a time, and the legacy tool loop.
 - `src/core.ts`: room framing, delta delivery (what each agent has not seen), asks, plan parsing, migration.
-- `src/claude-native.ts`, `src/codex-native.ts`, `src/copilot-native.ts`: the Claude stream-json, Codex app-server and Copilot ACP drivers; `src/jsonl.ts`: JSON-lines processes and JSON-RPC.
+- `src/claude-native.ts`, `src/codex-native.ts`, `src/copilot-native.ts`, `src/gemini-native.ts`: the Claude stream-json, Codex app-server, Copilot ACP and Gemini ACP drivers; `src/jsonl.ts`: JSON-lines processes and JSON-RPC.
 - `src/commands.ts`: composer parsing, mentions, hand-offs, `/loop`.
 - `src/room-tools.ts`, `src/tools.ts`, `src/tool-specs.ts`: room tools over MCP (in-process and loopback HTTP) and the legacy read-only tools.
 - `src/skills.ts`: skill discovery and sharing; `src/editor-context.ts`, `src/editor-tracker.ts`: the open file and selection.
@@ -409,6 +441,7 @@ node --import tsx scripts/test-clients.ts [claude|codex|copilot]
 - [Claude Code headless and stream-json](https://code.claude.com/docs/en/headless)
 - [Codex app-server](https://github.com/openai/codex)
 - [GitHub Copilot CLI](https://github.com/github/copilot-cli) and the [Agent Client Protocol](https://agentclientprotocol.com)
+- [Gemini CLI ACP mode](https://geminicli.com/docs/cli/acp-mode/) and [policy engine](https://geminicli.com/docs/reference/policy-engine)
 - [VS Code Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model)
 - [Ollama chat API](https://docs.ollama.com/api/chat) and [embeddings API](https://docs.ollama.com/api/embed)
 

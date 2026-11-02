@@ -7,6 +7,7 @@ import { childEnv } from './process';
 import { acpEditorBlocks } from './editor-context';
 import { bumpEffort } from './codex-native';
 import { filterNativeCommands } from './commands';
+import { disabledNames } from './core';
 
 const INIT_MS = 20_000, SESSION_MS = 60_000, OPTION_MS = 10_000, PROMPT_MS = 12 * 3_600_000, STOP_MS = 5_000, COMMANDS_WAIT_MS = 2_000;
 const MISSING = 'The GitHub Copilot CLI was not found. Install it to give Copilot its own tools, skills and sessions: npm i -g @github/copilot';
@@ -42,6 +43,8 @@ export function copilotArgs(agent: Agent, wiring: SkillWiring | undefined, setti
     ...(options.extraDirs ?? []).flatMap(path => dir(path)),
     ...(options.useProjectSettings === false ? ['--no-custom-instructions'] : []),
     ...(options.useMcp === false ? ['--disable-builtin-mcps'] : []),
+    ...disabledNames(agent, 'tools').map(name => `--excluded-tools=${name}`),
+    ...disabledNames(agent, 'mcpServers').map(name => `--disable-mcp-server=${name}`),
     ...(forceAllowAll && effectivePermission(agent, settings) === 'full' ? ['--allow-all'] : [])];
 }
 function findOption(live: Live | undefined, id: string, category?: string): any | undefined {
@@ -60,32 +63,32 @@ function configValue(option: any, value: string | boolean): string | boolean {
   if (typeof value === 'string' || option?.type === 'boolean' || typeof option?.currentValue === 'boolean') return value;
   return optionValues(option).find(v => (value ? ON : OFF).test(v)) ?? value;
 }
-function mapKind(kind: unknown): ActivityItem['kind'] {
+export function mapKind(kind: unknown): ActivityItem['kind'] {
   if (kind === 'read') return 'read';
   if (kind === 'edit' || kind === 'delete' || kind === 'move') return 'edit';
   if (kind === 'search' || kind === 'fetch') return 'search';
   if (kind === 'execute') return 'command';
   return kind === 'think' ? 'info' : 'tool';
 }
-function mapStatus(status: unknown, fallback: ActivityItem['status'] = 'running'): ActivityItem['status'] {
+export function mapStatus(status: unknown, fallback: ActivityItem['status'] = 'running'): ActivityItem['status'] {
   if (status === 'completed') return 'done';
   if (status === 'failed') return 'failed';
   if (status === 'cancelled' || status === 'rejected') return 'declined';
   return status === 'pending' || status === 'in_progress' ? 'running' : fallback;
 }
-function blockText(content: unknown): string {
+export function blockText(content: unknown): string {
   if (Array.isArray(content)) return content.map(blockText).join('');
   const block = content as any;
   return block?.type === 'text' && typeof block.text === 'string' ? block.text : '';
 }
-function summary(input: unknown): string | undefined {
+export function summary(input: unknown): string | undefined {
   if (typeof input === 'string') return input.slice(0, 300);
   if (!input || typeof input !== 'object') return undefined;
   const raw = input as Record<string, unknown>;
   for (const key of ['command', 'path', 'file_path', 'filePath', 'pattern', 'query', 'url', 'description']) { const value = str(raw[key]); if (value) return value.slice(0, 300); }
   try { const json = JSON.stringify(raw); return json === '{}' ? undefined : json.slice(0, 300); } catch { return undefined; }
 }
-function outputText(content: unknown): string | undefined {
+export function outputText(content: unknown): string | undefined {
   const parts = Array.isArray(content) ? content.flatMap(c => c?.type === 'content' ? [blockText(c.content)] : []).filter(Boolean) : [];
   return parts.length ? parts.join('\n').slice(0, 300) : undefined;
 }
@@ -96,7 +99,7 @@ export function simpleDiff(oldText: string | null | undefined, newText: string |
   while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
   return [...a.slice(start, endA).map(line => '-' + line), ...b.slice(start, endB).map(line => '+' + line)].join('\n');
 }
-function diffOf(content: unknown): string | undefined {
+export function diffOf(content: unknown): string | undefined {
   const diffs = Array.isArray(content) ? content.filter(c => c?.type === 'diff' && typeof c.path === 'string') : [];
   return diffs.length ? diffs.map(d => `--- ${d.path}\n${simpleDiff(d.oldText, d.newText)}`).join('\n').slice(0, 4000) : undefined;
 }
@@ -120,7 +123,7 @@ function pathsOf(call: any): string[] {
     .filter((p: unknown): p is string => typeof p === 'string' && !!p);
 }
 /** True when the call names at least one path and every path is inside one of `roots`. */
-function insideRoots(call: any, roots: string[]): boolean {
+export function insideRoots(call: any, roots: string[]): boolean {
   const paths = pathsOf(call);
   return paths.length > 0 && paths.every(p => roots.some(root => { const rel = relative(root, resolve(root, p)); return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)); }));
 }
@@ -132,11 +135,11 @@ function approvalKind(call: any): ApprovalKind {
   if (kind === 'read' || kind === 'search') return 'read';
   return serverOf(call) ? 'mcp' : 'other';
 }
-function usageOf(value: any): Usage | undefined {
+export function usageOf(value: any): Usage | undefined {
   if (!value || typeof value !== 'object' || ![value.inputTokens, value.outputTokens, value.totalTokens].some(v => typeof v === 'number')) return undefined;
   return { ...emptyUsage(), input: num(value.inputTokens), output: num(value.outputTokens), cached: num(value.cachedReadTokens), cacheWrite: num(value.cachedWriteTokens), requests: 1 };
 }
-const estimate = (input: string, output: string): Usage => ({ ...emptyUsage(), input: Math.ceil(input.length / 3), output: Math.ceil(output.length / 3), requests: 1, estimated: true });
+export const estimate = (input: string, output: string): Usage => ({ ...emptyUsage(), input: Math.ceil(input.length / 3), output: Math.ceil(output.length / 3), requests: 1, estimated: true });
 const isAuthError = (error: unknown) => error instanceof RpcError && /authenticat|not signed in|sign in|log ?in/i.test(error.message);
 const signedOut = () => new ProviderError(SIGNED_OUT, 'signed-out', { action: 'copilotLogin' });
 function providerError(error: unknown): ProviderError {
@@ -320,13 +323,15 @@ export class CopilotDriver implements NativeDriver {
 
   private async mcpServers(agent: Agent): Promise<object[]> {
     const pairs = (values?: Record<string, string>) => Object.entries(values ?? {}).map(([name, value]) => ({ name, value: String(value) }));
-    const servers: object[] = [];
-    try {
-      const { url, headers } = await this.host.roomTools.httpEndpoint(agent.id);
-      servers.push({ type: 'http', name: 'chatroom', url, headers: pairs(headers) });
-    } catch (error) { this.host.log(`Room tools are unavailable to ${agent.name}: ${message(error)}`, 'error'); }
+    const off = new Set(disabledNames(agent, 'mcpServers')), servers: object[] = [];
+    if (!off.has('chatroom')) {
+      try {
+        const { url, headers } = await this.host.roomTools.httpEndpoint(agent.id);
+        servers.push({ type: 'http', name: 'chatroom', url, headers: pairs(headers) });
+      } catch (error) { this.host.log(`Room tools are unavailable to ${agent.name}: ${message(error)}`, 'error'); }
+    }
     for (const [name, server] of Object.entries(this.host.settings().sharedMcpServers ?? {})) {
-      if (name === 'chatroom' || !server || typeof server !== 'object') continue;
+      if (name === 'chatroom' || off.has(name) || !server || typeof server !== 'object') continue;
       if (server.url) servers.push({ type: 'http', name, url: server.url, headers: pairs(server.headers) });
       else if (server.command) servers.push({ name, command: server.command, args: server.args ?? [], env: pairs(server.env) });
     }
@@ -558,6 +563,8 @@ export class CopilotDriver implements NativeDriver {
       commands, mcpServers: (live?.mcpNames ?? []).map(name => ({ name, status: 'configured' })), ...(agents.length ? { agents } : {}),
       supports: { thinking: false, summary: false, sandbox: false, webSearch: false, useMcp: true, useSkills: false, useProjectSettings: true, extraDirs: true,
         ultraSession: false, ultraTurn: true, thinkHard: efforts.length > 0, fullAccess: true, customAgent: true },
+      // The CLI excludes tools by name and disables servers, but has no switch for one skill.
+      canDisable: { tools: true, toolsByName: true, skills: false, mcpServers: true, commands: true },
       ...((live?.context ?? agent.session?.context) ? { context: live?.context ?? agent.session?.context } : {}), updatedAt: Date.now(), ...extra };
   }
 }

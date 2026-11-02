@@ -1,5 +1,5 @@
-// Optional cloud smoke test of the native drivers using your existing Claude Code, Codex and Copilot CLI logins.
-// Usage: node --import tsx scripts/test-clients.ts [claude|codex|copilot]
+// Optional cloud smoke test of the native drivers using your existing Claude Code, Codex and Copilot CLI logins; Gemini only when you name it.
+// Usage: node --import tsx scripts/test-clients.ts [claude|codex|copilot|gemini]
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -7,8 +7,9 @@ import { findRuntime, codexModels, claudeModels } from '../src/catalog';
 import { ClaudeDriver } from '../src/claude-native';
 import { CodexDriver } from '../src/codex-native';
 import { CopilotDriver } from '../src/copilot-native';
+import { GeminiDriver } from '../src/gemini-native';
 import { RoomToolHost } from '../src/room-tools';
-import { createRoom, roomFraming } from '../src/core';
+import { createRoom, defaultOptions, roomFraming } from '../src/core';
 import { DriverHost, NativeDriver, NativeProviderId, TurnSink } from '../src/types';
 
 function smokeHost(cwd: string, storage: string): DriverHost {
@@ -22,12 +23,14 @@ const sink: TurnSink = { text() {}, thinking() {}, activity() {}, approval: asyn
 async function main() {
   const cwd = resolve('.conda/chatroom/client-smoke'); await mkdir(cwd, { recursive: true });
   const host = smokeHost(cwd, await mkdtemp(join(tmpdir(), 'chatroom-smoke-')));
-  const drivers: Record<NativeProviderId, NativeDriver> = { claude: new ClaudeDriver(host), codex: new CodexDriver(host), copilot: new CopilotDriver(host) };
+  const drivers: Record<NativeProviderId, NativeDriver> = { claude: new ClaudeDriver(host), codex: new CodexDriver(host), copilot: new CopilotDriver(host), gemini: new GeminiDriver(host) };
   const room = createRoom();
-  const results = await Promise.all((['codex', 'claude', 'copilot'] as const).filter(id => !process.argv[2] || process.argv[2] === id).map(async id => {
+  // New rooms don't include Gemini.
+  room.agents.push({ ...room.agents[0]!, id: 'gemini-smoke', name: 'Gemini', provider: 'gemini', model: '', options: defaultOptions('gemini') });
+  const results = await Promise.all((['codex', 'claude', 'copilot', 'gemini'] as const).filter(id => process.argv[2] ? process.argv[2] === id : id !== 'gemini').map(async id => {
     const runtime = await findRuntime(id, id);
     if (!runtime) return { id, passed: false, error: 'Runtime not found' };
-    const catalog = id === 'copilot' ? { models: [] } : await (id === 'codex' ? codexModels(runtime) : claudeModels(runtime));
+    const catalog = id === 'copilot' || id === 'gemini' ? { models: [] } : await (id === 'codex' ? codexModels(runtime) : claudeModels(runtime));
     console.log(`${id}: ${runtime.version}, ${runtime.source}, ${catalog.models.length} models`);
     const agent = room.agents.find(a => a.provider === id)!;
     agent.options.permission = 'plan'; agent.options.effort = id === 'codex' ? 'low' : '';

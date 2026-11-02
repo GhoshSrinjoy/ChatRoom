@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ClaudeDriver, claudeArgs, claudeUsage } from '../src/claude-native';
+import { ClaudeDriver, claudeArgs, claudeUsage, disallowedTools } from '../src/claude-native';
 import { Agent, DriverSettings, NativeTurnRequest, ProviderError, Room, SkillWiring } from '../src/types';
 import { FakeChild, RecordingSink, fakeHost, fakeSpawn, recordingSink, testAgent, testRoom, waitFor } from './helpers';
 
@@ -79,6 +79,20 @@ function setup(script: Script = {}, agentPatch: Partial<Agent> = {}) {
 const userMessages = (child: FakeChild) => child.received.filter(m => m.type === 'user');
 const controls = (child: FakeChild, subtype?: string) => child.received.filter(m => m.type === 'control_request' && (!subtype || m.request.subtype === subtype));
 const argAfter = (args: string[], flag: string) => args[args.indexOf(flag) + 1];
+
+test('what is turned off becomes one --disallowedTools list: tools, whole servers and skills', () => {
+  const room = testRoom([]);
+  assert.deepEqual(disallowedTools(testAgent('claude')), []);
+  assert.ok(!claudeArgs(testAgent('claude'), room, undefined, { id: 'x', resume: false }, undefined, settings, '/s').includes('--disallowedTools'));
+  const agent = testAgent('claude', { options: { webSearch: false, disabled: { tools: ['Bash', 'WebFetch', 'mcp__mem__recall'], mcpServers: ['pathview', 'claude.ai Gmail'], skills: ['pdf', 'chatroom-shared:docs'] } } as any });
+  const args = claudeArgs(agent, room, undefined, { id: 'x', resume: false }, undefined, settings, '/s');
+  assert.equal(args.filter(a => a === '--disallowedTools').length, 1, 'repeating the flag could drop a list');
+  assert.equal(args[args.indexOf('--disallowedTools') + 1], 'WebSearch,WebFetch,Bash,mcp__mem__recall,mcp__pathview,mcp__claude_ai_Gmail,Skill(skill:pdf),Skill(skill:chatroom-shared:docs)');
+  assert.equal(args[args.indexOf('--settings') + 1], JSON.stringify({ skillOverrides: { pdf: 'off', 'chatroom-shared:docs': 'off' } }), 'hidden from the model too, for this process only');
+  assert.ok(!claudeArgs(testAgent('claude', { options: { disabled: { tools: ['Read'] } } as any }), room, undefined, { id: 'x', resume: false }, undefined, settings, '/s').includes('--settings'));
+  // A name a rule cannot express is left out rather than breaking the list.
+  assert.deepEqual(disallowedTools(testAgent('claude', { options: { disabled: { tools: ['a,b', 'c(d)', 'Read'], skills: ['x(y)'] } } as any })), ['Read']);
+});
 
 test('claudeArgs keeps Claude Code fully native and maps options to flags', () => {
   const agent = testAgent('claude'), room = testRoom([agent]);
@@ -500,5 +514,26 @@ test('the process starts in the agent\'s folder from host.cwdFor; another folder
   await driver.turn(request(agent, room, sinkFor(agent)));
   assert.equal(fake.children.length, 2, 'a new folder means a new process'); assert.equal(fake.children[1]!.cwd, host.cwd());
   assert.equal(fake.children[0]!.stdinEnded, true);
+  await driver.dispose();
+});
+
+test('a turned-off item restarts the process at the next turn, and the session resumes', async () => {
+  const fake = fakeSpawn(child => { child.onLine(m => {
+    if (m?.type === 'control_request') child.emit({ type: 'control_response', response: { subtype: 'success', request_id: m.request_id, response: { commands: [], models: [], account: {} } } });
+    if (m?.type === 'user') { child.emit({ type: 'system', subtype: 'init', session_id: SID, tools: ['Read'] }); child.emit({ type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: SID, usage: {} }); }
+  }); });
+  const driver = new ClaudeDriver(fakeHost(), fake.spawn), agent = testAgent('claude'), room = testRoom([agent]);
+  const turn = async () => {
+    const sink = recordingSink();
+    await driver.turn({ room, agent, kind: 'direct', framing: FRAMING, context: '', fullContext: () => '', ask: 'Do it', flags: {}, signal: new AbortController().signal, sink });
+    for (const patch of sink.sessions) agent.session = { ...agent.session, ...patch };
+  };
+  await turn(); await turn();
+  assert.equal(fake.children.length, 1, 'nothing changed: same process');
+  agent.options.disabled = { tools: ['Read'] };
+  await turn();
+  assert.equal(fake.children.length, 2);
+  const args = fake.children[1]!.args;
+  assert.equal(args[args.indexOf('--disallowedTools') + 1], 'Read'); assert.ok(args.includes('--resume'), 'the session continues');
   await driver.dispose();
 });

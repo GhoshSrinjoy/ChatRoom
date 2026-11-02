@@ -9,19 +9,21 @@ export function skillRoots(workspace: string | undefined, home = homedir()): Ski
   const user: SkillRoot[] = [
     { dir: join(home, '.claude', 'skills'), source: 'claude-user', recursive: false, nativeTo: ['claude'] },
     { dir: join(home, '.claude', 'plugins'), source: 'claude-plugin', recursive: true, nativeTo: ['claude'], depth: 6, underSkills: true },
-    { dir: join(home, '.agents', 'skills'), source: 'agents-user', recursive: true, nativeTo: ['codex', 'copilot'], depth: 3 },
+    { dir: join(home, '.agents', 'skills'), source: 'agents-user', recursive: true, nativeTo: ['codex', 'copilot', 'gemini'], depth: 3 },
     { dir: join(home, '.codex', 'skills'), source: 'codex-user', recursive: false, nativeTo: ['codex'] },
-    { dir: join(home, '.copilot', 'skills'), source: 'copilot-user', recursive: false, nativeTo: ['copilot'] }
+    { dir: join(home, '.copilot', 'skills'), source: 'copilot-user', recursive: false, nativeTo: ['copilot'] },
+    { dir: join(home, '.gemini', 'skills'), source: 'gemini-user', recursive: false, nativeTo: ['gemini'] }
   ];
   if (!workspace) return user;
   const project: SkillRoot[] = [
     { dir: join(workspace, '.claude', 'skills'), source: 'claude-project', recursive: false, nativeTo: ['claude', 'copilot'] },
-    { dir: join(workspace, '.agents', 'skills'), source: 'agents-project', recursive: false, nativeTo: ['codex', 'copilot'] },
+    { dir: join(workspace, '.agents', 'skills'), source: 'agents-project', recursive: false, nativeTo: ['codex', 'copilot', 'gemini'] },
     { dir: join(workspace, '.codex', 'skills'), source: 'codex-project', recursive: false, nativeTo: ['codex'] },
-    { dir: join(workspace, '.github', 'skills'), source: 'github-project', recursive: false, nativeTo: ['copilot'] }
+    { dir: join(workspace, '.github', 'skills'), source: 'github-project', recursive: false, nativeTo: ['copilot'] },
+    { dir: join(workspace, '.gemini', 'skills'), source: 'gemini-project', recursive: false, nativeTo: ['gemini'] }
   ];
-  // Spec table order: claude-user, claude-project, claude-plugin, agents-user, agents-project, codex-user, codex-project, github-project, copilot-user.
-  return [user[0]!, project[0]!, user[1]!, user[2]!, project[1]!, user[3]!, project[2]!, project[3]!, user[4]!];
+  // Spec table order: claude-user, claude-project, claude-plugin, agents-user, agents-project, codex-user, codex-project, github-project, copilot-user, gemini-user, gemini-project.
+  return [user[0]!, project[0]!, user[1]!, user[2]!, project[1]!, user[3]!, project[2]!, project[3]!, user[4]!, user[5]!, project[4]!];
 }
 const unquote = (value: string) => /^(["']).*\1$/s.test(value) ? value.slice(1, -1).replace(/\\(["'])/g, '$1') : value;
 export function parseSkillFrontmatter(text: string): { name?: string; description?: string } {
@@ -131,6 +133,8 @@ export async function prepareSkillWiring(skills: SharedSkill[], storageDir: stri
     ...(claudeLinked ? { claudePluginDir: pluginDir } : {}),
     ...(copilotLinked ? { copilotAddDir: copilotDir } : {}),
     codexExtraRoots: [...new Set(missing('codex').map(s => dirname(s.dir)))],
+    // Gemini resolves links before it checks a path, so it gets the real folders, not links to them.
+    geminiDirs: [...new Set(missing('gemini').map(s => dirname(s.dir)))].slice(0, 20),
     indexPath, indexDir: root, skills
   };
 }

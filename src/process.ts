@@ -6,6 +6,14 @@ import { Executable, NativeProviderId } from './types';
 export type { Executable } from './types';
 /** For an npm shim or global install, the JavaScript entry or (Copilot) the native executable it launches. */
 function npmTarget(dir: string, provider: NativeProviderId): Executable | undefined {
+  if (provider === 'gemini') {
+    // Current releases ship a bundle; older ones a dist folder.
+    for (const script of ['bundle/gemini.js', 'dist/index.js']) {
+      const path = join(dir, 'node_modules', '@google', 'gemini-cli', script);
+      if (existsSync(path)) return { command: process.execPath, prefix: [path] };
+    }
+    return undefined;
+  }
   if (provider !== 'copilot') {
     const script = join(dir, 'node_modules', provider === 'codex' ? '@openai/codex/bin/codex.js' : '@anthropic-ai/claude-code/cli.js');
     return existsSync(script) ? { command: process.execPath, prefix: [script] } : undefined;
@@ -55,6 +63,8 @@ export function childEnv(executable: Executable, provider?: NativeProviderId, ex
   if (provider === 'claude') env.CLAUDE_CODE_ENTRYPOINT = 'sdk-ts';
   if (provider === 'codex' && !env.RUST_LOG) env.RUST_LOG = 'warn';
   if (provider === 'copilot') env.COPILOT_AUTO_UPDATE = 'false';
+  // One process to stop and one stdin for ACP: no relaunch to raise its memory limit.
+  if (provider === 'gemini') env.GEMINI_CLI_NO_RELAUNCH = 'true';
   if (extra.pathPrepend?.length) {
     const key = Object.keys(env).find(k => process.platform === 'win32' ? k.toUpperCase() === 'PATH' : k === 'PATH') ?? 'PATH';
     env[key] = [...extra.pathPrepend, env[key]].filter(Boolean).join(delimiter);

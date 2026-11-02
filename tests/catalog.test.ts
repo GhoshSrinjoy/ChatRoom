@@ -40,3 +40,17 @@ test('Copilot runtime discovery reads the version from a configured CLI and from
     assert.equal(await findRuntime('copilot', join(dir, 'missing.js')), undefined);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('Gemini runtime discovery: a current CLI is usable, an old one is found but marked too old', { timeout: 30000 }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'chatroom-gemini-'));
+  const cli = async (name: string, version: string) => { const path = join(dir, name); await writeFile(path, `if (process.argv.includes('--version')) console.log('${version}');`); return path; };
+  try {
+    assert.equal((await findRuntime('gemini', await cli('current.js', '0.66.0')))?.modern, true);
+    assert.equal((await findRuntime('gemini', await cli('oldest.js', '0.38.0')))?.modern, true);
+    assert.equal((await findRuntime('gemini', await cli('major.js', '1.0.0')))?.modern, true);
+    const old = await findRuntime('gemini', await cli('old.js', '0.1.18'));
+    assert.equal(old?.modern, false); assert.equal(old?.version, '0.1.18');
+    assert.equal((await findRuntime('gemini', await cli('before.js', '0.37.9')))?.modern, false);
+    assert.equal(await findRuntime('gemini', join(dir, 'missing.js')), undefined);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
