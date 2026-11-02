@@ -274,8 +274,9 @@ Chatroom runs the Gemini CLI as `gemini --acp`, with its own tools, skills, MCP 
 
 - **Version:** 0.38 or newer. An older one is found and left alone: the agent says it needs an update and offers **Update Gemini CLI**, which runs `npm i -g @google/gemini-cli@latest` in a terminal.
 - **Sign-in:** it uses the login of your `gemini` command, or `GEMINI_API_KEY`. Since June 18, 2026, [Google no longer serves the Gemini CLI to free, Google One, AI Pro and AI Ultra logins](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/). It keeps working with a paid Gemini API key or a Gemini Code Assist Standard or Enterprise license. When Google refuses a login, the agent's card and the room say what it answered, and the other agents continue.
+- **No surprise windows:** a CLI Chatroom starts can't open a browser by itself, so a missing login shows as **Signed out**. A Google page opens only when you click **Sign in to Gemini**, which runs `gemini` in a terminal.
 - **Trust:** Chatroom runs only in folders you trust in VS Code, so it tells the CLI this folder is trusted, for that process only.
-- **Different from the other CLIs:** it doesn't list its tools, so you [turn one off by name](#turning-tools-off). It has no `/compact` here; it compresses its own session when it fills up. It has no effort levels, think harder or Ultra, and project settings (`GEMINI.md`) can't be turned off per agent.
+- **Different from the other CLIs:** it doesn't report its tools, so Chatroom [reads them](#turning-tools-off) once per CLI version. It has no `/compact` here; it compresses its own session when it fills up. It has no effort levels, think harder or Ultra, and project settings (`GEMINI.md`) can't be turned off per agent.
 - **Your files:** what Chatroom needs from the CLI goes in a small policy file in the extension's storage. Nothing is written to `~/.gemini`.
 
 <table>
@@ -292,19 +293,21 @@ The **Tools** tab lists what each agent has. Click an item to turn it off for th
 <table>
   <tr>
     <td align="center" valign="top" width="50%"><img src="docs/images/tool-switches.png" width="320" alt="Claude's card in the Tools tab with tools, a skill, an MCP server and commands struck through, and the commands list open"><br><em>Turned-off items stay listed, struck through, and the labels count them. Here the commands list is open; <b>Show fewer</b> closes it.</em></td>
-    <td align="center" valign="top" width="50%"><img src="docs/images/gemini-tools.png" width="320" alt="Gemini's card in the Tools tab with two tools turned off by name and one skill turned off"><br><em>Gemini doesn't list its tools, so these two were typed by name.</em></td>
+    <td align="center" valign="top" width="50%"><img src="docs/images/gemini-tools.png" width="320" alt="Gemini's card in the Tools tab with its tools listed, two of them turned off, and one skill turned off"><br><em>Gemini's tools, read from the CLI. Click one to turn it off.</em></td>
   </tr>
 </table>
 
 | Item | Claude Code | Codex | Copilot CLI | Gemini CLI |
 | --- | --- | --- | --- | --- |
-| Tool | Removed from the model's tools (`--disallowedTools`) | MCP tools only (`disabled_tools`) | Removed from the model's tools (`--excluded-tools`) | Denied and removed (policy rule) |
-| Skill | Hidden and refused (`skillOverrides`, deny rule) | Removed (`skills.config`) | No switch for one skill, so the list shows none | Refused when called (policy rule) |
+| Tool | Removed from the model's tools (`--disallowedTools`) | Built-in tools with a switch (`features.*`) and MCP tools (`disabled_tools`) | Removed from the model's tools (`--excluded-tools`) | Denied and removed (policy rule) |
+| Skill | Hidden and refused (`skillOverrides`, deny rule) | Removed (`skills.config`) | Refused when called (a hook for that process, from CLI 1.0.92) | Refused when called (policy rule) |
 | MCP server | All its tools removed | Turned off in the thread's config | Turned off (`--disable-mcp-server`) | All its tools denied and removed |
 | Command | Chatroom stops offering and forwarding it | Same | Same | Same |
 
-- **Listing tools:** Claude Code reports its tools after the first turn. Codex reports only MCP tools, so those are the ones listed here. Copilot and Gemini don't report theirs, so you can type a tool's name under **Tools** (for example `web_fetch`).
-- **Commands and skills:** turning a skill off also takes the slash command of the same name out of the `/` menu. A command that is off is refused with a message saying where to turn it back on.
+- **Listing tools:** Claude Code reports its tools after the first turn. Codex, Copilot and Gemini don't report their built-in tools, so Chatroom reads them once per CLI version: it starts the CLI in an empty folder with no logins, against a local stand-in for its model service, and takes the list from the first request. A local proxy refuses anything else the CLI tries to reach, so no tokens are used and nothing leaves your machine. For Claude Code, Copilot and Gemini you can still type a tool's name under **Tools**, for anything the list can't see.
+- **Codex:** `exec_command` and `write_stdin` share a switch, as do the goal tools, so they go off together. A tool gets a button only once a real run shows its switch working. Tools with no switch, such as `apply_patch`, are dimmed; use the **Plan** or **Ask** level to control edits.
+- **Copilot skills:** the CLI still lists a turned-off skill to the model, so the agent is told not to use it, and a call is refused. If the hook itself can't start, the CLI refuses every skill and nothing else.
+- **Commands and skills:** turning a skill off also takes the slash command of the same name out of the `/` menu, and clicking a skill's command turns off the skill too, which also stops the model using it. A command that is off is refused with a message saying where to turn it back on.
 
 ## Commands
 
@@ -439,6 +442,9 @@ node --import tsx scripts/test-documents.ts path\to\scan.jpg
 # The Gemini driver against a real Gemini CLI with a scripted model: no account, no tokens, nothing in ~/.gemini is read or changed.
 node --import tsx scripts/test-gemini.ts path\to\gemini-cli\bundle\gemini.js
 
+# Tool lists and switches against the real Codex, Copilot and Gemini CLIs, with a local stand-in: no account, no tokens.
+node --import tsx scripts/test-switches.ts [codex|copilot|gemini] [--gemini path\to\gemini.js] [--copilot path] [--codex path]
+
 # Optional live runs with your own logins (they use real tokens).
 node --import tsx scripts/test-team.ts path\to\scan.jpg medgemma:4b
 node --import tsx scripts/test-clients.ts [claude|codex|copilot|gemini]
@@ -452,6 +458,7 @@ node --import tsx scripts/test-clients.ts [claude|codex|copilot|gemini]
 - `src/claude-native.ts`, `src/codex-native.ts`, `src/copilot-native.ts`, `src/gemini-native.ts`: the Claude stream-json, Codex app-server, Copilot ACP and Gemini ACP drivers; `src/jsonl.ts`: JSON-lines processes and JSON-RPC.
 - `src/commands.ts`: composer parsing, mentions, hand-offs, `/loop`.
 - `src/room-tools.ts`, `src/tools.ts`, `src/tool-specs.ts`: room tools over MCP (in-process and loopback HTTP) and the legacy read-only tools.
+- `src/tool-lists.ts`: reads the tools Codex, Copilot and Gemini offer their models.
 - `src/skills.ts`: skill discovery and sharing; `src/editor-context.ts`, `src/editor-tracker.ts`: the open file and selection.
 - `src/providers.ts`, `src/catalog.ts`, `src/process.ts`: CLI discovery, model catalogs, process environment.
 - `src/extract.ts`, `src/knowledge.ts`, `src/documents.ts`, `src/ollama.ts`: documents, OCR, embeddings and Ollama.
