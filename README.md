@@ -4,7 +4,7 @@
 
 A VS Code extension where the real Claude Code, Codex, GitHub Copilot and Gemini CLIs work in one chat room with you, plus local Ollama models. Each agent is the CLI itself, with its own tools, skills, slash commands, MCP servers, sessions, effort levels and permission modes. The agents see each other's messages, hand work to each other with `@mentions`, and can work as a team under a lead. Attach PDFs, Word files or images, and every agent can read and search them using local OCR and embeddings.
 
-<p align="center"><img src="docs/images/lead-team.png" width="860" alt="Team mode: the lead's plan, with two steps in parallel and a third that builds on both"><br><em>Team mode. Claude leads: Codex and Copilot take two steps in parallel, Claude checks both against the code, then writes the final answer.</em></p>
+<p align="center"><img src="docs/images/lead-team.png" width="860" alt="Team mode: the lead's plan, with three steps in parallel and a fourth that builds on them"><br><em>Team mode, with Gemini added to the room. Claude leads: Codex, Copilot and Gemini take three steps in parallel, Claude checks them against the code, then writes the final answer.</em></p>
 
 ## Features
 
@@ -71,6 +71,13 @@ npm run package
 
 The room title opens your chats: click one to switch to it, or the trash icon beside it to delete it. A chat with messages asks first, because deleting can't be undone; an empty one goes at once. Deleting removes the chat from Chatroom and stops its CLIs. Worktree changes you haven't applied are kept on a `chatroom/orphaned/…` branch. Each CLI keeps its own session files, and documents stay in the local cache other chats share.
 
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="docs/images/chats.png" width="320" alt="The chat list open under the room title, with a trash icon beside each chat and one chat asking to confirm its delete"><br><em>The room title opens your chats, each with a trash icon. A chat with messages asks first and says what happens to its unapplied work.</em></td>
+    <td align="center" width="50%"><img src="docs/images/add-agent.png" width="320" alt="The add agent dialog listing Codex, Claude Code, GitHub Copilot, Gemini CLI and Ollama"><br><em><b>+</b> in the team strip adds an agent, including the Gemini CLI.</em></td>
+  </tr>
+</table>
+
 The grid button beside the room title opens **Usage**, **Tools** and **Activity**. **Chatroom: Open in Editor** opens the room in an editor tab beside your current one.
 
 <table>
@@ -84,7 +91,7 @@ The grid button beside the room title opens **Usage**, **Tools** and **Activity*
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="docs/images/tools.png" width="320" alt="Tools tab listing each agent's own tools, skills, MCP servers and commands"><br><em><b>Tools</b>: each agent's own tools, skills, MCP servers and commands, as its CLI reports them.</em></td>
+    <td align="center" width="50%"><img src="docs/images/tools.png" width="320" alt="Tools tab listing each agent's own tools, skills, MCP servers and commands"><br><em><b>Tools</b>: each agent's own tools, skills, MCP servers and commands, as its CLI reports them. Click one to turn it off; <b>+N more</b> opens the rest.</em></td>
     <td align="center" width="50%"><img src="docs/images/usage.png" width="320" alt="Usage tab with tokens by agent"><br><em><b>Usage</b>: tokens per agent, cached re-reads, cost when the CLI reports it, and the optional token limit per message.</em></td>
   </tr>
 </table>
@@ -271,9 +278,23 @@ Chatroom runs the Gemini CLI as `gemini --acp`, with its own tools, skills, MCP 
 - **Different from the other CLIs:** it doesn't list its tools, so you [turn one off by name](#turning-tools-off). It has no `/compact` here; it compresses its own session when it fills up. It has no effort levels, think harder or Ultra, and project settings (`GEMINI.md`) can't be turned off per agent.
 - **Your files:** what Chatroom needs from the CLI goes in a small policy file in the extension's storage. Nothing is written to `~/.gemini`.
 
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%"><img src="docs/images/gemini-settings.png" width="320" alt="Agent settings for Gemini: model, permissions, worktree, web search, MCP servers, skills and extra folders"><br><em>Gemini's settings. Project settings are greyed out because the CLI has no switch for them.</em></td>
+    <td align="center" valign="top" width="50%"><img src="docs/images/gemini-update.png" width="320" alt="The Gemini card in the Tools tab saying version 0.1.18 is too old, with an Update Gemini CLI button"><br><em>A CLI that is too old says so and offers the update. Chatroom doesn't start it.</em></td>
+  </tr>
+</table>
+
 ## Turning tools off
 
 The **Tools** tab lists what each agent has. Click an item to turn it off for that agent; click it again to turn it back on. **+N more** opens the rest of a long list. A change applies from the agent's next turn: its CLI restarts if it has to, and its session continues. Turned-off items are saved with the agent in that room, and a new room starts with everything on. Nothing is written to your CLI settings files.
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%"><img src="docs/images/tool-switches.png" width="320" alt="Claude's card in the Tools tab with tools, a skill, an MCP server and commands struck through, and the commands list open"><br><em>Turned-off items stay listed, struck through, and the labels count them. Here the commands list is open; <b>Show fewer</b> closes it.</em></td>
+    <td align="center" valign="top" width="50%"><img src="docs/images/gemini-tools.png" width="320" alt="Gemini's card in the Tools tab with two tools turned off by name and one skill turned off"><br><em>Gemini doesn't list its tools, so these two were typed by name.</em></td>
+  </tr>
+</table>
 
 | Item | Claude Code | Codex | Copilot CLI | Gemini CLI |
 | --- | --- | --- | --- | --- |
