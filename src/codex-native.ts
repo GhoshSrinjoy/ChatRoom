@@ -108,6 +108,23 @@ function applyDisabled(config: Record<string, unknown>, agent: Agent, mcpNames: 
   const skills = disabledNames(agent, 'skills');
   if (skills.length) config['skills.config'] = skills.map(name => ({ name, enabled: false }));
 }
+/**
+ * Built-in tools and the override that removes them, found against the real CLI. Tools on one switch go together. Codex accepts unknown
+ * keys without complaint, so src/tool-lists.ts checks these against a real run before a tool gets a button.
+ */
+const BUILTIN_SWITCHES: { key: string; value: unknown; tools: string[] }[] = [
+  { key: 'features.shell_tool', value: false, tools: ['exec_command', 'write_stdin', 'shell', 'shell_command', 'local_shell'] },
+  { key: 'features.view_image', value: false, tools: ['view_image'] },
+  { key: 'features.goals', value: false, tools: ['create_goal', 'get_goal', 'update_goal'] },
+  { key: 'features.sleep_tool', value: false, tools: ['clock.sleep'] },
+  { key: 'features.multi_agent', value: false, tools: ['multi_agent_v1.close_agent', 'multi_agent_v1.resume_agent', 'multi_agent_v1.send_input', 'multi_agent_v1.spawn_agent', 'multi_agent_v1.wait_agent'] },
+  { key: 'web_search', value: 'disabled', tools: ['web_search'] },
+];
+/** Every switch on: what a read uses to see which tools they really remove. */
+export const codexSwitchConfig = (): Record<string, unknown> => Object.fromEntries(BUILTIN_SWITCHES.map(s => [s.key, s.value]));
+export const codexToolGroups = (): string[][] => BUILTIN_SWITCHES.map(s => s.tools).filter(tools => tools.length > 1);
+/** The tools that go off together with this one. */
+export const codexToolGroup = (name: string): string[] => BUILTIN_SWITCHES.find(s => s.tools.includes(name))?.tools ?? [name];
 /** Per-thread config overrides (§5.4.2). */
 function threadConfig(options: AgentOptions, mcpNames: string[], shared: Record<string, SharedMcpServer>, agent?: Agent): Record<string, unknown> {
   const config: Record<string, unknown> = { model_reasoning_summary: options.summary };
@@ -125,6 +142,9 @@ function threadConfig(options: AgentOptions, mcpNames: string[], shared: Record<
   }
   if (options.useProjectSettings === false) config.project_doc_max_bytes = 0;
   config.project_doc_fallback_filenames = ['CLAUDE.md'];
+  // Last, so a tool the user turned off stays off whatever the web search setting says.
+  const off = agent ? disabledNames(agent, 'tools') : [];
+  for (const { key, value, tools } of BUILTIN_SWITCHES) if (tools.some(tool => off.includes(tool))) config[key] = value;
   return config;
 }
 /** Model and effort a thread/start or thread/resume reports for the thread. */
@@ -214,8 +234,9 @@ export class CodexDriver implements NativeDriver {
       return { ...base, status: signedOutNow ? 'signed-out' : 'ready', ...(signedOutNow ? { detail: SIGN_IN } : {}), ...(runtime ? { version: runtime.version } : {}),
         ...(who?.type === 'chatgpt' ? { account: [who.email, who.planType].filter(Boolean).join(' · ') } : who?.type === 'apiKey' ? { account: 'API key' } : {}),
         models: server.models, efforts: model?.reasoning ?? [], ...(defaultEffort ? { defaultEffort } : {}),
+        ...(server.configModel || model?.id ? { activeModel: server.configModel || model?.id } : {}),
         skills: skills.map(s => ({ name: s.name, description: s.description, source: s.scope })), commands,
-        // Only MCP tools are reported, and the connectors server's are switched as a whole.
+        // Only MCP tools are reported, and the connectors server's are switched as a whole. Built-in tools come from a read: src/tool-lists.ts.
         tools: (Array.isArray(mcp?.data) ? mcp.data : []).filter((s: any) => typeof s?.name === 'string' && s.name !== APPS_SERVER).flatMap((s: any) => Object.keys(s.tools ?? {}).map(tool => `${s.name}.${tool}`)),
         canDisable: { tools: true, toolsByName: false, skills: true, mcpServers: true, commands: true },
         mcpServers: (Array.isArray(mcp?.data) ? mcp.data : []).filter((s: any) => typeof s?.name === 'string')

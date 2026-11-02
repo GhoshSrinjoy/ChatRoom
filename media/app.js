@@ -431,6 +431,7 @@
     if (action) { const b = document.createElement('button'); b.type = 'button'; b.className = 'outline-button inline'; b.dataset.copilot = action; b.textContent = action === 'install' ? 'Install Copilot CLI' : 'Sign in to Copilot'; div.append(b); }
     const gemini = /npm i(?:nstall)? -g @google\/gemini-cli/.test(m.text) ? 'install' : /run "gemini" in a terminal/.test(m.text) ? 'login' : '';
     if (gemini) { const b = document.createElement('button'); b.type = 'button'; b.className = 'outline-button inline'; b.dataset.gemini = gemini; b.textContent = gemini === 'install' ? 'Install or update Gemini CLI' : 'Sign in to Gemini'; div.append(b); }
+    for (const fix of m.fixes || []) div.insertAdjacentHTML('beforeend', hintButtons(fix.action, fix.provider, fix.status));
     return div;
   }
   // The room's combined worktree changes. Only the latest card has buttons; the host keeps it up to date.
@@ -1272,15 +1273,19 @@
   // One list of what an agent has. What is turned off stays listed, even once the CLI stops reporting it, so it can be turned on again.
   function capRow(a, kind, label, items, empty = 'None') {
     const can = !!caps(a)?.canDisable?.[kind], isOff = name => kind === 'commands' ? commandOff(a, name) : offNames(a, kind).includes(name);
+    const fixed = new Set(kind === 'tools' ? caps(a)?.fixedTools || [] : []), groups = kind === 'tools' ? caps(a)?.toolGroups || [] : [];
     const listed = new Set(items.map(x => x.name)), gone = offNames(a, kind).filter(name => !listed.has(name)).map(name => ({ name, text: kind === 'commands' ? '/' + name : name }));
-    const all = [...items, ...gone], key = `${a.id}:${kind}`, open = capsOpen.has(key), more = all.length - CAPS_SHOWN, off = all.filter(x => isOff(x.name)).length;
+    const all = [...items, ...gone], key = `${a.id}:${kind}`, open = capsOpen.has(key), more = all.length - CAPS_SHOWN, off = all.filter(x => !fixed.has(x.name) && isOff(x.name)).length;
     const chip = x => {
       const body = (x.dot ? `<span class="connection-dot ${x.dot}"></span>` : '') + esc(x.text) + (x.count !== undefined ? ` · ${x.count}` : '');
+      if (fixed.has(x.name)) return `<span class="cap-chip fixed" title="${esc(`${names[a.provider]} has no switch for this tool`)}">${body}</span>`;
       if (!can) return `<span class="cap-chip" title="${esc(x.title || '')}">${body}</span>`;
-      const down = isOff(x.name), same = namedAs(x.name.toLowerCase());
-      // A command that is off through its skill is turned on through the skill.
-      const target = kind === 'commands' && down && !offNames(a, 'commands').some(same) ? 'skills' : kind, stored = offNames(a, target).find(same) ?? x.name;
-      const how = kind === 'commands' ? (down ? 'Turned off: Chatroom does not offer it. Click to turn it on' : 'Click to stop offering this command') : down ? 'Turned off. Click to turn it on' : 'Click to turn it off';
+      const down = isOff(x.name), same = namedAs(x.name.toLowerCase()), peers = (groups.find(group => group.includes(x.name)) || []).filter(name => name !== x.name && listed.has(name));
+      // A skill's command goes off and on with its skill, because that also stops the model using it. One already off as a command is turned on as a command.
+      const target = kind !== 'commands' ? kind : down ? (offNames(a, 'commands').some(same) ? 'commands' : 'skills') : x.skill && caps(a)?.canDisable?.skills ? 'skills' : 'commands', stored = offNames(a, target).find(same) ?? x.name;
+      const how = kind === 'commands' && target === 'skills' ? (down ? 'Turned off with its skill. Click to turn both on' : 'Click to turn off this skill and its command')
+        : kind === 'commands' ? (down ? 'Turned off: Chatroom does not offer it. Click to turn it on' : 'Click to stop offering this command')
+        : `${down ? 'Turned off. Click to turn it on' : 'Click to turn it off'}${peers.length ? `, together with ${peers.join(', ')},` : ''}`;
       return `<button type="button" class="cap-chip toggle${down ? ' off' : ''}" aria-pressed="${!down}" data-cap="${esc(JSON.stringify([a.id, target, stored]))}" title="${esc([x.title, `${how} for ${a.name}`].filter(Boolean).join(' · '))}">${body}</button>`;
     };
     const toggle = more > 0 ? `<button type="button" class="cap-chip more" data-caps-more="${esc(key)}" aria-expanded="${open}">${open ? 'Show fewer' : `+${more} more`}</button>` : '';
@@ -1313,8 +1318,8 @@
       + capRow(a, 'tools', 'Tools', c.tools.map(name => ({ name, text: name })), noTools)
       + capRow(a, 'skills', 'Skills', c.skills.map(s => ({ name: s.name, text: s.name, title: s.description })))
       + capRow(a, 'mcpServers', 'MCP servers', c.mcpServers.map(s => ({ name: s.name, text: s.name, title: s.status, dot: mcpDot(s.status), count: s.tools })))
-      + capRow(a, 'commands', 'Commands', c.commands.map(x => ({ name: x.name, text: '/' + x.name, title: x.description })))
-      + (c.canDisable ? '<p class="fine-print caps-note">Click an item to turn it off for this agent. It applies from its next turn.</p>' : '') + '</div>';
+      + capRow(a, 'commands', 'Commands', c.commands.map(x => ({ name: x.name, text: '/' + x.name, title: x.description, skill: x.source === 'skill' })))
+      + (c.canDisable ? `<p class="fine-print caps-note">Click an item to turn it off for this agent. It applies from its next turn.${c.fixedTools?.length ? ' Dimmed tools have no switch in this CLI.' : ''}</p>` : '') + '</div>';
   }
   function toolsTab() {
     const r = state.room, running = busy(), docs = r.documents || [], skills = state.sharedSkills || [], ollama = state.connections.find(c => c.id === 'ollama');

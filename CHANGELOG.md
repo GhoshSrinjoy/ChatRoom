@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.0
+
+- **Tool lists for Codex, Copilot and Gemini.** These CLIs don't report their built-in tools, so Chatroom now reads them, once per CLI version, and lists them under **Tools** to click. A read starts the CLI in an empty folder with no logins, against a local stand-in for its model service, and a local proxy refuses anything else it tries to reach: no tokens are used, nothing leaves your machine, and no window opens. You can still type a name for anything the list can't see.
+- **Codex's built-in tools can be turned off.** `exec_command` and `write_stdin`, `view_image`, the goal tools, `clock.sleep` and `web_search`, with the CLI's own switches. Codex accepts unknown keys without complaint, so a tool gets a button only once a real run shows its switch working. The rest, such as `apply_patch`, are shown dimmed.
+- **Copilot: turn off one skill.** Its own `copilot skill disable` is global, and sessions over the protocol Chatroom uses ignore it. So a small hook for that one process refuses the skill, and only skill calls start it. Needs Copilot CLI 1.0.92 or newer.
+- **A skill's command goes with its skill.** Clicking it under Commands now turns off the skill as well, which also stops the model using it.
+- **No surprise Google windows.** Agents run the Gemini CLI with browser launching turned off, so a missing login shows as Signed out instead of opening a sign-in page. A browser opens only when you click **Sign in to Gemini**, in a terminal.
+- **Fixed:** the room's notice about an agent that can't run now has its Install, Update or Sign in button, whatever the agent is called.
+- **Fixed:** turning off a Copilot tool no longer puts `Info: Disabled tools: ...` at the start of its next reply.
+- Verified in real VS Code against the real Codex, Copilot and Gemini CLIs with local stand-ins, and on Copilot 1.0.92 and 1.0.105 with `scripts/test-switches.ts`: a turned-off tool is gone from what the model is offered, and a forced call to it is refused.
+
 ## 0.8.0
 
 - **Gemini CLI.** Add it with **+**: it runs as `gemini --acp` with its own tools, skills, MCP servers and sessions, permission levels mapped to its approval modes, approval cards, and room tools over MCP. Existing rooms and new rooms are unchanged until you add it.

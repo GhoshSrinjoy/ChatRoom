@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRoom, buildContext, parseToolCall, parsePlan, planStages, systemPrompt, message, estimateTokens, boundedNumber, roomFraming, renderEntry, renderContext,
   unseenEntries, boundedHistory, turnAsk, migrateRoom, defaultOptions, framingHash, DEFAULT_LOOP, FramingContext, SCHEMA,
-  BUILTIN_TEAMS, classifyUnavailable, disabledNames, normalizeDisabled, normalizeTeam, usesCli, pipelineLead, stageAgents, teamPlan, unavailableText, sandboxLanguage, sandboxStatusText, sandboxSummary, sandboxWhat } from '../src/core';
+  BUILTIN_TEAMS, classifyUnavailable, disabledNames, normalizeDisabled, normalizeTeam, usesCli, pipelineLead, stageAgents, teamPlan, unavailableText, sandboxLanguage, sandboxStatusText, sandboxSummary, sandboxWhat, toggleDisabled } from '../src/core';
 import { Connection, Message, ProviderError, SandboxResult, TeamStage, Unavailable, addUsage, emptyUsage } from '../src/types';
 
 const copilotCli: Connection = { id: 'copilot', status: 'ready', runtime: 'cli', detail: '', models: [] };
@@ -12,6 +12,27 @@ function teamRoom() {
   codex.model = 'gpt-5'; claude.model = 'sonnet'; claude.options.permission = 'auto-edit'; copilot.model = ''; copilot.options.permission = 'plan';
   return { room, codex, claude, copilot };
 }
+
+test('toggleDisabled: one item, or a group of which only what the CLI lists is recorded', () => {
+  assert.deepEqual(toggleDisabled(undefined, 'tools', 'view_image', true), { tools: ['view_image'] });
+  assert.deepEqual(toggleDisabled({ skills: ['a'] }, 'tools', 'x', true), { skills: ['a'], tools: ['x'] });
+  assert.equal(toggleDisabled({ tools: ['x'] }, 'tools', 'x', false), undefined, 'nothing left off');
+  const group = ['exec_command', 'write_stdin', 'shell'], listed = ['exec_command', 'write_stdin', 'view_image'];
+  assert.deepEqual(toggleDisabled(undefined, 'tools', 'write_stdin', true, group, listed), { tools: ['exec_command', 'write_stdin'] }, 'shell is not listed, so it never shows as off');
+  assert.deepEqual(toggleDisabled({ tools: ['exec_command', 'write_stdin', 'view_image'] }, 'tools', 'exec_command', false, group, listed), { tools: ['view_image'] }, 'on again together');
+  assert.deepEqual(toggleDisabled({ tools: ['shell'] }, 'tools', 'exec_command', true, group, listed), { tools: ['exec_command', 'write_stdin'] }, 'a leftover of the group goes');
+  assert.deepEqual(toggleDisabled(undefined, 'tools', 'typed_name', true, ['typed_name'], []), { tools: ['typed_name'] }, 'what was clicked always counts');
+});
+
+test('a Copilot agent is told which skills are off, because its CLI still lists them', () => {
+  const { room, codex, copilot } = teamRoom();
+  assert.doesNotMatch(roomFraming(copilot, room, ctx()), /turned off these skills/);
+  copilot.options.disabled = { skills: ['demo', 'other'] };
+  assert.match(roomFraming(copilot, room, ctx()), /The user turned off these skills for you, so don't use them: demo, other\./);
+  assert.doesNotMatch(roomFraming(copilot, room, ctx({ legacy: true })), /turned off these skills/, 'a chat model has no skills');
+  codex.options.disabled = { skills: ['demo'] };
+  assert.doesNotMatch(roomFraming(codex, room, ctx()), /turned off these skills/, 'the other CLIs really hide them');
+});
 
 test('room framing lists the roster, marks the agent, and adds lead, role and skills lines only when they apply', () => {
   const { room, codex, claude, copilot } = teamRoom();

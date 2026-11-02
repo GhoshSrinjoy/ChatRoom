@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SandboxRequest, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, WorktreeMode, addUsage, emptyUsage } from './types';
-import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, DISABLE_KINDS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, disableName, leadAgent, message, migrateRoom, normalizeDisabled, normalizeTeam, overLimit, patchLoop, roomFraming, sandboxReport, teamPlan, unavailableText } from './core';
+import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, DISABLE_KINDS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, disableName, leadAgent, message, migrateRoom, normalizeDisabled, toggleDisabled, normalizeTeam, overLimit, patchLoop, roomFraming, sandboxReport, teamPlan, unavailableText } from './core';
 import { RoomEngine } from './engine';
 import { OllamaClient } from './ollama';
 import { Drivers, createDrivers, createLegacyProviders, detectConnections, legacyCapabilities, nativeDriverFor, providerRuntime } from './providers';
@@ -11,7 +11,8 @@ import { ToolService } from './tools';
 import { RoomToolHost } from './room-tools';
 import { discoverSkills, prepareSkillWiring } from './skills';
 import { EditorTracker } from './editor-tracker';
-import { EFFORT_ORDER } from './codex-native';
+import { EFFORT_ORDER, codexToolGroup, codexToolGroups } from './codex-native';
+import { StoredToolList, ToolListRequest, ToolLists, isListedProvider, readTools } from './tool-lists';
 import { ROOM_COMMANDS, SANDBOX_USAGE, parseComposer, parseLoop, parseSandbox, parseTeam, parseWorktrees, resolveMention } from './commands';
 import { DocumentService, LocalModels } from './documents';
 import { KnowledgeStore, sha256 } from './knowledge';
@@ -103,6 +104,9 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   private dockerChecking?: Promise<void>;
   private sandboxSwept = false;
   private dockerStarting = false;
+  /** What Codex, Copilot and Gemini offer their models, read once per version. */
+  private toolLists: ToolLists;
+  private readonly toolListStop = new AbortController();
   constructor(private readonly context: vscode.ExtensionContext) {
     const saved = context.workspaceState.get<unknown[]>('chatroom.rooms.v1', []);
     this.rooms = (Array.isArray(saved) ? saved : []).filter((r: any) => r && typeof r.id === 'string' && Array.isArray(r.agents) && Array.isArray(r.messages)).slice(0, 20).map(r => this.restore(r));
@@ -148,6 +152,8 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       changed: () => this.changed(),
       log: (text, kind) => this.engine.log(text, kind ?? 'tool')
     });
+    this.toolLists = new ToolLists({ get: () => context.globalState.get<Record<string, StoredToolList>>('chatroom.toolLists', {}), set: lists => { void context.globalState.update('chatroom.toolLists', lists); } },
+      request => this.readToolList(request), { changed: () => this.changed(), log: text => this.engine.log(text, 'error') });
     this.drivers = createDrivers(this.host);
     this.legacy = createLegacyProviders(this.ollama, models => this.copilotModels(models));
     this.engine = this.makeEngine(this.rooms[0]!);
@@ -264,8 +270,21 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   }
   private capsRecord(room: Room): Record<string, AgentCapabilities> {
     const result: Record<string, AgentCapabilities> = {};
-    for (const agent of room.agents) { const caps = this.capsFor(agent); if (caps) result[agent.id] = caps; }
+    for (const agent of room.agents) { const caps = this.capsFor(agent); if (caps) result[agent.id] = this.withToolList(agent, caps); }
     return result;
+  }
+  /** Adds the built-in tools a CLI doesn't report to what it does report. A read starts the first time an agent needs one and the list arrives with a later state. */
+  private withToolList(agent: Agent, caps: AgentCapabilities): AgentCapabilities {
+    if (caps.runtime !== 'cli' || caps.status !== 'ready' || !caps.version || !isListedProvider(agent.provider)) return caps;
+    const model = agent.provider === 'codex' ? agent.model || caps.activeModel : undefined;
+    const list = this.toolLists.get({ provider: agent.provider, version: caps.version, ...(model ? { model } : {}) });
+    if (!list) return caps;
+    return { ...caps, tools: [...new Set([...list.tools, ...caps.tools])], ...(list.fixed?.length ? { fixedTools: list.fixed } : {}), ...(agent.provider === 'codex' ? { toolGroups: codexToolGroups() } : {}) };
+  }
+  private async readToolList(request: ToolListRequest) {
+    const runtime = await providerRuntime(request.provider);
+    if (!runtime) throw new Error('the CLI is no longer installed');
+    return readTools(request.provider, runtime.executable, { ...(request.model ? { model: request.model } : {}), version: this.host.version, signal: this.toolListStop.signal });
   }
   private framingFor(agent: Agent, room: Room, legacy: boolean): string {
     return roomFraming(agent, room, { connections: this.connections, caps: this.capsRecord(room), skillsIndex: this.wiring?.indexPath, legacy, unavailable: a => this.availabilityOf(a) });
@@ -654,6 +673,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   /** Connections, shared skills and agent capabilities, all rediscovered. */
   async refreshAll(): Promise<void> {
     this.caps.clear();
+    this.toolLists.retry();
     await Promise.all([this.refresh(true), this.refreshSkills()]);
     await this.refreshCapabilities();
   }
@@ -885,8 +905,9 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       case 'agentDisable': {
         const agent = agentOf(data.id), name = disableName(data.name);
         if (!agent || !name || !DISABLE_KINDS.includes(data.kind)) return;
-        const current = agent.options.disabled ?? {}, list = (current[data.kind as keyof typeof current] ?? []).filter(n => n !== name);
-        const next = normalizeDisabled({ ...current, [data.kind]: data.off === true ? [...list, name] : list });
+        // Codex turns some built-in tools off only together, so they go together here.
+        const group = data.kind === 'tools' && agent.provider === 'codex' ? codexToolGroup(name) : [name], caps = this.capsFor(agent);
+        const next = toggleDisabled(agent.options.disabled, data.kind, name, data.off === true, group, caps ? this.withToolList(agent, caps).tools : []);
         if (next) agent.options.disabled = next; else delete agent.options.disabled;
         this.changed(); break;
       }
@@ -1203,6 +1224,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     }
   }
   dispose(): Promise<void> {
+    this.toolListStop.abort();
     if (this.disposed) return this.disposed;
     this.engine.dispose();
     this.sandbox.dispose();

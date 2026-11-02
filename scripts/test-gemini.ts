@@ -18,6 +18,8 @@ const root = mkdtempSync(join(tmpdir(), 'chatroom gemini ')), workspace = join(r
 for (const dir of [workspace, home, join(home, '.gemini'), storage]) mkdirSync(dir, { recursive: true });
 // An empty home: the CLI sees no settings and no login of yours, only the API-key sign-in it saves after "gemini" asks.
 process.env.GEMINI_CLI_HOME = home; process.env.GEMINI_API_KEY = 'scripted-model-needs-no-key';
+// One step selects a Google login with none saved: nothing here may open a sign-in page.
+process.env.NO_BROWSER = 'true'; process.env.BROWSER = 'www-browser';
 const settingsFile = join(home, '.gemini', 'settings.json'), apiKeySettings = JSON.stringify({ security: { auth: { selectedType: 'gemini-api-key' } } });
 writeFileSync(settingsFile, apiKeySettings);
 

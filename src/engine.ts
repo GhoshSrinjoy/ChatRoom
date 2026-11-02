@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, TaskPreset, TeamStage, ToolCall, TurnFlags, TurnKind, TurnSink, Unavailable, addUsage, emptyUsage } from './types';
+import { ActivityItem, Agent, AgentCapabilities, ApprovalDecision, ApprovalInfo, ApprovalRequest, EditorSnapshot, Flow, Message, NativeDriver, NoticeFix, PermissionLevel, PlanStep, Provider, ProviderError, ProviderId, Room, TaskPreset, TeamStage, ToolCall, TurnFlags, TurnKind, TurnSink, Unavailable, addUsage, emptyUsage } from './types';
 import { MAX_PLAN_STEPS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TurnSpec, boundedHistory, classifyUnavailable, estimatedUsage, framingHash, leadAgent, legacyContext, legacySystem, message, overLimit, parsePlan, parseToolCall, pipelineLead, planStages, renderContext, renderEntry, roomFresh, roomUpdate, sandboxFinished, stageAgents, teamPlan, turnAsk, unavailableText, unseenEntries, upsertChangesCard } from './core';
 import { extractHandoffs, markerOf } from './commands';
 import { plainEditorText } from './editor-context';
@@ -120,7 +120,22 @@ export class RoomEngine {
     this.room.activity.push({ id: randomUUID(), text: text.slice(0, 1500), time: this.clock.now(), kind });
     this.room.activity = this.room.activity.slice(-150); this.changed();
   }
-  private notice(text: string): void { this.room.messages.push(message('notice', text, 'Chatroom')); this.changed(); }
+  /** A notice, with a button for each agent it names whose CLI needs installing, updating or a sign-in. */
+  private notice(text: string, about: Agent[] = []): void {
+    const entry = message('notice', text, 'Chatroom'), fixes = this.fixes(about);
+    if (fixes.length) entry.fixes = fixes;
+    this.room.messages.push(entry); this.changed();
+  }
+  private fixes(agents: Agent[]): NoticeFix[] {
+    const out: NoticeFix[] = [];
+    for (const agent of agents) {
+      const mark = this.unavailable(agent);
+      if ((mark?.reason !== 'missing' && mark?.reason !== 'signed-out') || !this.options.native(agent)) continue;
+      const update = mark.reason === 'missing' && /too old/.test(mark.detail) && agent.provider === 'gemini';
+      if (!out.some(f => f.provider === agent.provider && f.status === mark.reason)) out.push({ provider: agent.provider, status: mark.reason, ...(update ? { action: 'updateGemini' as const } : {}) });
+    }
+    return out;
+  }
   private state(id: string, status: NonNullable<Room['agentStates']>[string]['status'], detail?: string): void {
     (this.room.agentStates ??= {})[id] = detail ? { status, detail } : { status };
   }
@@ -185,17 +200,17 @@ export class RoomEngine {
       if (blocked.length) {
         this.log(`Skipping ${this.named(blocked)}`);
         this.notice(go.length ? `Skipping ${this.named(blocked)} · continuing with ${andList(go.map(a => a.name))}.`
-          : `${blocked.length === 1 ? `${blocked[0]!.name} can't run right now (${this.why(blocked[0]!)})` : `${this.named(blocked)} can't run right now`}. Mention another agent, or press Try again in its settings.`);
+          : `${blocked.length === 1 ? `${blocked[0]!.name} can't run right now (${this.why(blocked[0]!)})` : `${this.named(blocked)} can't run right now`}. Mention another agent, or press Try again in its settings.`, blocked);
       }
       this.queue = go.map(a => ({ id: a.id, kind: 'direct' }));
       return;
     }
     if (away.length) this.log(`Skipping ${this.named(away)}`);
-    if (!ready.length) { this.notice(`No agent can run right now: ${away.map(a => `${a.name} (${this.why(a)})`).join(', ')}.`); this.lastSkipKey = ''; return; }
+    if (!ready.length) { this.notice(`No agent can run right now: ${away.map(a => `${a.name} (${this.why(a)})`).join(', ')}.`, away); this.lastSkipKey = ''; return; }
     // The room's own team: its stages post their own skip notices.
     if (this.room.mode === 'pipeline' && this.room.team?.stages.length) { pass.pipeline = { index: 0, done: new Set() }; return; }
     const key = away.map(a => skipKey(a, this.unavailable(a)!)).sort().join('|');
-    if (key && key !== this.lastSkipKey) this.notice(`Skipping ${this.named(away)} · continuing with ${andList(ready.map(a => a.name))}.`);
+    if (key && key !== this.lastSkipKey) this.notice(`Skipping ${this.named(away)} · continuing with ${andList(ready.map(a => a.name))}.`, away);
     this.lastSkipKey = key;
     // A pipeline room without a team works like Team mode.
     if (this.room.mode === 'orchestrated' || this.room.mode === 'pipeline') {
@@ -317,7 +332,7 @@ export class RoomEngine {
     for (const { agentId, line } of found) {
       const target = enabled.find(a => a.id === agentId), key = `${author.id}>${agentId}>${line}`;
       if (!target || agentId === author.id || pass.keys.has(key)) continue;
-      if (!this.available(target)) { pass.keys.add(key); this.notice(`${author.name} asked ${target.name}, but ${target.name} can't run right now (${this.why(target)}).`); continue; }
+      if (!this.available(target)) { pass.keys.add(key); this.notice(`${author.name} asked ${target.name}, but ${target.name} can't run right now (${this.why(target)}).`, [target]); continue; }
       if (pass.hops >= Math.max(0, this.options.maxHandoffs())) {
         if (!pass.limitLogged) { pass.limitLogged = true; this.log('Hand-off limit reached'); }
         continue;
@@ -545,7 +560,7 @@ export class RoomEngine {
     if (!substituted && blocked.length && !runners.some(a => state.done.has(a.id))) {
       const sub = this.stageSubstitute(state.done, blocked);
       if (sub) {
-        this.notice(`${stage.name}: ${andList(blocked.map(a => a.name))} can't run right now (${reasons(blocked)}) · ${sub.name} takes this stage.`);
+        this.notice(`${stage.name}: ${andList(blocked.map(a => a.name))} can't run right now (${reasons(blocked)}) · ${sub.name} takes this stage.`, blocked);
         if (this.halted()) return 'paused';
         if (this.capHit()) return 'end';
         await runOne(sub, this.room, [], blocked.map(a => a.name));
@@ -1003,7 +1018,7 @@ export class RoomEngine {
     agent.unavailable = mark; this.blocked.add(answer);
     const text = unavailableText(mark, this.clock.now());
     this.state(agent.id, 'unavailable', text);
-    this.notice(`${agent.name} can't run right now (${text}) · continuing without it.`);
+    this.notice(`${agent.name} can't run right now (${text}) · continuing without it.`, [agent]);
     // This notice already covers the next pass's skip.
     this.lastSkipKey = [...this.lastSkipKey.split('|').filter(k => k && !k.startsWith(`${agent.id}:`)), skipKey(agent, mark)].sort().join('|');
   }
