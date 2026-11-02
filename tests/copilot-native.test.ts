@@ -60,6 +60,18 @@ test('copilotArgs: ACP flags, shared skill dirs, extra dirs and option switches'
   assert.equal(simpleDiff('a\nold\nz', 'a\nnew\nz'), '-old\n+new');
 });
 
+test('what is turned off: tools and servers become flags, and a server Chatroom passes is left out of the session', async () => {
+  const settings = { allowFullAccess: false, idleSessionMs: 1000, copilotUseEnvToken: false, sharedMcpServers: {} };
+  const off = testAgent('copilot', { options: { disabled: { tools: ['web_fetch', 'shell'], mcpServers: ['chatroom', 'github-mcp'] } } as any });
+  const args = copilotArgs(off, undefined, settings);
+  for (const flag of ['--excluded-tools=web_fetch', '--excluded-tools=shell', '--disable-mcp-server=chatroom', '--disable-mcp-server=github-mcp']) assert.ok(args.includes(flag), flag);
+  const { driver, agent, room, peers } = setup(undefined, { agent: { options: { disabled: { mcpServers: ['chatroom'] } } as any } });
+  const caps = await driver.capabilities(room, agent);
+  assert.deepEqual(method(peers[0]!, 'session/new')[0]!.params.mcpServers, []);
+  assert.deepEqual(caps.canDisable, { tools: true, toolsByName: true, skills: false, mcpServers: true, commands: true }, 'no switch for one skill, so none is offered');
+  await driver.dispose();
+});
+
 test('first turn: initialize, session/new with the room MCP endpoint, framing, context, editor blocks and ask; second turn reuses the session', async () => {
   const saved = process.env.GH_TOKEN; process.env.GH_TOKEN = 'ghp_classic';
   const { driver, agent, room, peers, children, host } = setup();

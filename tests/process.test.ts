@@ -145,3 +145,22 @@ test('resolveCli finds the native Copilot executable behind an npm shim', async 
 test('killTree ignores processes that are already gone', async () => {
   await killTree(2 ** 22 + 99);
 });
+
+test('resolveCli finds the Gemini CLI behind an npm shim, in the current and the older package layout', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'chatroom-gemini-'));
+  try {
+    const shim = join(dir, process.platform === 'win32' ? 'gemini.cmd' : 'gemini');
+    await writeFile(shim, '@ECHO off\r\nnode "%~dp0\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js" %*\r\n');
+    const pkg = join(dir, 'node_modules', '@google', 'gemini-cli');
+    await mkdir(join(pkg, 'dist'), { recursive: true }); await writeFile(join(pkg, 'dist', 'index.js'), '');
+    assert.deepEqual(resolveCli(shim, 'gemini'), { command: process.execPath, prefix: [join(pkg, 'dist', 'index.js')] });
+    await mkdir(join(pkg, 'bundle'), { recursive: true }); await writeFile(join(pkg, 'bundle', 'gemini.js'), '');
+    assert.deepEqual(resolveCli(shim, 'gemini'), { command: process.execPath, prefix: [join(pkg, 'bundle', 'gemini.js')] });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('childEnv: the Gemini CLI does not relaunch itself; other CLIs are not told', () => {
+  const exe = { command: 'gemini.exe', prefix: [] };
+  assert.equal(childEnv(exe, 'gemini').GEMINI_CLI_NO_RELAUNCH, 'true');
+  assert.equal(childEnv(exe, 'claude').GEMINI_CLI_NO_RELAUNCH, undefined);
+});

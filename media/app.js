@@ -12,6 +12,10 @@
   // Sandbox: when Start Docker Desktop was pressed, and recent run/cancel clicks (a double click sends once).
   let dockerStarting = 0;
   const recentClicks = new Map();
+  // Conversation picker: whether its list is open, and the room whose delete is waiting for a confirmation.
+  let roomsOpen = false, roomConfirm = '';
+  // Tools tab: which capability lists show every item.
+  const CAPS_SHOWN = 24, capsOpen = new Set();
   const ultraConfirmed = saved.ultraConfirmed || {}, openState = new Map(), nodes = new Map(), capsAsked = {};
   const menu = { open: false, kind: '', query: '', start: 0, end: 0, items: [], index: 0 };
   const $ = id => document.getElementById(id);
@@ -22,6 +26,7 @@
   const clock = at => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   const icons = {
     logo: '<svg viewBox="0 0 32 32" fill="none"><path d="M6 5h15a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3h-9l-6 5v-5a3 3 0 0 1-3-3V8a3 3 0 0 1 3-3Z" stroke="currentColor" stroke-width="1.8"/><path d="M25 10h1a3 3 0 0 1 3 3v13l-5-4" stroke="currentColor" stroke-width="1.8"/><circle cx="9" cy="13" r="1.3" fill="currentColor"/><circle cx="14" cy="13" r="1.3" fill="currentColor"/><circle cx="19" cy="13" r="1.3" fill="currentColor"/></svg>',
+    trash: '<path d="M4 7h16M9.5 7V4h5v3M6.5 7l1 13h9l1-13M10 11v5.5M14 11v5.5"/>',
     plus: '<path d="M12 5v14M5 12h14"/>', arrow: '<path d="m7 17 10-10M7 7h10v10"/>',
     send: '<path d="m5 12 7-7 7 7M12 5v15"/>', pause: '<path d="M8 5v14M16 5v14"/>',
     stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>', play: '<path d="m8 5 11 7-11 7Z"/>',
@@ -62,14 +67,15 @@
     globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.5 3.5 5.3 3.5 8.5s-1.1 6-3.5 8.5c-2.4-2.5-3.5-5.3-3.5-8.5s1.1-6 3.5-8.5Z"/>'
   };
   const icon = name => name === 'logo' ? icons.logo : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.grid}</svg>`;
-  // Provider glyphs. Copilot (copilot-16) and Ollama (cpu-16) are Primer Octicons, MIT (see ThirdPartyNotices.txt); Codex and Claude are drawn here.
+  // Provider glyphs. Copilot (copilot-16) and Ollama (cpu-16) are Primer Octicons, MIT (see ThirdPartyNotices.txt); Codex, Claude and Gemini are drawn here.
   const GLYPHS = {
     codex: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.6 12.5A2.6 2.6 0 1 1 5.2 7.37A3.4 3.4 0 1 1 11.98 7.7A2.4 2.4 0 1 1 12 12.5Z"/><path d="M6.3 8.3l1.5 1.4-1.5 1.4M9.1 11.1h2"/></svg>',
     claude: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M8 5.9L8 1.4M9.05 6.18L10.4 3.84M9.82 6.95L13.72 4.7M10.1 8L12.8 8M9.82 9.05L13.72 11.3M9.05 9.82L10.4 12.16M8 10.1L8 14.6M6.95 9.82L5.6 12.16M6.18 9.05L2.28 11.3M5.9 8L3.2 8M6.18 6.95L2.28 4.7M6.95 6.18L5.6 3.84"/></svg>',
     copilot: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M7.998 15.035c-4.562 0-7.873-2.914-7.998-3.749V9.338c.085-.628.677-1.686 1.588-2.065.013-.07.024-.143.036-.218.029-.183.06-.384.126-.612-.201-.508-.254-1.084-.254-1.656 0-.87.128-1.769.693-2.484.579-.733 1.494-1.124 2.724-1.261 1.206-.134 2.262.034 2.944.765.05.053.096.108.139.165.044-.057.094-.112.143-.165.682-.731 1.738-.899 2.944-.765 1.23.137 2.145.528 2.724 1.261.566.715.693 1.614.693 2.484 0 .572-.053 1.148-.254 1.656.066.228.098.429.126.612.012.076.024.148.037.218.924.385 1.522 1.471 1.591 2.095v1.872c0 .766-3.351 3.795-8.002 3.795Zm0-1.485c2.28 0 4.584-1.11 5.002-1.433V7.862l-.023-.116c-.49.21-1.075.291-1.727.291-1.146 0-2.059-.327-2.71-.991A3.222 3.222 0 0 1 8 6.303a3.24 3.24 0 0 1-.544.743c-.65.664-1.563.991-2.71.991-.652 0-1.236-.081-1.727-.291l-.023.116v4.255c.419.323 2.722 1.433 5.002 1.433ZM6.762 2.83c-.193-.206-.637-.413-1.682-.297-1.019.113-1.479.404-1.713.7-.247.312-.369.789-.369 1.554 0 .793.129 1.171.308 1.371.162.181.519.379 1.442.379.853 0 1.339-.235 1.638-.54.315-.322.527-.827.617-1.553.117-.935-.037-1.395-.241-1.614Zm4.155-.297c-1.044-.116-1.488.091-1.681.297-.204.219-.359.679-.242 1.614.091.726.303 1.231.618 1.553.299.305.784.54 1.638.54.922 0 1.28-.198 1.442-.379.179-.2.308-.578.308-1.371 0-.765-.123-1.242-.37-1.554-.233-.296-.693-.587-1.713-.7Z"/><path d="M6.25 9.037a.75.75 0 0 1 .75.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 .75-.75Zm4.25.75v1.501a.75.75 0 0 1-1.5 0V9.787a.75.75 0 0 1 1.5 0Z"/></svg>',
+    gemini: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1c.45 3.75 3.25 6.55 7 7-3.75.45-6.55 3.25-7 7-.45-3.75-3.25-6.55-7-7 3.75-.45 6.55-3.25 7-7Z"/></svg>',
     ollama: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.5.75V2h3V.75a.75.75 0 0 1 1.5 0V2h1.25c.966 0 1.75.784 1.75 1.75V5h1.25a.75.75 0 0 1 0 1.5H14v3h1.25a.75.75 0 0 1 0 1.5H14v1.25A1.75 1.75 0 0 1 12.25 14H11v1.25a.75.75 0 0 1-1.5 0V14h-3v1.25a.75.75 0 0 1-1.5 0V14H3.75A1.75 1.75 0 0 1 2 12.25V11H.75a.75.75 0 0 1 0-1.5H2v-3H.75a.75.75 0 0 1 0-1.5H2V3.75C2 2.784 2.784 2 3.75 2H5V.75a.75.75 0 0 1 1.5 0Zm5.75 11.75a.25.25 0 0 0 .25-.25v-8.5a.25.25 0 0 0-.25-.25h-8.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25ZM5.75 5h4.5a.75.75 0 0 1 .75.75v4.5a.75.75 0 0 1-.75.75h-4.5a.75.75 0 0 1-.75-.75v-4.5A.75.75 0 0 1 5.75 5Zm.75 4.5h3v-3h-3Z"/></svg>'
   };
-  const names = { codex: 'Codex', claude: 'Claude Code', copilot: 'GitHub Copilot', ollama: 'Ollama' };
+  const names = { codex: 'Codex', claude: 'Claude Code', copilot: 'GitHub Copilot', gemini: 'Gemini CLI', ollama: 'Ollama' };
   const toolLabels = { list_files: 'List files', read_file: 'Read files', search_files: 'Search text', search_documents: 'Search documents', ollama_ocr: 'Local OCR', semantic_search: 'Semantic search' };
   const toolDescriptions = { list_files: 'Find files in the workspace', read_file: 'Read files; PDFs, Word files and images are converted to text automatically', search_files: 'Find exact text across files', search_documents: 'Find passages in the documents attached to this room', ollama_ocr: 'Read images with a local vision model', semantic_search: 'Find relevant code with local embeddings' };
   const ROOM_TOOLS = [
@@ -97,13 +103,14 @@
   const SUPPORT = {
     claude: { thinking: true, summary: false, sandbox: false, webSearch: true, useMcp: true, useSkills: true, useProjectSettings: true, extraDirs: true, ultraSession: false, ultraTurn: false, thinkHard: true, fullAccess: true, customAgent: true },
     codex: { thinking: false, summary: true, sandbox: true, webSearch: true, useMcp: true, useSkills: false, useProjectSettings: true, extraDirs: true, ultraSession: false, ultraTurn: false, thinkHard: true, fullAccess: true, customAgent: false },
-    copilot: { thinking: false, summary: false, sandbox: false, webSearch: false, useMcp: true, useSkills: false, useProjectSettings: true, extraDirs: true, ultraSession: false, ultraTurn: true, thinkHard: false, fullAccess: true, customAgent: true }
+    copilot: { thinking: false, summary: false, sandbox: false, webSearch: false, useMcp: true, useSkills: false, useProjectSettings: true, extraDirs: true, ultraSession: false, ultraTurn: true, thinkHard: false, fullAccess: true, customAgent: true },
+    gemini: { thinking: false, summary: false, sandbox: false, webSearch: true, useMcp: true, useSkills: true, useProjectSettings: false, extraDirs: true, ultraSession: false, ultraTurn: false, thinkHard: false, fullAccess: true, customAgent: false }
   };
   const THINK_TITLE = 'Think harder on this message (Claude: ultrathink · Codex: one effort level higher · Copilot: higher reasoning effort)';
   const ULTRA_TEXT = 'Ultra lets each agent orchestrate its own sub-agents (Claude ultracode, Codex Ultra effort, Copilot fleet). It can use many times more tokens. Turn it on for this message?';
   $('app').innerHTML = `
     <header class="topbar"><div class="brand"><span class="brandmark">${icon('logo')}</span>Chatroom</div><div class="top-actions"><span id="workspace" class="workspace-label"></span><button class="icon-button" data-action="refresh" title="Refresh connections and models" aria-label="Refresh connections">${icon('refresh')}</button><button class="icon-button" data-action="open" title="Open in editor" aria-label="Open in editor">${icon('arrow')}</button><button class="icon-button" data-action="defaults" title="Models and defaults" aria-label="Settings">${icon('settings')}</button></div></header>
-    <div class="room-bar"><div class="room-picker"><select id="rooms" aria-label="Conversation"></select><button class="icon-button small" data-action="new" aria-label="New room" title="New room">${icon('plus')}</button></div><div class="room-bar-right"><span id="room-status" class="status-label"></span><button class="icon-button small inspector-toggle" data-action="inspector" aria-label="Usage, tools and activity" title="Usage, tools and activity">${icon('grid')}</button><button class="icon-button small" data-action="export" aria-label="Export conversation" title="Export conversation">${icon('export')}</button></div></div>
+    <div class="room-bar"><div class="room-picker"><button type="button" id="rooms" class="room-current" aria-label="Conversations" aria-haspopup="true" aria-expanded="false" aria-controls="rooms-menu"><span id="room-current-title" class="room-current-title"></span>${icon('down')}</button><ul id="rooms-menu" class="rooms-menu" aria-label="Conversations" hidden></ul><button class="icon-button small" data-action="new" aria-label="New room" title="New room">${icon('plus')}</button></div><div class="room-bar-right"><span id="room-status" class="status-label"></span><button class="icon-button small inspector-toggle" data-action="inspector" aria-label="Usage, tools and activity" title="Usage, tools and activity">${icon('grid')}</button><button class="icon-button small" data-action="export" aria-label="Export conversation" title="Export conversation">${icon('export')}</button></div></div>
     <main class="workspace">
       <nav id="team-strip" class="team-strip" role="toolbar" aria-label="Agents in this room"><div id="team-pills" class="team-pills"></div><button class="icon-button small" data-action="add" aria-label="Add agent" title="Add an agent">${icon('plus')}</button><button class="icon-button small" data-action="room-setup" aria-label="Room setup" title="Room setup: who is in the room, who leads, and how they work together">${icon('settings')}</button></nav>
       <section class="conversation"><div class="conversation-heading"><h1 id="conversation-title"></h1><span id="turns" class="turn-count"></span></div><div id="messages" class="messages" role="log" aria-label="Room conversation" aria-live="polite"></div>
@@ -135,12 +142,12 @@
   const effortLabel = e => effortLabels[e] || e;
   const quoteName = name => /\s/.test(name) ? `@"${name}"` : '@' + name;
   function isNative(a) {
-    if (a.provider === 'claude' || a.provider === 'codex') return true;
+    if (a.provider === 'claude' || a.provider === 'codex' || a.provider === 'gemini') return true;
     if (a.provider !== 'copilot' || a.options?.copilotRuntime === 'vscode-lm') return false;
     const c = caps(a); return c ? c.runtime === 'cli' : conn(a)?.runtime === 'cli';
   }
   function supports(a, key) { if (!isNative(a)) return false; const s = caps(a)?.supports; return s ? !!s[key] : !!SUPPORT[a.provider]?.[key]; }
-  function runtimeLabel(a) { return a.provider === 'claude' ? 'Claude Code' : a.provider === 'codex' ? 'Codex CLI' : a.provider === 'copilot' ? (isNative(a) ? 'GitHub Copilot CLI' : 'GitHub Copilot (VS Code chat model)') : 'Ollama (local model)'; }
+  function runtimeLabel(a) { return a.provider === 'claude' ? 'Claude Code' : a.provider === 'codex' ? 'Codex CLI' : a.provider === 'gemini' ? 'Gemini CLI' : a.provider === 'copilot' ? (isNative(a) ? 'GitHub Copilot CLI' : 'GitHub Copilot (VS Code chat model)') : 'Ollama (local model)'; }
   function modelsOf(a) { const list = caps(a)?.models; return list?.length ? list : conn(a)?.models || []; }
   function modelInfo(a, id) { const all = [...(caps(a)?.models || []), ...(conn(a)?.models || [])]; return id ? all.find(m => m.id === id) : all.find(m => m.isDefault); }
   function modelName(a) { return a.model ? modelInfo(a, a.model)?.name || a.model : 'default'; }
@@ -166,9 +173,9 @@
     return d.toLocaleString('en', { weekday: 'short', ...hm });
   }
   function unavailLabel(u) {
-    return ({ 'usage-limit': u.until ? `Out of usage · back ${untilText(u.until)}` : 'Out of usage', missing: 'Not installed', 'signed-out': 'Signed out', model: `Model ${u.model || 'default'} unavailable`, offline: 'Not running' })[u.reason] || 'Unavailable';
+    return ({ 'usage-limit': u.until ? `Out of usage · back ${untilText(u.until)}` : 'Out of usage', missing: /too old/.test(u.detail || '') ? 'Update needed' : 'Not installed', 'signed-out': 'Signed out', model: `Model ${u.model || 'default'} unavailable`, offline: 'Not running' })[u.reason] || 'Unavailable';
   }
-  function unavailShort(u) { return ({ 'usage-limit': u.until ? 'back ' + untilText(u.until, true) : 'out of usage', missing: 'not installed', 'signed-out': 'signed out', model: 'no model', offline: 'offline' })[u.reason] || 'unavailable'; }
+  function unavailShort(u) { return ({ 'usage-limit': u.until ? 'back ' + untilText(u.until, true) : 'out of usage', missing: /too old/.test(u.detail || '') ? 'needs update' : 'not installed', 'signed-out': 'signed out', model: 'no model', offline: 'offline' })[u.reason] || 'unavailable'; }
   const unavailIcon = u => u.reason === 'usage-limit' || u.reason === 'offline' ? 'clock' : 'ban';
   function unavailNote(a, modelHint) {
     const u = unavailOf(a); if (!u) return '';
@@ -219,12 +226,11 @@
     if (!state) return;
     const r = state.room, running = busy();
     r.loop = { ...DEFAULT_LOOP, ...(r.loop || {}) };
-    if (lastRoom !== r.id) { lastRoom = r.id; nearBottom = true; nodes.clear(); think = false; ultra = false; keepDraft = undefined; closePopover(); }
+    if (lastRoom !== r.id) { lastRoom = r.id; nearBottom = true; nodes.clear(); think = false; ultra = false; keepDraft = undefined; roomConfirm = ''; closePopover(); }
     if (droppedKey && state.editor?.key !== droppedKey) droppedKey = '';
     if (lastSent && r.messages.some(m => m.kind === 'user' && m.text === lastSent.text && m.createdAt >= lastSent.at - 5000)) lastSent = undefined;
     $('workspace').textContent = state.workspace || '';
-    setHtml($('rooms'), state.rooms.map(x => `<option value="${esc(x.id)}" ${x.id === r.id ? 'selected' : ''}>${esc(x.title)}</option>`).join(''));
-    $('rooms').disabled = running;
+    renderRooms();
     $('room-status').textContent = running ? 'Conversation in progress' : r.status === 'paused' ? 'Conversation paused' : 'Ready when you are';
     $('room-status').className = `status-label ${r.status}`;
     $('conversation-title').textContent = r.title;
@@ -239,6 +245,40 @@
     renderMessages(); renderPopover(); renderInspector(); refreshDialog();
     if (menu.open) openMenu(menu.kind, menu.query, menu.start, menu.end, false);
   }
+  // The conversation picker. It stays out of the way while a run is going, like switching rooms does.
+  function renderRooms() {
+    const r = state.room, button = $('rooms'), running = busy();
+    if (running) { roomsOpen = false; roomConfirm = ''; }
+    $('room-current-title').textContent = r.title;
+    button.title = r.title; button.disabled = running; button.setAttribute('aria-expanded', String(roomsOpen));
+    $('rooms-menu').hidden = !roomsOpen;
+    setHtml($('rooms-menu'), state.rooms.map(roomRow).join(''));
+  }
+  function roomRow(x) {
+    const current = x.id === state.room.id;
+    // Cancel sits where the delete icon was, so a double click on the icon never deletes.
+    if (roomConfirm === x.id) return `<li class="room-row confirm"><span class="room-confirm-text">Delete "${esc(clip(x.title, 60))}"?${x.changes ? ' Its unapplied changes stay on a branch.' : ''}</span><button type="button" class="text-button danger" data-room-delete-yes="${esc(x.id)}">Delete</button><button type="button" class="text-button" data-room-delete-no="${esc(x.id)}">Cancel</button></li>`;
+    return `<li class="room-row${current ? ' current' : ''}"><button type="button" class="room-open" data-room-open="${esc(x.id)}"${current ? ' aria-current="true"' : ''} title="${esc(x.title)}">${esc(x.title)}</button><button type="button" class="room-delete" data-room-delete="${esc(x.id)}" aria-label="Delete chat: ${esc(x.title)}" title="Delete this chat">${icon('trash')}</button></li>`;
+  }
+  function setRoomsOpen(open, restoreFocus) {
+    roomsOpen = open; if (!open) roomConfirm = '';
+    renderRooms();
+    if (open) document.querySelector('.room-row.current .room-open')?.focus();
+    else if (restoreFocus) $('rooms').focus();
+  }
+  function moveRoomFocus(step) {
+    const list = [...document.querySelectorAll('.room-open')], at = list.indexOf(document.activeElement);
+    if (list.length) list[at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length].focus();
+  }
+  // A chat with nothing in it has nothing to lose, so it goes at once; any other asks first, because deleting can't be undone.
+  function askDeleteRoom(id) {
+    const x = state.rooms.find(room => room.id === id);
+    if (!x) return;
+    if (x.messages === 0 && !x.changes) { deleteRoom(id); return; }
+    roomConfirm = id; renderRooms();
+    document.querySelector(`[data-room-delete-no="${CSS.escape(id)}"]`)?.focus();
+  }
+  function deleteRoom(id) { roomConfirm = ''; send('deleteRoom', { id }); renderRooms(); $('rooms').focus(); }
   function statusOf(a) {
     if (!a.enabled) return 'off';
     const r = state.room, s = r.agentStates?.[a.id]?.status, u = unavailOf(a);
@@ -389,6 +429,8 @@
     div.className = 'notice-line'; div.dataset.id = m.id; span.textContent = m.text; div.append(span);
     const action = /npm i(?:nstall)? -g @github\/copilot/.test(m.text) ? 'install' : /copilot login/.test(m.text) ? 'login' : '';
     if (action) { const b = document.createElement('button'); b.type = 'button'; b.className = 'outline-button inline'; b.dataset.copilot = action; b.textContent = action === 'install' ? 'Install Copilot CLI' : 'Sign in to Copilot'; div.append(b); }
+    const gemini = /npm i(?:nstall)? -g @google\/gemini-cli/.test(m.text) ? 'install' : /run "gemini" in a terminal/.test(m.text) ? 'login' : '';
+    if (gemini) { const b = document.createElement('button'); b.type = 'button'; b.className = 'outline-button inline'; b.dataset.gemini = gemini; b.textContent = gemini === 'install' ? 'Install or update Gemini CLI' : 'Sign in to Gemini'; div.append(b); }
     return div;
   }
   // The room's combined worktree changes. Only the latest card has buttons; the host keeps it up to date.
@@ -869,7 +911,7 @@
     const ranked = list => list.map(c => [c, rank(c)]).filter(([, r]) => r >= 0).sort((x, y) => x[1] - y[1]);
     for (const [c, r] of ranked((state.roomCommands || []).filter(c => !mentioned.length || c.agentScoped))) items.push({ group: 'Chatroom', insert: `/${c.name} `, name: '/' + c.name, hint: c.args || '', desc: c.description, agent: '', rank: r });
     for (const a of (mentioned.length ? mentioned : enabledAgents()).filter(isNative)) {
-      const list = ranked(caps(a)?.commands || []), group = `${a.name} · ${runtimeLabel(a)}` + (list.length > limit ? ` · ${limit} of ${list.length}, type to filter` : '');
+      const list = ranked((caps(a)?.commands || []).filter(c => !commandOff(a, c.name))), group = `${a.name} · ${runtimeLabel(a)}` + (list.length > limit ? ` · ${limit} of ${list.length}, type to filter` : '');
       for (const [c, r] of list.slice(0, limit)) items.push({ group, insert: `/${c.name} `, name: '/' + c.name, hint: c.argumentHint || '', desc: c.description || (c.source === 'skill' ? 'Skill' : ''), agent: a.id, rank: r });
     }
     return items;
@@ -1078,7 +1120,7 @@
       + `<div class="section-heading setup-heading">TEAMS <span class="subtle">saved right away</span></div><div id="defaults-teams" class="team-list">${teamListHtml()}</div><button type="button" class="outline-button" data-team-open="new">${icon('plus')} New team…</button><div class="dialog-actions"><button type="button" class="text-button" data-action="settings">VS Code settings</button><button type="submit" class="primary-button">Save defaults</button></div></form>`, 'defaults');
   }
   function addAgent() {
-    const hints = { codex: 'Codex CLI with its own tools and sessions', claude: 'Claude Code with its own tools, skills and sessions', copilot: 'Copilot CLI, or models available in VS Code', ollama: 'Local & cloud models' };
+    const hints = { codex: 'Codex CLI with its own tools and sessions', claude: 'Claude Code with its own tools, skills and sessions', copilot: 'Copilot CLI, or models available in VS Code', gemini: 'Gemini CLI with its own tools, skills and sessions', ollama: 'Local & cloud models' };
     openDialog(`<div class="dialog-heading"><div><h2 id="dialog-title">Another perspective.</h2><p>Add an agent to the room.</p></div><button class="icon-button" data-action="close-dialog" aria-label="Close">${icon('close')}</button></div><div class="provider-grid">${Object.keys(names).map(p => `<button data-provider="${p}">${avatar({ provider: p })}<span><strong>${names[p]}</strong><small>${hints[p]}</small></span>${icon('plus')}</button>`).join('')}</div><p class="fine-print">You can add several agents from the same client, each with its own model, effort, permissions and focus.</p>`, 'add');
   }
 
@@ -1224,9 +1266,34 @@
   }
   const capChips = (list, label = x => x, title = () => '') => list.length ? list.slice(0, 24).map(x => `<span class="cap-chip" title="${esc(title(x))}">${esc(label(x))}</span>`).join('') + (list.length > 24 ? `<span class="cap-chip more">+${list.length - 24} more</span>` : '') : '<span class="subtle">None</span>';
   const mcpDot = status => /^(ready|connected|ok|running)$/i.test(status) ? 'ready' : /fail|error/i.test(status) ? 'error' : 'unchecked';
+  const offNames = (a, kind) => opts(a).disabled?.[kind] || [];
+  const namedAs = lower => n => n.toLowerCase() === lower;
+  function commandOff(a, name) { const same = namedAs(String(name).toLowerCase()); return offNames(a, 'commands').some(same) || offNames(a, 'skills').some(same); }
+  // One list of what an agent has. What is turned off stays listed, even once the CLI stops reporting it, so it can be turned on again.
+  function capRow(a, kind, label, items, empty = 'None') {
+    const can = !!caps(a)?.canDisable?.[kind], isOff = name => kind === 'commands' ? commandOff(a, name) : offNames(a, kind).includes(name);
+    const listed = new Set(items.map(x => x.name)), gone = offNames(a, kind).filter(name => !listed.has(name)).map(name => ({ name, text: kind === 'commands' ? '/' + name : name }));
+    const all = [...items, ...gone], key = `${a.id}:${kind}`, open = capsOpen.has(key), more = all.length - CAPS_SHOWN, off = all.filter(x => isOff(x.name)).length;
+    const chip = x => {
+      const body = (x.dot ? `<span class="connection-dot ${x.dot}"></span>` : '') + esc(x.text) + (x.count !== undefined ? ` · ${x.count}` : '');
+      if (!can) return `<span class="cap-chip" title="${esc(x.title || '')}">${body}</span>`;
+      const down = isOff(x.name), same = namedAs(x.name.toLowerCase());
+      // A command that is off through its skill is turned on through the skill.
+      const target = kind === 'commands' && down && !offNames(a, 'commands').some(same) ? 'skills' : kind, stored = offNames(a, target).find(same) ?? x.name;
+      const how = kind === 'commands' ? (down ? 'Turned off: Chatroom does not offer it. Click to turn it on' : 'Click to stop offering this command') : down ? 'Turned off. Click to turn it on' : 'Click to turn it off';
+      return `<button type="button" class="cap-chip toggle${down ? ' off' : ''}" aria-pressed="${!down}" data-cap="${esc(JSON.stringify([a.id, target, stored]))}" title="${esc([x.title, `${how} for ${a.name}`].filter(Boolean).join(' · '))}">${body}</button>`;
+    };
+    const toggle = more > 0 ? `<button type="button" class="cap-chip more" data-caps-more="${esc(key)}" aria-expanded="${open}">${open ? 'Show fewer' : `+${more} more`}</button>` : '';
+    const example = { claude: 'WebFetch', copilot: 'web_fetch', gemini: 'web_fetch' }[a.provider];
+    const add = kind === 'tools' && caps(a)?.canDisable?.toolsByName ? `<form class="cap-add" data-cap-add="${esc(a.id)}"><input maxlength="200" autocomplete="off" spellcheck="false" aria-label="Turn off a tool of ${esc(a.name)} by name" placeholder="Turn off a tool by name${example ? `, e.g. ${example}` : ''}"><button type="submit" class="outline-button inline">Turn off</button></form>` : '';
+    return `<div class="caps-row"><span class="caps-label">${esc(label)} (${all.length}${off ? ` · ${off} off` : ''})</span><div class="cap-list">${(open ? all : all.slice(0, CAPS_SHOWN)).map(chip).join('') || `<span class="subtle">${esc(empty)}</span>`}${toggle}</div>${add}</div>`;
+  }
   function hintButtons(action, provider, status) {
     if (action === 'copilotLogin' || (provider === 'copilot' && status === 'signed-out')) return '<button type="button" class="outline-button inline" data-copilot="login">Sign in to Copilot</button>';
     if (action === 'installCopilot' || (provider === 'copilot' && status === 'missing')) return '<button type="button" class="outline-button inline" data-copilot="install">Install Copilot CLI</button>';
+    if (action === 'geminiLogin' || (provider === 'gemini' && status === 'signed-out')) return '<button type="button" class="outline-button inline" data-gemini="login">Sign in to Gemini</button>';
+    if (action === 'updateGemini') return '<button type="button" class="outline-button inline" data-gemini="install">Update Gemini CLI</button>';
+    if (action === 'installGemini' || (provider === 'gemini' && status === 'missing')) return '<button type="button" class="outline-button inline" data-gemini="install">Install Gemini CLI</button>';
     if (action === 'openSettings') return '<button type="button" class="outline-button inline" data-action="settings">Open Settings</button>';
     return '';
   }
@@ -1241,7 +1308,13 @@
     }
     if (!c) return `<div class="caps-card">${head}<p class="fine-print">Tools, skills and commands load when the agent connects. Refresh to check now.</p></div>`;
     if (problem) return `<div class="caps-card">${head}${problem}</div>`;
-    return `<div class="caps-card">${head}${problem}<div class="caps-row"><span class="caps-label">Tools (${c.tools.length})</span><div class="cap-list">${c.tools.length ? capChips(c.tools) : '<span class="subtle">Listed after the first turn</span>'}</div></div><div class="caps-row"><span class="caps-label">Skills (${c.skills.length})</span><div class="cap-list">${capChips(c.skills, s => s.name, s => s.description || '')}</div></div><div class="caps-row"><span class="caps-label">MCP servers (${c.mcpServers.length})</span><div class="cap-list">${c.mcpServers.length ? c.mcpServers.slice(0, 24).map(s => `<span class="cap-chip" title="${esc(s.status)}"><span class="connection-dot ${mcpDot(s.status)}"></span>${esc(s.name)}${s.tools !== undefined ? ` · ${s.tools}` : ''}</span>`).join('') : '<span class="subtle">None</span>'}</div></div><div class="caps-row"><span class="caps-label">Commands (${c.commands.length})</span><div class="cap-list">${capChips(c.commands, x => '/' + x.name, x => x.description || '')}</div></div></div>`;
+    const noTools = a.provider === 'claude' ? 'Listed after the first turn' : a.provider === 'codex' ? 'Codex lists only MCP tools, and has none connected' : 'This CLI does not list its tools';
+    return `<div class="caps-card">${head}${problem}`
+      + capRow(a, 'tools', 'Tools', c.tools.map(name => ({ name, text: name })), noTools)
+      + capRow(a, 'skills', 'Skills', c.skills.map(s => ({ name: s.name, text: s.name, title: s.description })))
+      + capRow(a, 'mcpServers', 'MCP servers', c.mcpServers.map(s => ({ name: s.name, text: s.name, title: s.status, dot: mcpDot(s.status), count: s.tools })))
+      + capRow(a, 'commands', 'Commands', c.commands.map(x => ({ name: x.name, text: '/' + x.name, title: x.description })))
+      + (c.canDisable ? '<p class="fine-print caps-note">Click an item to turn it off for this agent. It applies from its next turn.</p>' : '') + '</div>';
   }
   function toolsTab() {
     const r = state.room, running = busy(), docs = r.documents || [], skills = state.sharedSkills || [], ollama = state.connections.find(c => c.id === 'ollama');
@@ -1250,7 +1323,7 @@
     const glyphs = s => (s.nativeTo || []).map(p => avatar({ provider: p }, 'micro')).join('');
     return `<div class="inspector-section"><div class="section-heading">AGENTS <span class="count">${r.agents.length}</span></div>${r.agents.map(capsCard).join('') || '<p class="muted">No agents in this room.</p>'}</div>`
       + worktreesSection() + sandboxSection()
-      + `<div class="inspector-section"><div class="section-heading">SHARED WITH THE ROOM</div><label class="switch-row"><span><strong>Share skills between agents</strong><small>Claude Code, Codex and Copilot can use each other's skills.</small></span><span class="switch"><input type="checkbox" id="share-skills" role="switch" aria-label="Share skills between agents" ${r.shareSkills !== false ? 'checked' : ''}${running ? ' disabled' : ''}></span></label>${skills.slice(0, 60).map(s => `<div class="skill-row"><div class="skill-head"><strong>${esc(s.name)}</strong><span class="subtle">${esc(s.source)}</span><span class="native-to" title="Native to ${esc((s.nativeTo || []).map(p => names[p]).join(', '))}">${glyphs(s)}</span></div><p>${esc(s.description)}</p></div>`).join('')}${skills.length > 60 ? `<p class="fine-print">+${skills.length - 60} more skills</p>` : skills.length ? '' : '<p class="fine-print">No skills found in .claude, .agents, .codex, .github or .copilot folders.</p>'}<div class="section-heading sub-heading">ROOM TOOLS</div>${ROOM_TOOLS.map(([name, label, iconName, description]) => `<div class="tool-row"><span class="tool-symbol">${icon(iconName)}</span><div><strong>${label}</strong><small>${esc(description)}</small><small>available to every native agent${needs[name] || ''}</small></div></div>`).join('')}</div>`
+      + `<div class="inspector-section"><div class="section-heading">SHARED WITH THE ROOM</div><label class="switch-row"><span><strong>Share skills between agents</strong><small>Claude Code, Codex, Copilot and Gemini can use each other's skills.</small></span><span class="switch"><input type="checkbox" id="share-skills" role="switch" aria-label="Share skills between agents" ${r.shareSkills !== false ? 'checked' : ''}${running ? ' disabled' : ''}></span></label>${(capsOpen.has('shared-skills') ? skills : skills.slice(0, 60)).map(s => `<div class="skill-row"><div class="skill-head"><strong>${esc(s.name)}</strong><span class="subtle">${esc(s.source)}</span><span class="native-to" title="Native to ${esc((s.nativeTo || []).map(p => names[p]).join(', '))}">${glyphs(s)}</span></div><p>${esc(s.description)}</p></div>`).join('')}${skills.length > 60 ? `<button type="button" class="cap-chip more" data-caps-more="shared-skills" aria-expanded="${capsOpen.has('shared-skills')}">${capsOpen.has('shared-skills') ? 'Show fewer' : `+${skills.length - 60} more skills`}</button>` : skills.length ? '' : '<p class="fine-print">No skills found in .claude, .agents, .codex, .github, .copilot or .gemini folders.</p>'}<div class="section-heading sub-heading">ROOM TOOLS</div>${ROOM_TOOLS.map(([name, label, iconName, description]) => `<div class="tool-row"><span class="tool-symbol">${icon(iconName)}</span><div><strong>${label}</strong><small>${esc(description)}</small><small>available to every native agent${needs[name] || ''}</small></div></div>`).join('')}</div>`
       + `<div class="inspector-section"><div class="section-heading">ROOM DOCUMENTS <span class="count">${docs.length}</span></div><p class="muted">Attached files are read automatically, with OCR for images and scanned pages, then split into passages and embedded. Agents get the most relevant passages with each message and can search for more.</p>${docs.map(d => `<div class="doc-row ${esc(d.status)}"><span class="tool-symbol">${icon('file')}</span><div><strong>${esc(d.name)}</strong><small>${esc(d.status === 'ready' ? `${docStatus(d)} · ${d.chars.toLocaleString()} characters · ${d.chunks} passage${d.chunks === 1 ? '' : 's'}` : d.detail || d.status)}</small></div><button class="icon-button small" data-remove-doc="${esc(d.id)}" aria-label="Remove ${esc(d.name)}">${icon('close')}</button></div>`).join('')}<button class="outline-button" data-action="attachDocuments">${icon('attach')} Attach documents</button></div>`
       + `<div class="inspector-section"><div class="section-heading">LOCAL SPECIALISTS <span class="connection-dot ${ollama?.status || 'unchecked'}"></span></div><p class="muted">Local Ollama models read documents and build the search index. Installed models are selected automatically.</p><label class="model-field">Vision / OCR<select id="vision-model"${running ? ' disabled' : ''}>${options('vision')}</select></label><label class="model-field">Embeddings<select id="embedding-model"${running ? ' disabled' : ''}>${options('embedding')}</select></label><p class="fine-print">Models must already be installed in Ollama. Cloud models are excluded. Extracted text, OCR results and embeddings are cached on disk in this workspace's VS Code storage, so the same file is never processed twice.</p></div>`
       + `<div class="inspector-section"><div class="section-heading">CONNECTIONS</div>${state.connections.map(c => `<div class="connection-row"><span class="connection-dot ${c.status}"></span><div><strong>${names[c.id] || esc(c.id)}</strong><small>${esc(c.detail)}</small><small>${esc(c.modelSource || '')}</small>${c.hint ? `<small class="hint">${esc(c.hint.text)}</small>${hintButtons(c.hint.action, c.id)}` : ''}</div></div>`).join('')}<button class="outline-button" data-action="refresh"${state.discovering ? ' disabled' : ''}>${icon('refresh')} ${state.discovering ? 'Discovering…' : 'Refresh connections'}</button></div><p class="fine-print footnote">Native agents use their own tools, skills and MCP servers, governed by each agent's permission level.</p>`;
@@ -1322,6 +1395,7 @@
     const target = event.target;
     if (target.closest('#menu')) return;
     if (pop && !target.closest('#popover') && !target.closest('[data-pop]')) closePopover();
+    if (roomsOpen && !target.closest('.room-picker')) setRoomsOpen(false);
     const button = target.closest('button'); if (!button || button.disabled || !state && !button.dataset.action) return;
     const d = button.dataset;
     if (d.pop) { togglePopover(d.pop, button); return; }
@@ -1330,6 +1404,14 @@
     if (button.id === 'chip-ultra') { if (ultra) { ultra = false; button.setAttribute('aria-pressed', 'false'); } else confirmUltra().then(ok => { if (ok) { ultra = true; button.setAttribute('aria-pressed', 'true'); } }); return; }
     if (button.id === 'open-slash') { insertSlash(); return; }
     if (button.id === 'open-mention') { insertMention(); return; }
+    if (button.id === 'rooms') { setRoomsOpen(!roomsOpen); return; }
+    if (d.roomOpen) { setRoomsOpen(false, true); if (d.roomOpen !== state.room.id) send('switch', { id: d.roomOpen }); return; }
+    if (d.roomDelete) { askDeleteRoom(d.roomDelete); return; }
+    if (d.roomDeleteYes) { deleteRoom(d.roomDeleteYes); return; }
+    if (d.roomDeleteNo) { roomConfirm = ''; renderRooms(); document.querySelector(`[data-room-delete="${CSS.escape(d.roomDeleteNo)}"]`)?.focus(); return; }
+    if (d.capsMore) { if (!capsOpen.delete(d.capsMore)) capsOpen.add(d.capsMore); renderInspector(); return; }
+    if (d.cap) { const [id, kind, name] = JSON.parse(d.cap), a = agentById(id); if (a) send('agentDisable', { id, kind, name, off: !offNames(a, kind).includes(name) }); return; }
+    if (d.gemini) { send('gemini', { action: d.gemini }); return; }
     if (d.action) act(d.action, button);
     if (d.agent && button.classList.contains('agent-pill')) editAgent(d.agent);
     if (d.edit) editAgent(d.edit);
@@ -1394,7 +1476,6 @@
     if (id === 'agent-permission') syncSandbox();
     if (id === 'agent-permission' && el.value === 'full') { const previous = opts(agentById(editing) || {}).permission; confirmBox('Allow this agent to edit files and run commands without asking?', 'Allow full access').then(ok => { if (!ok && $('agent-permission')) { $('agent-permission').value = previous === 'full' ? 'ask' : previous; syncSandbox(); } }); }
     if (id === 'agent-ultra' && el.checked) confirmUltra().then(ok => { if (!ok && $('agent-ultra')) $('agent-ultra').checked = false; });
-    if (id === 'rooms') send('switch', { id: el.value });
     if (id === 'vision-model' || id === 'embedding-model') send('localModels', { vision: $('vision-model').value, embedding: $('embedding-model').value });
   });
   document.addEventListener('input', event => {
@@ -1410,6 +1491,7 @@
     if (id === 'agent-form') saveAgent();
     if (id === 'team-form') useTeam();
     if (id === 'keep-form') submitKeep();
+    if (event.target.dataset?.capAdd) { const input = event.target.querySelector('input'), name = input.value.trim(); if (name) send('agentDisable', { id: event.target.dataset.capAdd, kind: 'tools', name, off: true }); input.value = ''; input.blur(); }
     if (id === 'defaults-form') {
       const modelDefaults = { planning: {}, drafting: {}, review: {} };
       document.querySelectorAll('[data-default-preset]').forEach(el => { modelDefaults[el.dataset.defaultPreset][el.dataset.defaultProvider] = el.value; });
@@ -1431,6 +1513,11 @@
   });
   $('messages').addEventListener('scroll', () => { const el = $('messages'); nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 90; });
   document.addEventListener('keydown', event => {
+    if (roomsOpen && event.target.closest?.('.room-picker')) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); moveRoomFocus(event.key === 'ArrowDown' ? 1 : -1); return; }
+      if (event.key === 'Escape' && roomConfirm) { const id = roomConfirm; roomConfirm = ''; renderRooms(); document.querySelector(`[data-room-delete="${CSS.escape(id)}"]`)?.focus(); return; }
+      if (event.key === 'Escape') { setRoomsOpen(false, true); return; }
+    }
     if (event.key === 'Escape') {
       if (confirmClose) { confirmClose(); return; }
       if (keepDraft && event.target.closest?.('#keep-form')) { closeKeep(true); return; }

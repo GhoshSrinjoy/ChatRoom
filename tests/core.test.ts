@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRoom, buildContext, parseToolCall, parsePlan, planStages, systemPrompt, message, estimateTokens, boundedNumber, roomFraming, renderEntry, renderContext,
   unseenEntries, boundedHistory, turnAsk, migrateRoom, defaultOptions, framingHash, DEFAULT_LOOP, FramingContext, SCHEMA,
-  BUILTIN_TEAMS, classifyUnavailable, normalizeTeam, pipelineLead, stageAgents, teamPlan, unavailableText, sandboxLanguage, sandboxStatusText, sandboxSummary, sandboxWhat } from '../src/core';
+  BUILTIN_TEAMS, classifyUnavailable, disabledNames, normalizeDisabled, normalizeTeam, usesCli, pipelineLead, stageAgents, teamPlan, unavailableText, sandboxLanguage, sandboxStatusText, sandboxSummary, sandboxWhat } from '../src/core';
 import { Connection, Message, ProviderError, SandboxResult, TeamStage, Unavailable, addUsage, emptyUsage } from '../src/types';
 
 const copilotCli: Connection = { id: 'copilot', status: 'ready', runtime: 'cli', detail: '', models: [] };
@@ -398,4 +398,28 @@ test('worktrees: an isolated agent gets one framing line; the merge ask names th
   assert.equal(migrated.agents[1]!.isolate, true); assert.equal(migrated.agents[1]!.worktree!.checkpoints, 2);
   const kept = migrateRoom(JSON.parse(JSON.stringify({ ...room, worktrees: 'auto', changes: { base: 'b', branch: 'c', path: 'p', files: [], added: 0, removed: 0, status: 'ready', updatedAt: 1 } })), { attachEditor: true, shareSkills: true, permission: 'ask' });
   assert.equal(kept.worktrees, 'auto'); assert.equal(kept.changes!.branch, 'c');
+});
+
+test('a saved Gemini agent stays Gemini after a reload; an unknown provider still falls back to Ollama', () => {
+  const defaults = { attachEditor: true, shareSkills: true, permission: 'ask' as const };
+  const room = migrateRoom({ id: 'r', schema: SCHEMA, agents: [{ id: 'g', name: 'Gemini', provider: 'gemini', model: 'gemini-2.5-pro' }, { id: 'x', provider: 'something-new' }], messages: [] }, defaults);
+  assert.equal(room.agents[0]!.provider, 'gemini'); assert.equal(room.agents[0]!.name, 'Gemini'); assert.equal(room.agents[0]!.model, 'gemini-2.5-pro');
+  assert.equal(room.agents[1]!.provider, 'ollama');
+  assert.equal(usesCli(room.agents[0]!, []), true, 'with no connection known yet');
+});
+
+test('turned-off items survive a reload, and a damaged saved value is cleaned', () => {
+  const defaults = { attachEditor: true, shareSkills: true, permission: 'ask' as const };
+  const load = (disabled: unknown) => migrateRoom({ id: 'r', schema: SCHEMA, agents: [{ id: 'a', provider: 'claude', options: { disabled } }], messages: [] }, defaults).agents[0]!;
+  assert.deepEqual(load({ tools: ['Bash'], mcpServers: ['mem'] }).options.disabled, { tools: ['Bash'], mcpServers: ['mem'] });
+  assert.deepEqual(load({ tools: ['Bash', 'Bash', ' ', 7, 'bad\u0000name'], nonsense: ['x'], skills: 'not-a-list' }).options.disabled, { tools: ['Bash'] });
+  for (const bad of ['text', 3, [], {}, { tools: [] }, undefined]) assert.equal('disabled' in load(bad).options, false, JSON.stringify(bad));
+  assert.deepEqual(disabledNames(load({ tools: ['Bash'] }), 'tools'), ['Bash']); assert.deepEqual(disabledNames(load(undefined), 'tools'), []);
+  assert.equal(normalizeDisabled({ tools: Array.from({ length: 900 }, (_, i) => 't' + i) })!.tools!.length, 500, 'bounded');
+  assert.equal(normalizeDisabled({ tools: ['x'.repeat(201)] }), undefined, 'names are bounded');
+});
+
+test('a too old CLI reads as needing an update, not as not installed', () => {
+  assert.equal(unavailableText({ reason: 'missing', detail: 'Gemini CLI 0.1.18 is too old: Chatroom needs 0.38.0 or newer', at: 0 }, 0), 'needs an update');
+  assert.equal(unavailableText({ reason: 'missing', detail: 'Not found', at: 0 }, 0), 'not installed');
 });

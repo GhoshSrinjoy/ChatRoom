@@ -1,5 +1,5 @@
 import { Agent, AgentCapabilities, LoopConfig, NativeCommand, NativeProviderId, RoomCommandInfo, SandboxLanguage, SandboxProfile, TeamConfig, WorktreeMode } from './types';
-import { normalizeTeam, sandboxLanguage } from './core';
+import { disabledNames, normalizeTeam, sandboxLanguage } from './core';
 
 export const ROOM_COMMANDS: RoomCommandInfo[] = [
   { name: 'help', description: 'Show Chatroom commands', agentScoped: false },
@@ -32,6 +32,7 @@ export const NATIVE_COMMAND_DENYLIST: Record<NativeProviderId, string[]> = {
   copilot: ['login', 'logout', 'exit', 'theme', 'vim', 'terminal-setup', 'statusline', 'footer', 'update', 'changelog', 'feedback', 'diagnose', 'app', 'ide',
     'voice', 'remote', 'restart', 'keep-alive', 'user', 'settings', 'experimental', 'collect-debug-logs', 'copy', 'share', 'resume', 'cwd', 'cd', 'add-dir',
     'list-dirs', 'allow-all', 'yolo', 'new', 'help', 'version', 'session'],
+  gemini: ['help'],
 };
 const denied = (provider: NativeProviderId, name: string) => (NATIVE_COMMAND_DENYLIST[provider] ?? []).some(d => d.endsWith('*') ? name.startsWith(d.slice(0, -1)) : name === d);
 export function filterNativeCommands(provider: NativeProviderId, commands: NativeCommand[]): NativeCommand[] {
@@ -73,7 +74,7 @@ function mentions(text: string): MentionToken[] {
   return out;
 }
 const PROVIDER_ALIASES: Record<string, Agent['provider']> = {
-  claude: 'claude', 'claude code': 'claude', 'claude-code': 'claude', codex: 'codex', copilot: 'copilot', 'github copilot': 'copilot', 'github-copilot': 'copilot', ollama: 'ollama',
+  claude: 'claude', 'claude code': 'claude', 'claude-code': 'claude', codex: 'codex', copilot: 'copilot', 'github copilot': 'copilot', 'github-copilot': 'copilot', gemini: 'gemini', 'gemini cli': 'gemini', 'gemini-cli': 'gemini', ollama: 'ollama',
 };
 export function resolveMention(token: string, agents: Agent[], leadId?: string): Agent[] | 'all' | undefined {
   const t = token.trim().toLowerCase();
@@ -97,11 +98,17 @@ export interface ParsedComposer {
   error?: string;
 }
 const at = (agent: Agent) => /\s/.test(agent.name) ? `@"${agent.name}"` : `@${agent.name}`;
+/** A command the user turned off, directly or through the skill of the same name. */
+export function commandOff(agent: Agent, name: string): boolean {
+  const key = name.toLowerCase();
+  return [...disabledNames(agent, 'commands'), ...disabledNames(agent, 'skills')].some(n => n.toLowerCase() === key);
+}
 /** The native command an agent has under this name or alias, after filtering. Legacy agents have none. */
 function nativeCommand(agent: Agent, caps: AgentCapabilities | undefined, name: string): NativeCommand | undefined {
   if (!caps || caps.runtime !== 'cli' || agent.provider === 'ollama') return undefined;
-  return filterNativeCommands(agent.provider, caps.commands ?? []).find(c => c.name.toLowerCase() === name || (c.aliases ?? []).some(a => a.replace(/^\//, '').toLowerCase() === name));
+  return filterNativeCommands(agent.provider, caps.commands ?? []).find(c => !commandOff(agent, c.name) && (c.name.toLowerCase() === name || (c.aliases ?? []).some(a => a.replace(/^\//, '').toLowerCase() === name)));
 }
+const offCommand = (name: string, agent: Agent) => `/${name} is turned off for ${agent.name}. Turn it back on in the Tools tab.`;
 export function parseComposer(text: string, agents: Agent[], caps: Record<string, AgentCapabilities | undefined>, leadId?: string): ParsedComposer {
   const t = (text ?? '').trim();
   if (t.startsWith('//')) return { text: t.slice(1), targets: [], all: false };
@@ -140,14 +147,16 @@ export function parseComposer(text: string, agents: Agent[], caps: Record<string
       const owners = agents.filter(a => a.enabled).map(a => ({ agent: a, found: nativeCommand(a, caps[a.id], name) })).filter(o => o.found);
       if (owners.length === 1) return { ...base, command: { name: canonical(owners[0]!.found!, name), args, scope: 'native', agentIds: [owners[0]!.agent.id] } };
       if (owners.length > 1) return { ...base, error: `Several agents have /${name}: mention one, e.g. ${at(owners[0]!.agent)} /${name}.` };
-      return { ...base, error: `Unknown command /${name}. Type / to see the commands.` };
+      const turnedOff = agents.find(a => a.enabled && commandOff(a, name));
+      return { ...base, error: turnedOff ? offCommand(name, turnedOff) : `Unknown command /${name}. Type / to see the commands.` };
     }
     if (AGENT_SCOPED.includes(name)) return { ...base, command: { name, args, scope: 'room', agentIds: lead.targets } };
     const targets = lead.targets.map(id => agents.find(a => a.id === id)!);
     const found = targets.map(a => nativeCommand(a, caps[a.id], name));
     if (found.every(Boolean)) return { ...base, command: { name: canonical(found[0]!, name), args, scope: 'native', agentIds: lead.targets } };
     if (ROOM_NAMES.has(name)) return { ...base, command: { name, args, scope: 'room', agentIds: lead.targets } };
-    return { ...base, error: `${targets[found.findIndex(f => !f)]!.name} has no /${name} command.` };
+    const missing = targets[found.findIndex(f => !f)]!;
+    return { ...base, error: commandOff(missing, name) ? offCommand(name, missing) : `${missing.name} has no /${name} command.` };
   }
   const { targets, all, off } = collect(tokens);
   if (!t) return { text: t, targets, all, error: 'Write a message first.' };

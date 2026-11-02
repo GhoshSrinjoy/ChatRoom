@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { Agent, AgentCapabilities, AgentOptions, Connection, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomChanges, RoomDocument, SandboxLanguage, SandboxResult, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
+import { Agent, AgentCapabilities, AgentOptions, Connection, DisableKind, DisabledItems, Flow, LoopConfig, Message, ModelDefaults, PermissionLevel, PlanStep, ProviderError, ProviderId, Room, RoomChanges, RoomDocument, SandboxLanguage, SandboxResult, TaskPreset, TeamConfig, TeamStage, ToolCall, ToolName, TurnKind, Unavailable, UnavailableReason, Usage, emptyUsage } from './types';
 
 export const SCHEMA = 5;
 export const TOOL_NAMES: ToolName[] = ['list_files', 'read_file', 'search_files', 'search_documents', 'ollama_ocr', 'semantic_search'];
 export const DEFAULT_TOOLS: ToolName[] = ['list_files', 'read_file', 'search_files', 'search_documents'];
-export const PROVIDER_LABELS = { codex: 'Codex', claude: 'Claude Code', copilot: 'GitHub Copilot', ollama: 'Ollama' } as const;
+export const PROVIDER_LABELS = { codex: 'Codex', claude: 'Claude Code', copilot: 'GitHub Copilot', gemini: 'Gemini CLI', ollama: 'Ollama' } as const;
 export const PERMISSION_LABELS: Record<PermissionLevel, string> = { plan: 'Plan', ask: 'Ask', 'auto-edit': 'Auto-edit', full: 'Full access' };
 export const PERMISSIONS: PermissionLevel[] = ['plan', 'ask', 'auto-edit', 'full'];
 export const MAX_PLAN_STEPS = 8;
@@ -16,6 +16,29 @@ const OLD_DEFAULT_ROLES = new Set(['Engineer. Propose a concrete implementation 
 export function defaultOptions(provider: ProviderId, permission: PermissionLevel = 'ask'): AgentOptions {
   return { effort: '', thinking: 'on', summary: 'auto', permission, useMcp: true, useSkills: true, useProjectSettings: true, extraDirs: [], ultra: false,
     ...(provider === 'copilot' ? { copilotRuntime: 'auto' as const } : {}) };
+}
+export const DISABLE_KINDS: DisableKind[] = ['tools', 'skills', 'mcpServers', 'commands'];
+const MAX_DISABLED = 500;
+/** A usable item name: as a CLI reports it, without control characters. */
+export function disableName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const name = value.trim();
+  return name && name.length <= 200 && !/[\u0000-\u001f\u007f]/.test(name) ? name : undefined;
+}
+/** Disabled items from a saved or webview value: known kinds, valid names, no duplicates, bounded. */
+export function normalizeDisabled(raw: unknown): DisabledItems | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const result: DisabledItems = {};
+  for (const kind of DISABLE_KINDS) {
+    const list = (raw as DisabledItems)[kind];
+    const names = Array.isArray(list) ? [...new Set(list.map(disableName).filter((n): n is string => !!n))].slice(0, MAX_DISABLED) : [];
+    if (names.length) result[kind] = names;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+export function disabledNames(agent: Agent, kind: DisableKind): string[] {
+  const list = agent.options?.disabled?.[kind];
+  return Array.isArray(list) ? list : [];
 }
 function newAgent(name: string, provider: ProviderId, model: string, permission: PermissionLevel): Agent {
   return { id: randomUUID(), name, provider, model, role: '', enabled: true, tools: [...DEFAULT_TOOLS], options: defaultOptions(provider, permission) };
@@ -31,11 +54,13 @@ export function createRoom(defaults?: ModelDefaults, preset: TaskPreset = 'plann
     ] };
 }
 function migrateAgent(raw: any, schema: number, permission: PermissionLevel): Agent {
-  const provider: ProviderId = ['codex', 'claude', 'copilot', 'ollama'].includes(raw.provider) ? raw.provider : 'ollama';
+  const provider: ProviderId = ['codex', 'claude', 'copilot', 'gemini', 'ollama'].includes(raw.provider) ? raw.provider : 'ollama';
   const options: AgentOptions = { ...defaultOptions(provider, permission), ...(raw.options && typeof raw.options === 'object' ? raw.options : {}) };
   if (typeof raw.reasoning === 'string' && options.effort === '') options.effort = raw.reasoning;
   if (!PERMISSIONS.includes(options.permission)) options.permission = permission;
   if (!Array.isArray(options.extraDirs)) options.extraDirs = [];
+  const disabled = normalizeDisabled(options.disabled);
+  if (disabled) options.disabled = disabled; else delete options.disabled;
   delete raw.reasoning;
   raw.provider = provider; raw.options = options;
   raw.name = typeof raw.name === 'string' && raw.name ? raw.name : PROVIDER_LABELS[provider];
@@ -238,7 +263,7 @@ export function unavailableText(u: Unavailable, now: number): string {
       const far = u.until - now > 6 * 86400000;
       return `out of usage until ${new Date(u.until).toLocaleString('en', { ...(far ? { month: 'short', day: 'numeric' } : { weekday: 'short' }), hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}`;
     }
-    case 'missing': return 'not installed';
+    case 'missing': return /too old/.test(u.detail) ? 'needs an update' : 'not installed';
     case 'signed-out': return 'signed out';
     case 'model': return `model ${u.model || 'default'} is not available`;
     default: return 'not running';
@@ -276,7 +301,7 @@ export function normalizeTeam(raw: unknown): TeamConfig | undefined {
   if (!stages.length) return;
   return { name: clip(r.name, 40) || 'My team', stages, wrapUp: typeof r.wrapUp === 'boolean' ? r.wrapUp : stages.some(s => s.lead) };
 }
-const STAGE_PROVIDERS: Record<string, ProviderId> = { claude: 'claude', codex: 'codex', copilot: 'copilot', ollama: 'ollama', 'claude code': 'claude', 'github copilot': 'copilot' };
+const STAGE_PROVIDERS: Record<string, ProviderId> = { claude: 'claude', codex: 'codex', copilot: 'copilot', gemini: 'gemini', ollama: 'ollama', 'claude code': 'claude', 'github copilot': 'copilot', 'gemini cli': 'gemini' };
 /** A stage's enabled agents, by agent name or by provider name when exactly one enabled agent has that provider. */
 export function stageAgents(stage: TeamStage, room: Room): Agent[] {
   const enabled = room.agents.filter(a => a.enabled), out: Agent[] = [];
@@ -305,7 +330,7 @@ export interface FramingContext {
 }
 /** Whether an agent runs as its own CLI (native tools and session) rather than as a chat model. */
 export function usesCli(agent: Agent, connections: Connection[]): boolean {
-  if (agent.provider === 'claude' || agent.provider === 'codex') return true;
+  if (agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini') return true;
   if (agent.provider !== 'copilot') return false;
   const choice = agent.options?.copilotRuntime ?? 'auto';
   return choice !== 'vscode-lm' && (choice === 'cli' || connections.find(c => c.id === 'copilot')?.runtime === 'cli');
@@ -313,6 +338,7 @@ export function usesCli(agent: Agent, connections: Connection[]): boolean {
 function runtimeLabel(agent: Agent, native: boolean): string {
   if (agent.provider === 'claude') return 'Claude Code';
   if (agent.provider === 'codex') return 'Codex CLI';
+  if (agent.provider === 'gemini') return 'Gemini CLI';
   if (agent.provider === 'copilot') return native ? 'GitHub Copilot CLI' : 'GitHub Copilot (VS Code chat model)';
   return 'Ollama (local model)';
 }

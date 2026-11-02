@@ -45,8 +45,22 @@ svg { width: 16px; height: 16px; flex: 0 0 auto; }
 .top-actions { margin-left: auto; gap: 2px; min-width: 0; }
 .workspace-label { font-size: 11px; color: var(--muted); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-bar { display: flex; align-items: center; justify-content: space-between; padding: 3px 8px 5px; gap: 4px; border-bottom: 1px solid var(--border); }
-.room-picker { display: flex; align-items: center; min-width: 0; flex: 1; }
-.room-picker select { border: 0; background: transparent; width: 100%; max-width: 420px; }
+.room-picker { position: relative; display: flex; align-items: center; gap: 2px; min-width: 0; flex: 1; }
+.room-current { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: min(420px, 100%); padding: 2px 4px; border: 0; border-radius: 3px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.room-current:hover:not(:disabled) { background: var(--vscode-toolbar-hoverBackground, transparent); }
+.room-current:disabled { opacity: .7; cursor: default; }
+.room-current-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-current svg { flex: 0 0 auto; width: 13px; height: 13px; }
+.rooms-menu { position: absolute; top: calc(100% + 3px); left: 0; z-index: 7; width: min(340px, calc(100vw - 16px)); max-height: min(340px, 60vh); margin: 0; padding: 4px; overflow-y: auto; list-style: none; background: var(--vscode-quickInput-background, var(--widget)); color: var(--vscode-quickInput-foreground, var(--foreground)); border: 1px solid var(--widget-border, var(--border)); border-radius: 4px; box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, .35)); }
+.room-row { display: flex; align-items: center; gap: 2px; border-radius: 3px; }
+.room-row:hover, .room-row:focus-within { background: var(--vscode-list-hoverBackground, transparent); }
+.room-open { flex: 1; min-width: 0; padding: 4px 6px; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.room-row.current .room-open { font-weight: 600; }
+.room-delete { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--muted); cursor: pointer; }
+.room-delete svg { width: 13px; height: 13px; }
+.room-delete:hover, .room-delete:focus-visible { color: var(--vscode-errorForeground, inherit); background: var(--vscode-toolbar-hoverBackground, transparent); }
+.room-row.confirm { flex-wrap: wrap; justify-content: flex-end; gap: 4px 8px; padding: 5px 6px; background: var(--vscode-list-hoverBackground, transparent); }
+.room-confirm-text { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
 .room-bar-right { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
 .status-label, .turn-count { color: var(--muted); font-size: 11px; }
 .workspace { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
@@ -327,6 +341,13 @@ pre code { background: transparent; padding: 0; }
 .cap-list { display: flex; flex-wrap: wrap; gap: 3px; min-width: 0; }
 .cap-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; padding: 1px 5px; border: 1px solid var(--border); border-radius: 3px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cap-chip.more { color: var(--muted); border-style: dashed; }
+button.cap-chip { background: transparent; color: inherit; font-family: inherit; line-height: inherit; cursor: pointer; }
+button.cap-chip.more { color: var(--muted); }
+button.cap-chip:hover { border-color: var(--vscode-focusBorder, var(--muted)); }
+.cap-chip.toggle.off { color: var(--muted); border-style: dashed; text-decoration: line-through; opacity: .7; }
+.cap-add { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
+.cap-add input { flex: 1; min-width: 0; font-size: 11px; }
+.caps-note { margin: 8px 0 0; }
 .skill-row { margin: 10px 0; font-size: 12px; min-width: 0; }
 .skill-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .skill-head strong { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

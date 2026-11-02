@@ -171,7 +171,7 @@ export function recordingSink(decide?: (request: ApprovalRequest) => ApprovalDec
   };
   return sink;
 }
-const NAMES: Record<ProviderId, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', ollama: 'Ollama' };
+const NAMES: Record<ProviderId, string> = { claude: 'Claude', codex: 'Codex', copilot: 'Copilot', gemini: 'Gemini', ollama: 'Ollama' };
 export function testAgent(provider: ProviderId, patch: Partial<Agent> = {}): Agent {
   const options: AgentOptions = { effort: '', thinking: 'on', summary: 'auto', permission: 'ask', useMcp: true, useSkills: true, useProjectSettings: true, extraDirs: [], ultra: false,
     ...(provider === 'copilot' ? { copilotRuntime: 'auto' as const } : {}), ...(patch.options ?? {}) };

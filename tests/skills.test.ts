@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, lstat, stat } from 'n
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { skillRoots, parseSkillFrontmatter, discoverSkills, prepareSkillWiring } from '../src/skills';
+import { SharedSkill } from '../src/types';
 
 async function skill(dir: string, body: string) { await mkdir(dir, { recursive: true }); await writeFile(join(dir, 'SKILL.md'), body); }
 const fm = (name: string, description = `${name} helps`) => `---\nname: ${name}\ndescription: ${description}\n---\n# ${name}\n`;
@@ -27,10 +28,10 @@ async function fixture() {
 
 test('skill roots follow the spec table, with workspace roots only when a workspace is open', () => {
   const roots = skillRoots('/w', '/h');
-  assert.deepEqual(roots.map(r => r.source), ['claude-user', 'claude-project', 'claude-plugin', 'agents-user', 'agents-project', 'codex-user', 'codex-project', 'github-project', 'copilot-user']);
+  assert.deepEqual(roots.map(r => r.source), ['claude-user', 'claude-project', 'claude-plugin', 'agents-user', 'agents-project', 'codex-user', 'codex-project', 'github-project', 'copilot-user', 'gemini-user', 'gemini-project']);
   assert.deepEqual(roots.find(r => r.source === 'claude-project')!.nativeTo, ['claude', 'copilot']);
   assert.equal(roots.find(r => r.source === 'agents-user')!.recursive, true);
-  assert.equal(skillRoots(undefined, '/h').length, 5);
+  assert.equal(skillRoots(undefined, '/h').length, 6);
 });
 test('frontmatter: quoted values, folded and plain multi-line descriptions, missing values', () => {
   assert.deepEqual(parseSkillFrontmatter('---\nname: "quoted name"\ndescription: \'single quoted\'\n---\nbody'), { name: 'quoted name', description: 'single quoted' });
@@ -49,7 +50,7 @@ test('discovers skills across all roots with nativeTo, skipping .system, wrong p
     assert.deepEqual(Object.keys(by).sort(), ['agents-nested', 'agents-project-skill', 'claude-project-skill', 'claude-user-skill', 'codex-project-skill', 'codex-user-skill', 'copilot-user-skill', 'github-skill', 'noname', 'plugin-skill']);
     assert.equal(skills.filter(s => s.name === 'github-skill').length, 1);
     assert.equal(by['plugin-skill']!.source, 'claude-plugin'); assert.deepEqual(by['plugin-skill']!.nativeTo, ['claude']);
-    assert.equal(by['agents-nested']!.source, 'agents-user'); assert.deepEqual(by['agents-nested']!.nativeTo, ['codex', 'copilot']);
+    assert.equal(by['agents-nested']!.source, 'agents-user'); assert.deepEqual(by['agents-nested']!.nativeTo, ['codex', 'copilot', 'gemini']);
     assert.equal(by['noname']!.description, 'no name given');
     assert.equal(by['claude-user-skill']!.path, join(home, '.claude', 'skills', 'cu', 'SKILL.md'));
     assert.equal(by['claude-user-skill']!.dir, join(home, '.claude', 'skills', 'cu'));
@@ -92,4 +93,19 @@ test('skill wiring links non-native skills per CLI, writes the index and never t
     assert.equal(await readFile(none.indexPath!, 'utf8'), '# Skills shared in this room\n\nEach skill is a folder with a SKILL.md. Read the SKILL.md and follow it when a skill fits the task.\n\n');
     assert.ok((await stat(join(dirname(skills[0]!.path), 'SKILL.md'))).isFile());
   } finally { await rm(base, { recursive: true, force: true }); }
+});
+
+test('Gemini: its own folders and .agents are native to it; other skills get their real folders, for reading through the index', async () => {
+  const home = join(tmpdir(), 'h'), workspace = join(tmpdir(), 'w'), roots = skillRoots(workspace, home);
+  assert.deepEqual(roots.find(r => r.source === 'gemini-user'), { dir: join(home, '.gemini', 'skills'), source: 'gemini-user', recursive: false, nativeTo: ['gemini'] });
+  assert.deepEqual(roots.find(r => r.source === 'gemini-project'), { dir: join(workspace, '.gemini', 'skills'), source: 'gemini-project', recursive: false, nativeTo: ['gemini'] });
+  assert.ok(roots.find(r => r.source === 'agents-project')!.nativeTo.includes('gemini'));
+  assert.ok(!roots.find(r => r.source === 'claude-user')!.nativeTo.includes('gemini'));
+  assert.equal(skillRoots(undefined, home).filter(r => r.source === 'gemini-project').length, 0);
+  const storage = await mkdtemp(join(tmpdir(), 'chatroom-gemini-wiring-'));
+  try {
+    const skill = (name: string, dir: string, nativeTo: SharedSkill['nativeTo']): SharedSkill => ({ name, description: '', path: join(dir, 'SKILL.md'), dir, source: 'claude-user', nativeTo });
+    const wiring = await prepareSkillWiring([skill('a', join(home, '.claude', 'skills', 'a'), ['claude']), skill('b', join(home, '.claude', 'skills', 'b'), ['claude']), skill('own', join(home, '.gemini', 'skills', 'own'), ['gemini'])], storage, undefined);
+    assert.deepEqual(wiring.geminiDirs, [join(home, '.claude', 'skills')], 'one folder per parent, and none for its own skills');
+  } finally { await rm(storage, { recursive: true, force: true }); }
 });

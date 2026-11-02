@@ -1035,6 +1035,161 @@ try {
   assert.equal(await page.evaluate(() => getComputedStyle(document.body).color), 'rgb(51, 51, 51)');
   await page.screenshot({ path: 'artifacts/preview-light-sidebar.png' });
   assert.deepEqual(errors, []);
+  // Chat list, expandable tool lists, turning items off, and Gemini: on a page of their own, with a sidebar's width.
+  {
+  const side = await browser.newPage({ viewport: { width: 420, height: 900 }, deviceScaleFactor: 1 });
+  const sideErrors = []; side.on('pageerror', error => sideErrors.push(error.message));
+  await side.addInitScript(() => { window.__outbox = []; window.acquireVsCodeApi = () => ({ postMessage: message => window.__outbox.push(message), getState: () => ({}), setState: () => {} }); });
+  await side.goto(`http://127.0.0.1:${server.address().port}`);
+  const sideDeliver = data => side.evaluate(data => new Promise(resolve => { window.addEventListener('message', () => resolve(), { once: true }); window.postMessage(data, '*'); }), data);
+  const sideSent = type => side.evaluate(type => window.__outbox.filter(m => m.type === type), type);
+  const clearSent = () => side.evaluate(() => { window.__outbox = []; });
+  const longTitle = 'A very long conversation title that goes on and on and could never fit on one row of the list';
+  const manyTools = Array.from({ length: 30 }, (_, i) => `Tool${i + 1}`), can = { tools: true, toolsByName: true, skills: true, mcpServers: true, commands: true };
+  const base = structuredClone(state), claude = base.room.agents.find(a => a.provider === 'claude'), copilot = base.room.agents.find(a => a.provider === 'copilot');
+  claude.options.disabled = { tools: ['Tool2', 'GoneTool'], commands: ['cmd1'], skills: ['skill9'], mcpServers: ['gone-server'] };
+  base.rooms = [{ id: 'preview', title: 'New conversation', messages: 3, changes: false }, { id: 'r2', title: longTitle, messages: 2, changes: true }, { id: 'r3', title: 'Nothing here yet', messages: 0, changes: false }];
+  base.capabilities = { ...base.capabilities,
+    [claude.id]: { ...base.capabilities[claude.id], status: 'ready', detail: undefined, tools: manyTools, skills: Array.from({ length: 12 }, (_, i) => ({ name: `skill${i + 1}`, description: `Skill ${i + 1}` })),
+      mcpServers: Array.from({ length: 26 }, (_, i) => ({ name: `server${i + 1}`, status: 'ready', tools: i })),
+      commands: [...Array.from({ length: 64 }, (_, i) => ({ name: `cmd${i + 1}`, description: `Command ${i + 1}`, source: 'builtin' })), { name: 'skill9', description: 'Skill 9', source: 'skill' }], canDisable: can },
+    [copilot.id]: { ...base.capabilities[copilot.id], status: 'ready', detail: undefined, runtime: 'cli', tools: [], skills: [{ name: 'copilot-skill', description: 'One skill' }], commands: [], mcpServers: [], canDisable: { ...can, skills: false } } };
+  base.sharedSkills = Array.from({ length: 70 }, (_, i) => ({ name: `shared${i + 1}`, description: 'A shared skill', path: `/s/${i}/SKILL.md`, dir: `/s/${i}`, source: 'agents-user', nativeTo: ['codex', 'copilot', 'gemini'] }));
+  await sideDeliver(base);
+
+  // The chat list: every row has a small delete button; opening a row switches.
+  const list = side.locator('#rooms-menu'), trigger = side.locator('#rooms');
+  assert.equal(await trigger.textContent(), 'New conversation'); assert.equal(await list.isVisible(), false); assert.equal(await trigger.getAttribute('aria-expanded'), 'false');
+  await trigger.click();
+  assert.equal(await list.isVisible(), true); assert.equal(await trigger.getAttribute('aria-expanded'), 'true');
+  assert.equal(await side.locator('.room-row').count(), 3); assert.equal(await side.locator('.room-delete').count(), 3);
+  assert.equal(await side.locator('.room-open[aria-current="true"]').textContent(), 'New conversation');
+  assert.equal(await side.evaluate(() => document.activeElement?.dataset?.roomOpen), 'preview', 'focus starts on the current chat');
+  const overflow = await side.evaluate(() => { const row = document.querySelectorAll('.room-row')[1], menu = document.getElementById('rooms-menu'); return { row: row.getBoundingClientRect().right, menu: menu.getBoundingClientRect().right, page: document.documentElement.scrollWidth, width: innerWidth, del: row.querySelector('.room-delete').getBoundingClientRect().right }; });
+  assert.ok(overflow.del <= overflow.menu, 'a long title leaves the delete button in view'); assert.ok(overflow.page <= overflow.width, 'no sideways scroll');
+  await side.screenshot({ path: 'artifacts/preview-rooms.png' });
+  // Arrow keys move between chats; Escape closes and returns to the button.
+  await side.keyboard.press('ArrowDown');
+  assert.equal(await side.evaluate(() => document.activeElement?.dataset?.roomOpen), 'r2');
+  await side.keyboard.press('Escape');
+  assert.equal(await list.isVisible(), false); assert.equal(await side.evaluate(() => document.activeElement?.id), 'rooms');
+  await trigger.click(); await side.locator('[data-room-open="r2"]').click();
+  assert.deepEqual((await sideSent('switch')).map(m => m.id), ['r2']); assert.equal(await list.isVisible(), false);
+  await clearSent();
+  // The chat already open does not switch; a click elsewhere closes the list.
+  await trigger.click(); await side.locator('[data-room-open="preview"]').click();
+  assert.deepEqual(await sideSent('switch'), []);
+  await trigger.click(); await side.locator('#prompt').click(); assert.equal(await list.isVisible(), false);
+  // An empty chat goes at once. Any other asks first, and says what happens to unapplied work.
+  await trigger.click(); await side.locator('[data-room-delete="r3"]').click();
+  assert.deepEqual((await sideSent('deleteRoom')).map(m => m.id), ['r3']); assert.equal(await list.isVisible(), true, 'the list stays open to delete more');
+  await clearSent();
+  await side.locator('[data-room-delete="preview"]').click();
+  assert.deepEqual(await sideSent('deleteRoom'), [], 'a chat with messages is not deleted by one click');
+  assert.match(await side.locator('.room-row.confirm').textContent(), /Delete "New conversation"\?/); assert.doesNotMatch(await side.locator('.room-row.confirm').textContent(), /unapplied/);
+  await side.locator('[data-room-delete-no="preview"]').click();
+  assert.equal(await side.locator('.room-row.confirm').count(), 0); assert.deepEqual(await sideSent('deleteRoom'), []);
+  await side.locator('[data-room-delete="r2"]').click();
+  assert.match(await side.locator('.room-row.confirm').textContent(), /unapplied changes stay on a branch/);
+  await side.keyboard.press('Escape');
+  assert.equal(await side.locator('.room-row.confirm').count(), 0, 'Escape cancels the delete'); assert.equal(await list.isVisible(), true);
+  await side.locator('[data-room-delete="r2"]').click(); await side.locator('[data-room-delete-yes="r2"]').click();
+  assert.deepEqual((await sideSent('deleteRoom')).map(m => m.id), ['r2']); assert.equal(await side.locator('.room-row.confirm').count(), 0);
+  await clearSent(); await trigger.click();
+  // Nothing can be switched or deleted during a run, as before.
+  await trigger.click();
+  await sideDeliver({ ...base, room: { ...base.room, status: 'running' } });
+  assert.equal(await trigger.isDisabled(), true); assert.equal(await list.isVisible(), false);
+  await sideDeliver(base);
+  assert.equal(await trigger.isDisabled(), false);
+
+  // Tool lists: +N more expands and collapses, and stays expanded across updates.
+  await side.locator('.inspector-toggle').click(); await side.locator('[data-tab="tools"]').click();
+  const card = side.locator('.caps-card').nth(1), row = n => card.locator('.caps-row').nth(n), chips = n => row(n).locator('.cap-chip:not(.more)');
+  const chipOf = (kind, name) => card.locator(`[data-cap='${JSON.stringify([claude.id, kind, name])}']`);
+  assert.match(await row(0).locator('.caps-label').textContent(), /Tools \(31 · 2 off\)/);
+  assert.equal(await chips(0).count(), 24); assert.equal(await row(0).locator('.more').textContent(), '+7 more');
+  await row(0).locator('.more').click();
+  assert.equal(await chips(0).count(), 31); assert.equal(await row(0).locator('.more').textContent(), 'Show fewer'); assert.equal(await row(0).locator('.more').getAttribute('aria-expanded'), 'true');
+  await sideDeliver(base);
+  assert.equal(await chips(0).count(), 31, 'stays expanded across updates');
+  assert.equal(await chips(3).count(), 24, 'each list expands on its own'); assert.equal(await row(3).locator('.more').textContent(), '+41 more');
+  await row(3).locator('.more').click();
+  assert.equal(await chips(3).count(), 65); await side.screenshot({ path: 'artifacts/preview-tools.png' });
+  await row(3).locator('.more').click();
+  assert.equal(await chips(3).count(), 24);
+  // The MCP list had no way to see past 24 before.
+  assert.equal(await row(2).locator('.more').textContent(), '+3 more');
+  // Clicking an item turns it off or on, from the agent's next turn.
+  await clearSent();
+  assert.equal(await chips(0).nth(0).getAttribute('aria-pressed'), 'true');
+  await chips(0).nth(0).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: claude.id, kind: 'tools', name: 'Tool1', off: true }]);
+  await clearSent();
+  const offChip = chipOf('tools', 'Tool2');
+  assert.equal(await offChip.getAttribute('aria-pressed'), 'false'); assert.ok(await offChip.evaluate(el => el.classList.contains('off')));
+  await offChip.click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: claude.id, kind: 'tools', name: 'Tool2', off: false }]);
+  await clearSent();
+  // What the CLI stopped reporting stays listed, so it can be turned on again.
+  await chipOf('tools', 'GoneTool').click();
+  assert.deepEqual((await sideSent('agentDisable'))[0].name, 'GoneTool');
+  await row(2).locator('.more').click();
+  assert.equal(await chipOf('mcpServers', 'gone-server').count(), 1);
+  await row(2).locator('.more').click();
+  await clearSent();
+  // A command that is off through its skill is turned on through the skill.
+  await row(3).locator('.more').click();
+  await row(3).locator(`[data-cap='${JSON.stringify([claude.id, 'skills', 'skill9'])}']`).click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: claude.id, kind: 'skills', name: 'skill9', off: false }]);
+  await row(3).locator('.more').click();
+  await clearSent();
+  // Turn off a tool the CLI does not list, by name.
+  const byName = card.locator('.cap-add input');
+  await byName.fill('  web_fetch '); await card.locator('.cap-add button').click();
+  assert.deepEqual(await sideSent('agentDisable'), [{ type: 'agentDisable', id: claude.id, kind: 'tools', name: 'web_fetch', off: true }]);
+  assert.equal(await byName.inputValue(), '');
+  // A CLI without a switch for one skill shows no button for it: nothing pretends to work.
+  const copilotCard = side.locator('.caps-card').nth(2);
+  assert.equal(await copilotCard.locator('span.cap-chip', { hasText: 'copilot-skill' }).count(), 1); assert.equal(await copilotCard.locator('button.cap-chip', { hasText: 'copilot-skill' }).count(), 0);
+  assert.match(await copilotCard.textContent(), /This CLI does not list its tools/);
+  // Shared skills expand too.
+  assert.equal(await side.locator('.skill-row').count(), 60);
+  await side.locator('[data-caps-more="shared-skills"]').click();
+  assert.equal(await side.locator('.skill-row').count(), 70);
+  await side.locator('[data-tab="usage"]').click(); await side.locator('.inspector-close').click();
+  // A turned-off command leaves the slash menu; the others stay.
+  await side.locator('#prompt').fill('@Claude /cmd'); await side.locator('#prompt').press('End');
+  await side.locator('#menu').waitFor();
+  const offered = await side.locator('#menu').textContent();
+  assert.ok(!/\/cmd1(?!\d)/.test(offered), 'a turned-off command is not offered'); assert.match(offered, /\/cmd2/);
+  await side.locator('#prompt').press('Escape'); await side.locator('#prompt').fill('');
+
+  // Gemini: can be added, has a glyph, and an outdated CLI says so with a way to fix it.
+  await side.locator('[data-action="add"]').first().click();
+  await side.locator('[data-provider="gemini"]').waitFor();
+  assert.match(await side.locator('[data-provider="gemini"]').textContent(), /Gemini CLI/); assert.equal(await side.locator('[data-provider="gemini"] .avatar svg').count(), 1);
+  await clearSent(); await side.locator('[data-provider="gemini"]').click();
+  assert.deepEqual(await sideSent('addAgent'), [{ type: 'addAgent', provider: 'gemini' }]);
+  const old = 'Gemini CLI 0.1.18 is too old: Chatroom needs 0.38.0 or newer. Update it: npm i -g @google/gemini-cli@latest';
+  const gemini = { id: 'g1', name: 'Gemini', provider: 'gemini', model: '', role: '', enabled: true, tools: [], options: options(), unavailable: { reason: 'missing', detail: old, at: Date.now() } };
+  await sideDeliver({ ...base, room: { ...base.room, agents: [...base.room.agents, gemini], messages: [{ id: 'n1', author: 'Chatroom', kind: 'notice', text: old, createdAt: Date.now(), status: 'complete' }] },
+    capabilities: { ...base.capabilities, g1: { provider: 'gemini', runtime: 'cli', status: 'missing', detail: old, action: 'updateGemini', version: '0.1.18', models: [], efforts: [], tools: [], skills: [], commands: [], mcpServers: [], supports: supports({}), updatedAt: Date.now() } },
+    connections: [...base.connections, { id: 'gemini', status: 'missing', runtime: 'cli', detail: 'Gemini CLI 0.1.18 is too old: Chatroom needs 0.38.0 or newer', models: [], version: '0.1.18', hint: { text: 'Update it: npm i -g @google/gemini-cli@latest', action: 'updateGemini' } }] });
+  const pill = side.locator('.agent-pill[data-agent="g1"]');
+  assert.match(await pill.textContent(), /needs update/); assert.match(await pill.getAttribute('aria-label'), /Update needed/);
+  assert.equal(await pill.locator('.avatar svg').count(), 1);
+  await clearSent(); await side.locator('.notice-line [data-gemini="install"]').click();
+  assert.deepEqual(await sideSent('gemini'), [{ type: 'gemini', action: 'install' }]);
+  await side.locator('.inspector-toggle').click(); await side.locator('[data-tab="tools"]').click();
+  const geminiCard = side.locator('.caps-card').nth(3);
+  assert.match(await geminiCard.textContent(), /Gemini CLI 0\.1\.18/); assert.match(await geminiCard.textContent(), /too old/);
+  await clearSent(); await geminiCard.locator('[data-gemini="install"]').click();
+  assert.deepEqual(await sideSent('gemini'), [{ type: 'gemini', action: 'install' }]);
+  assert.match(await side.locator('.connection-row', { hasText: 'Gemini CLI' }).textContent(), /too old/);
+  assert.deepEqual(sideErrors, []);
+  await side.close();
+  }
   // Rasterize the code-native logo for the VSIX listing icon.
   await page.setViewportSize({ width: 128, height: 128 });
   await page.setContent('<html><style>*{box-sizing:border-box}body{margin:0;display:grid;place-items:center;width:128px;height:128px;background:#14251d;border-radius:26px}svg{width:86px;height:86px}</style>' + (await readFile('media/chatroom.svg', 'utf8')).replaceAll('#C5C5C5', '#A9E9CE') + '</html>');
@@ -1042,5 +1197,5 @@ try {
   await page.setViewportSize({ width: 600, height: 180 });
   await page.setContent('<html><body style="margin:0;background:white;color:black;font:46px Arial;padding:38px">CHATROOM 123</body></html>');
   await page.screenshot({ path: 'artifacts/ocr-fixture.png' });
-  console.log('UI checks passed: team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, worktrees (pill, changes card, select, agent switch, Tools section, /worktrees), sandbox (run cards, Run in sandbox, approvals, switch, Docker actions, Tools section, /sandbox), 360px/320px sidebar, escaping and logo rendering.');
+  console.log('UI checks passed: chat list with delete, expandable tool lists, turning items off, Gemini, team strip, unavailable agents, composer chips and popovers, / and @ menus, editor chip, think/ultra, approvals, activity, agent settings, tools, custom teams and the team builder, worktrees (pill, changes card, select, agent switch, Tools section, /worktrees), sandbox (run cards, Run in sandbox, approvals, switch, Docker actions, Tools section, /sandbox), 360px/320px sidebar, escaping and logo rendering.');
 } finally { await browser.close(); await new Promise(r => server.close(r)); }

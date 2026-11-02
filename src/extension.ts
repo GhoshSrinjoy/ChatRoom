@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { Agent, AgentCapabilities, Connection, DriverHost, DriverSettings, LoopConfig, ModelDefaults, ModelInfo, PermissionLevel, ProviderError, ProviderId, Room, RoomMode, RoomToolName, SandboxRequest, SharedMcpServer, SharedSkill, SkillWiring, StatePayload, TaskPreset, TeamConfig, Unavailable, WorktreeMode, addUsage, emptyUsage } from './types';
-import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, leadAgent, message, migrateRoom, normalizeTeam, overLimit, patchLoop, roomFraming, sandboxReport, teamPlan, unavailableText } from './core';
+import { BUILTIN_TEAMS, DEFAULT_LOOP, DEFAULT_TOOLS, DISABLE_KINDS, PERMISSIONS, PERMISSION_LABELS, PROVIDER_LABELS, TOOL_NAMES, boundedNumber, createRoom, defaultOptions, disableName, leadAgent, message, migrateRoom, normalizeDisabled, normalizeTeam, overLimit, patchLoop, roomFraming, sandboxReport, teamPlan, unavailableText } from './core';
 import { RoomEngine } from './engine';
 import { OllamaClient } from './ollama';
 import { Drivers, createDrivers, createLegacyProviders, detectConnections, legacyCapabilities, nativeDriverFor, providerRuntime } from './providers';
@@ -21,11 +21,11 @@ import { DockerStatus, SANDBOX_DECLINED, SANDBOX_OFF, SandboxService, SandboxSet
 
 const MODES: RoomMode[] = ['orchestrated', 'sequential', 'parallel', 'pipeline'];
 const PRESETS: TaskPreset[] = ['planning', 'drafting', 'review'];
-const PROVIDERS: ProviderId[] = ['codex', 'claude', 'copilot', 'ollama'];
+const PROVIDERS: ProviderId[] = ['codex', 'claude', 'copilot', 'gemini', 'ollama'];
 const SUMMARIES = ['auto', 'concise', 'detailed', 'none'];
 const SANDBOXES = ['read-only', 'workspace-write', 'danger-full-access'];
-const AGENT_NAMES: Record<ProviderId, string> = { codex: 'Codex', claude: 'Claude', copilot: 'Copilot', ollama: 'Ollama' };
-const RUNTIME_LABELS: Record<ProviderId, string> = { claude: 'Claude Code', codex: 'Codex CLI', copilot: 'GitHub Copilot CLI', ollama: 'Ollama' };
+const AGENT_NAMES: Record<ProviderId, string> = { codex: 'Codex', claude: 'Claude', copilot: 'Copilot', gemini: 'Gemini', ollama: 'Ollama' };
+const RUNTIME_LABELS: Record<ProviderId, string> = { claude: 'Claude Code', codex: 'Codex CLI', copilot: 'GitHub Copilot CLI', gemini: 'Gemini CLI', ollama: 'Ollama' };
 const BUSY = 'Wait for the agents to finish or press Stop.';
 const FULL_ACCESS = 'Enable "chatroom.allowFullAccess" in Settings to use Full access.';
 const NO_TEAM = 'Set up a team first: /team edit or /team Lead: Claude > Review: Codex';
@@ -52,7 +52,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('chatroom.new', () => app!.newRoom()),
     vscode.commands.registerCommand('chatroom.refresh', () => app!.refreshAll()),
     vscode.commands.registerCommand('chatroom.export', () => app!.exportRoom()),
-    vscode.commands.registerCommand('chatroom.copilotLogin', () => app!.copilotTerminal('login')));
+    vscode.commands.registerCommand('chatroom.copilotLogin', () => app!.copilotTerminal('login')),
+    vscode.commands.registerCommand('chatroom.geminiLogin', () => app!.geminiTerminal('login')));
 }
 export function deactivate(): Promise<void> | undefined { return app?.dispose(); }
 
@@ -277,7 +278,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     if (this.native(agent)) {
       const caps = this.caps.get(agent.id);
       if (caps?.status === 'missing' || caps?.status === 'signed-out') return mark(caps.status, caps.detail);
-      if ((agent.provider === 'claude' || agent.provider === 'codex') && connection?.status === 'missing') return mark('missing', connection.detail);
+      if ((agent.provider === 'claude' || agent.provider === 'codex' || agent.provider === 'gemini') && connection?.status === 'missing') return mark('missing', connection.detail);
       return undefined;
     }
     // Copilot through VS Code chat models: no models means not signed in.
@@ -584,7 +585,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
   }
   private broadcast(): void {
     const room = this.engine.room, attachOpenFile = this.config('attachOpenFile', true);
-    const state: StatePayload = { type: 'state', room, rooms: this.rooms.map(r => ({ id: r.id, title: r.title })), connections: this.connections,
+    const state: StatePayload = { type: 'state', room, rooms: this.rooms.map(r => ({ id: r.id, title: r.title, messages: r.messages.length, changes: !!r.changes && (r.changes.status === 'ready' || r.changes.status === 'conflict') })), connections: this.connections,
       capabilities: this.capsRecord(room), editor: attachOpenFile ? this.tracker.snapshot() ?? null : null, sharedSkills: this.sharedSkills, roomCommands: ROOM_COMMANDS, teams: this.teams(),
       localModels: this.models, discovering: this.discovering, modelDefaults: this.defaults(),
       defaultPreset: this.config<TaskPreset>('defaultPreset', 'planning'), executionMode: this.config<RoomMode>('executionMode', 'orchestrated'), maxParallelAgents: this.config('maxParallelAgents', 3),
@@ -699,6 +700,30 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     if (this.engine.busy) { void vscode.window.showInformationMessage('Stop the current run before opening another room.'); return; }
     const room = this.createConfiguredRoom(); this.rooms.unshift(room); this.rooms = this.rooms.slice(0, 20); this.showRoom(room);
   }
+  /**
+   * Deletes a room for good. Its CLI processes stop first so its files are free; worktrees left behind go through the usual sweep,
+   * which keeps any work on a branch. The CLIs' own session files are theirs to keep.
+   */
+  private async deleteRoom(id: string): Promise<void> {
+    const room = this.rooms.find(r => r.id === id);
+    if (!room) return;
+    const open = room === this.engine.room;
+    if (open && this.engine.busy) throw new Error('Stop the current run before deleting this chat.');
+    const index = this.rooms.indexOf(room);
+    this.rooms = this.rooms.filter(r => r !== room);
+    this.sandbox.cancelRoom(room.id);
+    for (const [key, controller] of this.ingestions) if (key.startsWith(`${room.id}:`)) controller.abort(new Error('Chat deleted.'));
+    if (open) {
+      if (!this.rooms.length) this.rooms.push(this.createConfiguredRoom());
+      this.showRoom(this.rooms[index] ?? this.rooms.at(-1)!);
+    } else this.changed();
+    for (const agent of room.agents) this.caps.delete(agent.id);
+    await this.release(room.id);
+    const manager = this.worktreeManager;
+    if (manager) void manager.sweep(new Set(this.rooms.map(r => r.id))).then(
+      result => { if (result.keptBranches.length) this.toast('notice', `Kept the deleted chat's work on ${result.keptBranches.join(', ')}.`); },
+      error => this.engine.log(`Worktree cleanup skipped · ${errorText(error)}`, 'error'));
+  }
   async exportRoom(): Promise<void> {
     const room = this.engine.room;
     const name = (id: string) => room.agents.find(a => a.id === id)?.name ?? 'Removed agent';
@@ -715,6 +740,11 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
     const exe = (await providerRuntime('copilot').catch(() => undefined))?.executable;
     if (!exe || exe.prefix.length) { terminal.sendText('copilot login'); return; }
     terminal.sendText(`${/pwsh|powershell/i.test(vscode.env.shell) ? '& ' : ''}"${exe.command}" login`);
+  }
+  async geminiTerminal(action: 'install' | 'login'): Promise<void> {
+    const terminal = vscode.window.terminals.find(t => t.name === 'Gemini CLI') ?? vscode.window.createTerminal({ name: 'Gemini CLI' });
+    terminal.show();
+    terminal.sendText(action === 'install' ? 'npm i -g @google/gemini-cli@latest' : 'gemini');
   }
   private notice(text: string): void { this.engine.room.messages.push(message('notice', text, 'Chatroom')); this.changed(); }
   private requireTrust(): void { if (!vscode.workspace.isTrusted) throw new Error('Trust this workspace before starting agents.'); this.root(); }
@@ -733,6 +763,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       case 'settings': await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:chatroom-local.chatroom'); break;
       case 'new': this.newRoom(); break;
       case 'export': await this.exportRoom(); break;
+      case 'deleteRoom': if (typeof data.id === 'string') await this.deleteRoom(data.id); break;
       case 'switch': {
         if (this.engine.busy) throw new Error('Stop the current run before switching rooms.');
         const next = this.rooms.find(r => r.id === data.id);
@@ -840,7 +871,7 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
           this.toast('notice', `${agent.name} starts a new session from its next turn.`);
         } else if (data.action === 'copyResume') {
           const id = agent.session?.id;
-          const command = id && ({ claude: `claude --resume ${id}`, codex: `codex resume ${id}`, copilot: `copilot --resume ${id}` } as Partial<Record<ProviderId, string>>)[agent.provider];
+          const command = id && ({ claude: `claude --resume ${id}`, codex: `codex resume ${id}`, copilot: `copilot --resume ${id}`, gemini: `gemini --resume ${id}` } as Partial<Record<ProviderId, string>>)[agent.provider];
           if (!command) throw new Error(`${agent.name} has no session to resume yet.`);
           await vscode.env.clipboard.writeText(command);
           this.toast('notice', `Copied: ${command}`);
@@ -850,6 +881,15 @@ class ChatroomApp implements vscode.WebviewViewProvider, vscode.Disposable {
       case 'capabilities': await this.refreshCapabilities(typeof data.id === 'string' ? data.id : undefined); break;
       case 'editor': if (data.action === 'reveal') await this.tracker.reveal(); break;
       case 'copilot': if (data.action === 'install' || data.action === 'login') await this.copilotTerminal(data.action); break;
+      case 'gemini': if (data.action === 'install' || data.action === 'login') await this.geminiTerminal(data.action); break;
+      case 'agentDisable': {
+        const agent = agentOf(data.id), name = disableName(data.name);
+        if (!agent || !name || !DISABLE_KINDS.includes(data.kind)) return;
+        const current = agent.options.disabled ?? {}, list = (current[data.kind as keyof typeof current] ?? []).filter(n => n !== name);
+        const next = normalizeDisabled({ ...current, [data.kind]: data.off === true ? [...list, name] : list });
+        if (next) agent.options.disabled = next; else delete agent.options.disabled;
+        this.changed(); break;
+      }
       case 'team': {
         if (data.team === null) {
           if (this.engine.busy) throw new Error('Pause or stop the run before changing the team.');

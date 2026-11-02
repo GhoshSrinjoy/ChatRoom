@@ -7,6 +7,7 @@ import { JsonlProcess, RpcConnection, RpcError, spawnJsonl } from './jsonl';
 import { childEnv } from './process';
 import { codexEditorText } from './editor-context';
 import { filterNativeCommands } from './commands';
+import { disabledNames } from './core';
 
 export const EFFORT_ORDER: string[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const rank = (effort: string) => EFFORT_ORDER.indexOf(effort);
@@ -90,9 +91,27 @@ function modelInfo(m: any): ModelInfo | undefined {
   return { id, name: typeof m.displayName === 'string' && m.displayName ? m.displayName : id, ...(typeof m.description === 'string' ? { description: m.description } : {}),
     isDefault: !!m.isDefault, ...(typeof m.defaultReasoningEffort === 'string' ? { defaultReasoning: m.defaultReasoningEffort } : {}), reasoning, ultra: reasoning.includes('ultra') };
 }
+/** The built-in connectors server: it has no transport in config.toml and is switched by a feature flag. */
+const APPS_SERVER = 'codex_apps';
+const dottable = (name: string) => !/[.\s"]/.test(name);
+/** What the user turned off, as config overrides: servers, single tools of a server (reported as server.tool) and skills by name. */
+function applyDisabled(config: Record<string, unknown>, agent: Agent, mcpNames: string[], shared: Record<string, SharedMcpServer>): void {
+  const off = disabledNames(agent, 'mcpServers');
+  if (off.includes(APPS_SERVER)) config['features.apps'] = false;
+  for (const name of off) if (name !== APPS_SERVER && dottable(name) && (mcpNames.includes(name) || name in shared)) config[`mcp_servers.${name}.enabled`] = false;
+  const tools = new Map<string, string[]>();
+  for (const entry of disabledNames(agent, 'tools')) {
+    const dot = entry.indexOf('.'), server = entry.slice(0, dot), tool = entry.slice(dot + 1);
+    if (dot > 0 && tool && dottable(server) && server !== APPS_SERVER && mcpNames.includes(server) && !off.includes(server)) tools.set(server, [...(tools.get(server) ?? []), tool]);
+  }
+  for (const [server, list] of tools) config[`mcp_servers.${server}.disabled_tools`] = list;
+  const skills = disabledNames(agent, 'skills');
+  if (skills.length) config['skills.config'] = skills.map(name => ({ name, enabled: false }));
+}
 /** Per-thread config overrides (§5.4.2). */
-function threadConfig(options: AgentOptions, mcpNames: string[], shared: Record<string, SharedMcpServer>): Record<string, unknown> {
+function threadConfig(options: AgentOptions, mcpNames: string[], shared: Record<string, SharedMcpServer>, agent?: Agent): Record<string, unknown> {
   const config: Record<string, unknown> = { model_reasoning_summary: options.summary };
+  if (agent) applyDisabled(config, agent, mcpNames, shared);
   if (options.webSearch !== undefined) config.web_search = options.webSearch === false ? 'disabled' : 'live';
   if (options.useMcp === false) {
     // Only servers from config.toml are named: the built-in apps server has no transport and fails the config when named.
@@ -196,6 +215,9 @@ export class CodexDriver implements NativeDriver {
         ...(who?.type === 'chatgpt' ? { account: [who.email, who.planType].filter(Boolean).join(' · ') } : who?.type === 'apiKey' ? { account: 'API key' } : {}),
         models: server.models, efforts: model?.reasoning ?? [], ...(defaultEffort ? { defaultEffort } : {}),
         skills: skills.map(s => ({ name: s.name, description: s.description, source: s.scope })), commands,
+        // Only MCP tools are reported, and the connectors server's are switched as a whole.
+        tools: (Array.isArray(mcp?.data) ? mcp.data : []).filter((s: any) => typeof s?.name === 'string' && s.name !== APPS_SERVER).flatMap((s: any) => Object.keys(s.tools ?? {}).map(tool => `${s.name}.${tool}`)),
+        canDisable: { tools: true, toolsByName: false, skills: true, mcpServers: true, commands: true },
         mcpServers: (Array.isArray(mcp?.data) ? mcp.data : []).filter((s: any) => typeof s?.name === 'string')
           .map((s: any) => ({ name: s.name, status: String(s.runtimeStatus ?? (s.toolsError ? 'failed' : 'configured')), tools: Object.keys(s.tools ?? {}).length })),
         supports: this.supports(model) };
@@ -338,7 +360,7 @@ export class CodexDriver implements NativeDriver {
     const key = keyOf(room.id, agent.id), stored = agent.session?.id;
     const policy = codexPolicy(options, options.extraDirs);
     await server.config;
-    const config = threadConfig(options, server.mcpNames, this.host.settings().sharedMcpServers ?? {});
+    const config = threadConfig(options, server.mcpNames, this.host.settings().sharedMcpServers ?? {}, agent);
     const configKey = JSON.stringify(config), cwd = this.cwd(room, agent);
     const common = { cwd, model: agent.model || null, approvalPolicy: policy.approvalPolicy, sandbox: policy.sandbox, approvalsReviewer: 'user',
       developerInstructions: req.framing, config };

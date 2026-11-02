@@ -1,5 +1,5 @@
-export type ProviderId = 'codex' | 'claude' | 'copilot' | 'ollama';
-export type NativeProviderId = 'codex' | 'claude' | 'copilot';
+export type ProviderId = 'codex' | 'claude' | 'copilot' | 'gemini' | 'ollama';
+export type NativeProviderId = 'codex' | 'claude' | 'copilot' | 'gemini';
 /** Chatroom's read-only tools for agents without native tools (Ollama, Copilot through vscode.lm). */
 export type ToolName = 'list_files' | 'read_file' | 'search_files' | 'search_documents' | 'ollama_ocr' | 'semantic_search';
 /** Room tools offered to native CLIs through MCP or Codex dynamic tools. */
@@ -49,6 +49,10 @@ export type WorktreeMode = 'off' | 'auto' | 'always';
 export type PermissionLevel = 'plan' | 'ask' | 'auto-edit' | 'full';
 export type CodexSandbox = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type ReasoningSummary = 'auto' | 'concise' | 'detailed' | 'none';
+/** The kinds of item the user can turn off for an agent in the Tools tab. */
+export type DisableKind = 'tools' | 'skills' | 'mcpServers' | 'commands';
+/** What the user turned off for an agent, by the names its CLI reports. */
+export type DisabledItems = Partial<Record<DisableKind, string[]>>;
 
 export interface AgentOptions {
   /** Native effort level; '' = the CLI's own default. */
@@ -72,6 +76,8 @@ export interface AgentOptions {
   /** Claude --agent / Copilot custom agent. */
   customAgent?: string;
   copilotRuntime?: 'auto' | 'cli' | 'vscode-lm';
+  /** Items turned off in the Tools tab; they apply from the agent's next turn. */
+  disabled?: DisabledItems;
 }
 export interface AgentSession {
   /** Claude session_id, Codex thread id or ACP sessionId. */
@@ -272,7 +278,7 @@ export interface ModelInfo {
   /** Claude: ultracode available; Codex: 'ultra' effort available. */
   ultra?: boolean;
 }
-export type HintAction = 'installCopilot' | 'copilotLogin' | 'openSettings';
+export type HintAction = 'installCopilot' | 'copilotLogin' | 'installGemini' | 'updateGemini' | 'geminiLogin' | 'openSettings';
 export interface Connection {
   id: ProviderId; status: 'ready' | 'missing' | 'error' | 'unchecked'; detail: string; models: ModelInfo[];
   modelSource?: string; executable?: string; version?: string;
@@ -296,6 +302,8 @@ export interface AgentCapabilities {
   mcpServers: { name: string; status: string; tools?: number }[];
   plugins?: string[]; agents?: string[];
   supports: CapabilitySupport;
+  /** What this CLI can really turn off, per kind; other kinds show no switch. toolsByName: it also takes tool names it does not list. */
+  canDisable?: Partial<Record<DisableKind | 'toolsByName', boolean>>;
   context?: { percent: number; tokens: number; window: number };
   action?: HintAction;
   updatedAt: number;
@@ -362,9 +370,12 @@ export interface RoomTools {
   mcp(agentId: string, message: any, signal?: AbortSignal): Promise<any | undefined>;
   httpEndpoint(agentId: string): Promise<{ url: string; headers: Record<string, string> }>;
 }
-export type SkillSource = 'claude-user' | 'claude-project' | 'claude-plugin' | 'agents-user' | 'agents-project' | 'codex-user' | 'codex-project' | 'github-project' | 'copilot-user';
+export type SkillSource = 'claude-user' | 'claude-project' | 'claude-plugin' | 'agents-user' | 'agents-project' | 'codex-user' | 'codex-project' | 'github-project' | 'copilot-user' | 'gemini-user' | 'gemini-project';
 export interface SharedSkill { name: string; description: string; path: string; dir: string; source: SkillSource; nativeTo: NativeProviderId[] }
-export interface SkillWiring { claudePluginDir?: string; copilotAddDir?: string; codexExtraRoots: string[]; indexPath?: string; indexDir?: string; skills: SharedSkill[] }
+export interface SkillWiring { claudePluginDir?: string; copilotAddDir?: string; codexExtraRoots: string[];
+  /** Folders holding the skills Gemini does not load itself; it reads them through the index. */
+  geminiDirs?: string[];
+  indexPath?: string; indexDir?: string; skills: SharedSkill[] }
 export interface SharedMcpServer { type?: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> }
 export interface DriverSettings {
   allowFullAccess: boolean;
@@ -390,7 +401,8 @@ export interface RoomCommandInfo { name: string; args?: string; description: str
 /** Host → webview state message. */
 export interface StatePayload {
   type: 'state';
-  room: Room; rooms: { id: string; title: string }[];
+  /** Every room, for the picker. changes: it holds worktree changes the user has not applied. */
+  room: Room; rooms: { id: string; title: string; messages: number; changes: boolean }[];
   connections: Connection[];
   capabilities: Record<string, AgentCapabilities>;
   editor: EditorSnapshot | null;
@@ -408,7 +420,7 @@ export interface StatePayload {
 /** Webview → host messages (validated by the host). */
 export type WebviewMessage =
   | { type: 'ready' | 'open' | 'refresh' | 'settings' | 'new' | 'export' | 'pause' | 'stop' | 'start' | 'attachDocuments' }
-  | { type: 'switch' | 'stopAgent' | 'removeAgent' | 'removeDocument'; id: string }
+  | { type: 'switch' | 'stopAgent' | 'removeAgent' | 'removeDocument' | 'deleteRoom'; id: string }
   | { type: 'send'; text: string; editor: boolean; think: boolean; ultra: boolean }
   | { type: 'options'; mode?: RoomMode; leadId?: string; concurrency?: number; tokenBudget?: number; preset?: TaskPreset; loop?: Partial<LoopConfig>; attachEditor?: boolean; shareSkills?: boolean; permission?: PermissionLevel; worktrees?: WorktreeMode; sandbox?: boolean }
   | { type: 'saveDefaults'; modelDefaults: ModelDefaults; defaultPreset: TaskPreset; executionMode: RoomMode; maxParallelAgents: number }
@@ -420,6 +432,9 @@ export type WebviewMessage =
   | { type: 'capabilities'; id?: string }
   | { type: 'editor'; action: 'reveal' }
   | { type: 'copilot'; action: 'install' | 'login' }
+  | { type: 'gemini'; action: 'install' | 'login' }
+  /** Turn one tool, skill, MCP server or command off or on for an agent, from its next turn. */
+  | { type: 'agentDisable'; id: string; kind: DisableKind; name: string; off: boolean }
   /** Use a team in this room (mode 'pipeline'); null returns the room to Team (lead) mode. */
   | { type: 'team'; team: TeamConfig | null }
   /** Save a team to chatroom.teams (replaces one with the same name). */

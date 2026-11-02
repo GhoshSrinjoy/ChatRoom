@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseSandbox, parseTeam, parseWorktrees, resolveMention, SANDBOX_USAGE, stripCode } from '../src/commands';
+import { AGENT_SCOPED, NATIVE_COMMAND_DENYLIST, ROOM_COMMANDS, commandOff, extractHandoffs, filterNativeCommands, markerOf, parseComposer, parseDuration, parseLoop, parseSandbox, parseTeam, parseWorktrees, resolveMention, SANDBOX_USAGE, stripCode } from '../src/commands';
 import { Agent, AgentCapabilities, NativeCommand, ProviderId } from '../src/types';
 
 const agent = (id: string, name: string, provider: ProviderId, enabled = true): Agent => ({ id, name, provider, model: '', role: '', enabled, tools: [],
@@ -246,4 +246,24 @@ test('parseTeam: show, off, edit, save, delete, a saved name and inline teams', 
   assert.deepEqual(parseTeam('Draft: Codex > Codex').team!.stages.map(s => s.name), ['Draft', 'Stage 2']);
   assert.equal(parseTeam('Draft: Codex > Review: Claude').team!.wrapUp, false);
   assert.deepEqual(parseTeam('Lead: > Review: (just look)'), { error: `That team has no stage with an agent. ${usage}` });
+});
+
+test('Gemini: @gemini resolves, and its help is not offered', () => {
+  const gemini = agent('a6', 'Gemini', 'gemini');
+  assert.deepEqual(resolveMention('gemini', [claude, { ...gemini, name: 'Flash' }]), [{ ...gemini, name: 'Flash' }]);
+  assert.deepEqual(resolveMention('gemini cli', [claude, { ...gemini, name: 'Flash' }]), [{ ...gemini, name: 'Flash' }]);
+  assert.deepEqual(filterNativeCommands('gemini', [cmd('help'), cmd('memory'), cmd('about')]).map(c => c.name), ['memory', 'about']);
+});
+
+test('a turned-off command is refused and says why; a turned-off skill takes its command with it; others still run', () => {
+  const off = (disabled: object): Agent => ({ ...claude, options: { ...claude.options, disabled } });
+  const commandsOff = off({ commands: ['review'] }), list = [commandsOff, codex];
+  assert.match(parseComposer('@Claude /review', list, capsMap).error!, /\/review is turned off for Claude.*Tools tab/);
+  assert.equal(parseComposer('@Codex /review', list, capsMap).command?.agentIds[0], 'a2', 'another agent keeps its own');
+  assert.equal(parseComposer('/review', list, capsMap).command?.agentIds[0], 'a2', 'an unmentioned command goes to the agent that still has it');
+  assert.match(parseComposer('/review', [commandsOff], capsMap).error!, /turned off/);
+  assert.equal(parseComposer('@Claude /pr-comments', list, capsMap).command?.name, 'pr-comments', 'the others still run');
+  assert.match(parseComposer('@Claude /deploy', [off({ skills: ['Deploy'] })], capsMap).error!, /\/deploy is turned off/, 'case-insensitive, through the skill');
+  assert.equal(parseComposer('@Claude /nothing', list, capsMap).error, 'Claude has no /nothing command.');
+  assert.equal(commandOff(commandsOff, 'REVIEW'), true); assert.equal(commandOff(claude, 'review'), false);
 });

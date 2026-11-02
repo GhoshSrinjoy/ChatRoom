@@ -20,6 +20,11 @@ function candidatePaths(provider: NativeProviderId, configured: string, folders:
     }
     return candidates;
   }
+  if (provider === 'gemini') {
+    candidates.push({ path: 'gemini', source: 'PATH executable' });
+    if (process.platform === 'win32' && process.env.APPDATA) candidates.push({ path: join(process.env.APPDATA, 'npm', 'gemini.cmd'), source: 'npm global install' });
+    return candidates;
+  }
   for (const folder of new Set(folders)) {
     const platform = process.platform === 'win32' ? `windows-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}` : `${process.platform === 'darwin' ? 'macos' : 'linux'}-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}`;
     for (const relative of provider === 'codex' ? [`bin/${platform}/codex${process.platform === 'win32' ? '.exe' : ''}`] : ['resources/native-binary/claude.exe', 'resources/native-binary/claude', 'resources/claude.exe']) {
@@ -29,16 +34,19 @@ function candidatePaths(provider: NativeProviderId, configured: string, folders:
   candidates.push({ path: provider, source: 'PATH executable' });
   return candidates;
 }
+/** The oldest Gemini CLI with --acp and session/set_model, which the driver relies on. */
+export const GEMINI_MIN_VERSION = '0.38.0';
 function isModern(provider: NativeProviderId, version: string): boolean {
   const [major = 0, minor = 0, patch = 0] = version.split('.').map(Number);
   if (provider === 'codex') return major > 0 || minor >= 100;
   if (provider === 'copilot') return major >= 1;
+  if (provider === 'gemini') return major > 0 || minor >= Number(GEMINI_MIN_VERSION.split('.')[1]);
   return major >= 2 && patch >= 100;
 }
 /** Finds a working CLI. Copilot: the configured path, then PATH (npm shim resolved to the native exe), npm's global folder and WinGet's link. The CLI is never bundled. */
 export async function findRuntime(provider: NativeProviderId, configured: string, extensionPath?: string): Promise<Runtime | undefined> {
   const folders: string[] = extensionPath ? [extensionPath] : [];
-  if (provider !== 'copilot' && (!configured || configured === provider)) {
+  if (provider !== 'copilot' && provider !== 'gemini' && (!configured || configured === provider)) {
     const prefix = provider === 'codex' ? 'openai.chatgpt-' : 'anthropic.claude-code-';
     for (const folder of [join(homedir(), '.vscode', 'extensions'), join(homedir(), '.vscode-insiders', 'extensions')]) {
       try { folders.push(...(await readdir(folder)).filter(n => n.startsWith(prefix)).sort((a, b) => b.localeCompare(a, undefined, { numeric: true })).map(n => join(folder, n))); } catch { /* Optional installation. */ }
@@ -47,7 +55,7 @@ export async function findRuntime(provider: NativeProviderId, configured: string
   for (const candidate of candidatePaths(provider, configured, folders)) {
     const executable = resolveCli(candidate.path, provider); if (!executable) continue;
     try {
-      const { stdout } = await exec(executable.command, [...executable.prefix, '--version'], { windowsHide: true, timeout: provider === 'copilot' ? 20000 : 10000, env: childEnv(executable, provider) });
+      const { stdout } = await exec(executable.command, [...executable.prefix, '--version'], { windowsHide: true, timeout: provider === 'copilot' || provider === 'gemini' ? 20000 : 10000, env: childEnv(executable, provider) });
       const version = /\d+\.\d+\.\d+/.exec(stdout)?.[0] ?? 'unknown';
       return { executable, version, source: candidate.source, modern: isModern(provider, version) };
     } catch { /* Continue to a working runtime. */ }

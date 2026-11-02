@@ -629,3 +629,32 @@ test('threads start and resume in the agent\'s folder from host.cwdFor; the app-
     assert.equal(sent('thread/resume')[0].params.cwd, folder);
   } finally { await driver.dispose(); }
 });
+
+test('what is turned off: thread config overrides, and MCP tools are listed so one can be turned off', async () => {
+  const { driver, sent } = setup();
+  const agent = testAgent('codex', { options: { summary: 'auto', disabled: { mcpServers: ['codex_apps', 'not-configured', 'with.dot'], tools: ['mem.recall', 'mem.remember', 'codex_apps.apps', 'not-configured.x', 'Plain'], skills: ['pdf-tools'] } } as any }), room = testRoom([agent]);
+  const caps = await driver.capabilities(room, agent);
+  assert.deepEqual(caps.tools, ['mem.recall', 'mem.remember'], 'tools of configured servers; the connectors server is switched as a whole');
+  assert.deepEqual(caps.canDisable, { tools: true, toolsByName: false, skills: true, mcpServers: true, commands: true });
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  const config = sent('thread/start')[0].params.config;
+  assert.equal(config['features.apps'], false, 'the built-in server goes by feature flag: naming it fails the config');
+  assert.ok(!Object.keys(config).some(k => k.startsWith('mcp_servers.codex_apps') || k.includes('not-configured') || k.includes('with.dot')));
+  assert.deepEqual(config['mcp_servers.mem.disabled_tools'], ['recall', 'remember']);
+  assert.deepEqual(config['skills.config'], [{ name: 'pdf-tools', enabled: false }]);
+  await driver.dispose();
+});
+
+test('turning a server off wins over its tools, and a change resumes the thread with the new config', async () => {
+  const { driver, sent } = setup();
+  const agent = testAgent('codex', { options: { summary: 'auto', disabled: { tools: ['mem.recall'] } } as any }), room = testRoom([agent]);
+  const sink = sinkFor(agent);
+  await driver.turn(request(agent, room, sink));
+  for (const patch of sink.sessions) agent.session = { ...agent.session, ...patch };
+  assert.deepEqual(sent('thread/start')[0].params.config['mcp_servers.mem.disabled_tools'], ['recall']);
+  agent.options.disabled = { tools: ['mem.recall'], mcpServers: ['mem'] };
+  await driver.turn(request(agent, room, sinkFor(agent)));
+  const config = sent('thread/resume').at(-1).params.config;
+  assert.equal(config['mcp_servers.mem.enabled'], false); assert.equal(config['mcp_servers.mem.disabled_tools'], undefined);
+  await driver.dispose();
+});
